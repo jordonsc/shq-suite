@@ -1,0 +1,10 @@
+auth:
+  username: hass
+  private_key: ~/.ssh/hass.pem
+
+hosts:
+  - hass.myhouse.dev
+
+hass:
+  component_path: /etc/home-assistant
+  systemd_service: homeassistant

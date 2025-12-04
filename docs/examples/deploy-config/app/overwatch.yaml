@@ -1,0 +1,32 @@
+# gRPC server adddress and port
+server_address: "0.0.0.0:50051"
+
+# For AWS Polly
+aws:
+  #region: "ap-southeast-2" -- only a few US regions support generative TTS
+  region: "us-west-2"
+  access_key_id: "AWS-ACCESS-KEY-ID"
+  secret_access_key: "AWS-SECRET-ACCESS-KEY"
+
+# Default voice for TTS (optional, defaults to "Amy")
+default_voice: "Amy"
+
+# Default volume for all requests
+default_volume: 0.5
+
+# TTS engine (optional, defaults to "generative")
+# Options: neural, generative, long-form, standard
+# - neural: High-quality, natural-sounding (recommended)
+# - generative: Newest, most natural (only Matthew, Ruth, Stephen)
+# - long-form: Optimized for longer content
+# - standard: Traditional TTS (lower quality, cheaper)
+default_engine: "generative"
+
+# Alarm klaxons
+alarms:
+  security: "sounds/alarms/klaxon-1.mp3"
+  fire: "sounds/alarms/klaxon-2.mp3"
+
+# Notification tones that precede TTS messages
+notification_tones:
+  notify: "sounds/tones/notification-1.mp3"

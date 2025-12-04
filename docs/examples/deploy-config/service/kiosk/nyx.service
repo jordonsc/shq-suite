@@ -1,0 +1,14 @@
+[Unit]
+Description=Nyx Display Server
+After=network-online.target graphical-session.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/display/nyx
+Restart=always
+RestartSec=10
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target

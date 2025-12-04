@@ -1,0 +1,67 @@
+# Service definitions for Overwatch Voice Control
+
+set_alarm:
+  name: Set Alarm
+  description: Enable or disable an alarm on the voice server
+  fields:
+    alarm_id:
+      name: Alarm ID
+      description: The ID of the alarm to control
+      required: true
+      example: "fire"
+      selector:
+        text:
+    enabled:
+      name: Enabled
+      description: True to start the alarm, False to stop it
+      required: true
+      example: true
+      selector:
+        boolean:
+    volume:
+      name: Volume
+      description: Volume level (0.0 to 1.0)
+      required: false
+      example: 0.75
+      selector:
+        number:
+          min: 0.0
+          max: 1.0
+          step: 0.1
+
+verbalise:
+  name: Verbalise
+  description: Synthesize and play text as speech
+  fields:
+    text:
+      name: Text
+      description: The text to speak
+      required: true
+      example: "Hello, this is a test message"
+      selector:
+        text:
+          multiline: true
+    notification_tone_id:
+      name: Notification Tone
+      description: Optional notification tone to play before speech
+      required: false
+      example: "notify"
+      selector:
+        text:
+    voice_id:
+      name: Voice
+      description: Voice ID to use (e.g., Amy, Joanna)
+      required: false
+      example: "Amy"
+      selector:
+        text:
+    volume:
+      name: Volume
+      description: Volume level (0.0 to 1.0)
+      required: false
+      example: 0.5
+      selector:
+        number:
+          min: 0.0
+          max: 1.0
+          step: 0.1

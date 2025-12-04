@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package voice;
+
+service VoiceService {
+  // Enable or disable an alarm
+  rpc SetAlarm(SetAlarmRequest) returns (SetAlarmResponse);
+
+  // Synthesise and play a text prompt
+  rpc Verbalise(VerbaliseRequest) returns (VerbaliseResponse);
+}
+
+message SetAlarmRequest {
+  string alarm_id = 1;
+  bool enabled = 2;
+  optional float volume = 3;  // Volume level 0.0-1.0
+}
+
+message SetAlarmResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message VerbaliseRequest {
+  string text = 1;
+  optional string notification_tone_id = 2;
+  optional string voice_id = 3;
+  optional float volume = 4;  // Volume level 0.0-1.0
+}
+
+message VerbaliseResponse {
+  bool success = 1;
+  string message = 2;
+}

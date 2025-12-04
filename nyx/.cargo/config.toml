@@ -1,0 +1,9 @@
+# Cross-compilation configuration
+# Uses 'cross' tool with Podman (set via CROSS_CONTAINER_ENGINE=podman)
+# Build commands:
+#   - Local: cargo build --release
+#   - Raspberry Pi: cross build --release --target aarch64-unknown-linux-gnu
+
+[env]
+# Configure Cross to use Podman instead of Docker
+CROSS_CONTAINER_ENGINE = "podman"
