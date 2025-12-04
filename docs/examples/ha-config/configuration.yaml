@@ -1,0 +1,66 @@
+# Example Home Assistant sample configuration.yaml 
+
+# SHQ Display integration
+shq_display:
+  # Kiosk 1
+  kiosk1:
+    host: kiosk1.myhouse.dev
+    port: 8765  # Optional, defaults to 8765
+    name: "Living Room Display"
+
+  # Kiosk 2
+  kiosk2:
+    host: kiosk2.myhouse.dev
+    name: "Bedroom Display"
+
+# Overwatch Voice Control integration
+overwatch:
+  host: "192.168.1.100"  # Replace with your voice server IP
+  port: 50051            # gRPC port (default: 50051)
+
+
+# Sample scripts
+automation:
+  # Doorbell announcement
+  - alias: "Doorbell Announcement"
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.front_door_button
+        to: "on"
+    action:
+      - service: overwatch.verbalise
+        data:
+          text: "Someone is at the front door"
+          notification_tone_id: "notify"
+          volume: 0.5
+
+  # Fire alarm
+  - alias: "Fire Alarm"
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.smoke_detector
+        to: "on"
+    action:
+      - service: overwatch.set_alarm
+        data:
+          alarm_id: "fire"
+          enabled: true
+          volume: 0.75
+      - service: overwatch.verbalise
+        data:
+          text: "Fire alarm! Please evacuate immediately!"
+          volume: 1.0
+
+  # Stop fire alarm when clear
+  - alias: "Stop Fire Alarm"
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.smoke_detector
+        to: "off"
+        for:
+          minutes: 3
+    action:
+      - service: overwatch.set_alarm
+        data:
+          alarm_id: "fire"
+          enabled: false

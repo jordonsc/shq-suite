@@ -1,0 +1,14 @@
+auth:
+  username: shq
+  private_key: ~/.ssh/shq.pem
+
+hosts:
+  - kiosk01.myhouse.dev
+  - kiosk02.myhouse.dev
+
+kiosk:
+  dashboard_url: http://hass.myhouse.dev:8123/dashboard-kiosk/{kiosk_name}?kiosk
+
+display:
+  install_path: /home/shq
+  systemd_service: display

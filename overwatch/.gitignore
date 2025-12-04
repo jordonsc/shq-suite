@@ -1,0 +1,12 @@
+# Rust
+target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
+
+# Build payload for deployment
+build/
+
+# Application
+config.yaml
+cache/

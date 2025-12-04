@@ -1,0 +1,21 @@
+# Cross configuration for building with Podman
+# Handles GLIBC compatibility between host and container
+
+[build]
+xargo = false
+
+[target.aarch64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main"
+
+# Install required build dependencies before building
+pre-build = [
+    "dpkg --add-architecture arm64",
+    "apt-get update",
+    "apt-get install -y libasound2-dev:arm64 curl unzip",
+    # Install latest protoc (supports optional fields in proto3)
+    "curl -L https://github.com/protocolbuffers/protobuf/releases/download/v28.3/protoc-28.3-linux-x86_64.zip -o /tmp/protoc.zip",
+    "unzip -o /tmp/protoc.zip -d /usr/local bin/protoc",
+    "unzip -o /tmp/protoc.zip -d /usr/local 'include/*'",
+    "chmod +x /usr/local/bin/protoc",
+    "rm /tmp/protoc.zip"
+]

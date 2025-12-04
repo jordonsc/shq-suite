@@ -1,0 +1,14 @@
+[Unit]
+Description=Overwatch Voice Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/overwatch/overwatch
+WorkingDirectory=%h/overwatch
+Restart=always
+RestartSec=10
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target

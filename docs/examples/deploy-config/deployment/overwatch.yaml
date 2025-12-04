@@ -1,0 +1,16 @@
+auth:
+  username: shq
+  private_key: ~/.ssh/shq.pem
+
+hosts:
+  - overwatch.myhouse.dev
+
+overwatch:
+  # Source path defaults to overwatch/build if not specified
+  # source_path: overwatch/build
+
+  # Destination path on remote host (relative to user home directory)
+  install_path: overwatch
+
+  # Systemd service name to restart after deployment
+  systemd_service: overwatch

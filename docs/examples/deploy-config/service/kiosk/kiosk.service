@@ -1,0 +1,13 @@
+[Unit]
+Description=SHQ Kiosk
+After=network-online.target graphical-session.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/chromium --password-store=basic --no-first-run --disable-session-crashed-bubble --noerrdialogs --kiosk {dashboard_url}
+Restart=always
+RestartSec=10
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+
+[Install]
+WantedBy=default.target
