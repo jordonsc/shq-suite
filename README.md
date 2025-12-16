@@ -4,6 +4,7 @@ The SHQ toolsuite is a set of applications for home automation which include:
 
  * Display helpers for wall displays (kiosks) and dashboard controls
  * Audio alarms & TTS services
+ * Automated door control systems
  * Home Assistant components to control the above
 
 Applications
@@ -12,6 +13,7 @@ Directory structure for applications:
 
  * `nyx`: Tool to control the brightness and power state of wall displays (Rust)
  * `overwatch`: TTS server with an alarm loop - verbalises text prompts and raises alarms (Rust)
+ * `dosa`: Door Opening Sensor Automation - automated door control via grblHAL CNC controller (Rust)
  * `home-assistant`: The Home Assistant custom components that integrate with the above tools (Python)
  * `deploy`: A tool to deploy each application to respective devices (symlink to `setup` in root) (Python)
 

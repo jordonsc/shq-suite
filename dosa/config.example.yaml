@@ -1,0 +1,35 @@
+door:
+  # Distance to open the door in millimeters
+  open_distance: 1000.0
+
+  # Speed when opening the door in mm/min
+  open_speed: 6000.0
+
+  # Speed when closing the door in mm/min
+  close_speed: 4000.0
+
+  # CNC axis for door movement (X, Y, Z, A, B, or C)
+  cnc_axis: "X"
+
+  # Offset from limit switch in millimeters
+  limit_offset: 3.0
+
+  # Delay in milliseconds after stop command before starting new motion
+  # Allows time for the CNC to fully halt before reversing direction
+  stop_delay_ms: 1000
+
+  # CNC controller connection
+  # Use one of the following configurations:
+
+  # Option 1: TCP connection (e.g., for network-connected grblHAL controller)
+  cnc_connection:
+    type: tcp
+    host: "192.168.1.100"
+    port: 23
+
+  # Option 2: Serial connection (e.g., for USB-connected controller)
+  # cnc_connection:
+  #   type: serial
+  #   port: "/dev/ttyUSB0"  # Linux
+  #   # port: "COM3"        # Windows
+  #   baud_rate: 115200

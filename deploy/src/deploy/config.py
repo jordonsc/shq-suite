@@ -105,6 +105,36 @@ class OverwatchConfig(DeploymentConfig):
             self.service_file = str(service_dir / "overwatch" / "overwatch.service")
 
 
+@dataclass
+class DosaConfig(DeploymentConfig):
+    """Configuration for DOSA (Door Opening Sensor Automation) deployments."""
+
+    source_path: str = None
+    config_file: str = None
+    service_file: str = None
+    install_path: str = "dosa"
+    systemd_service: str = "dosa"
+
+    def __post_init__(self):
+        """Set default paths if not provided."""
+        project_root = Path(__file__).parent.parent.parent.parent
+        config_dir = Path(__file__).parent.parent.parent / "config"
+        app_config_dir = config_dir / "app"
+        service_dir = config_dir / "service"
+
+        if self.source_path is None:
+            # Path relative to project root: dosa/build
+            self.source_path = str(project_root / "dosa" / "build")
+
+        if self.config_file is None:
+            # Default config file in deploy/config/app
+            self.config_file = str(app_config_dir / "dosa.yaml")
+
+        if self.service_file is None:
+            # Default service file in deploy/config/service
+            self.service_file = str(service_dir / "dosa" / "dosa.service")
+
+
 class ConfigPresets:
     """Predefined deployment configurations loaded from YAML files."""
 
@@ -178,4 +208,22 @@ class ConfigPresets:
             service_file=overwatch.get("service_file"),  # None if not specified, will use default
             install_path=overwatch.get("install_path", "overwatch"),
             systemd_service=overwatch.get("systemd_service", "overwatch"),
+        )
+
+    @classmethod
+    def get_dosa_config(cls) -> DosaConfig:
+        """Get DOSA deployment configuration from deployment/dosa.yaml."""
+        config = cls._load_yaml("dosa.yaml")
+        auth = config.get("auth", {})
+        dosa = config.get("dosa", {})
+
+        return DosaConfig(
+            hostnames=config.get("hosts", []),
+            user=auth.get("username", ""),
+            private_key=auth.get("private_key", ""),
+            source_path=dosa.get("source_path"),  # None if not specified, will use default
+            config_file=dosa.get("config_file"),  # None if not specified, will use default
+            service_file=dosa.get("service_file"),  # None if not specified, will use default
+            install_path=dosa.get("install_path", "dosa"),
+            systemd_service=dosa.get("systemd_service", "dosa"),
         )

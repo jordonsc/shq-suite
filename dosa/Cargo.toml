@@ -1,0 +1,29 @@
+[package]
+name = "dosa"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "sync", "time", "fs", "io-util", "signal", "net"] }
+tokio-tungstenite = "0.21"
+tokio-serial = "5.4"
+
+# WebSocket support
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Path handling
+directories = "5.0"
