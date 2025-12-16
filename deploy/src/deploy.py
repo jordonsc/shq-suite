@@ -11,7 +11,7 @@ from pathlib import Path
 
 import click
 
-from deploy import HomeAssistantDeployer, KioskDeployer, OverwatchDeployer
+from deploy import DosaDeployer, HomeAssistantDeployer, KioskDeployer, OverwatchDeployer
 from deploy.config import ConfigPresets
 
 
@@ -294,6 +294,83 @@ def overwatch(hostname, user, key, verbose, destination, build):
 
     click.echo()
     click.echo("Overwatch deployment complete.")
+
+
+### DOSA DEPLOYMENT ###
+@cli.command()
+@click.option(
+    "--hostname",
+    "-h",
+    multiple=True,
+    help="Override default hostname(s). Can be specified multiple times.",
+)
+@click.option(
+    "--user",
+    "-u",
+    help="Override default SSH user.",
+)
+@click.option(
+    "--key",
+    "-k",
+    help="Override default SSH private key path.",
+)
+@click.option(
+    "--verbose",
+    "-v",
+    is_flag=True,
+    help="Show verbose output.",
+)
+@click.option(
+    "--destination",
+    "-d",
+    help="Override destination directory on remote host.",
+)
+@click.option(
+    "--build",
+    "-b",
+    is_flag=True,
+    help="Build dosa binary before deploying.",
+)
+def dosa(hostname, user, key, verbose, destination, build):
+    """
+    Deploy DOSA door automation server.
+
+    Deploys the door automation binary to remote hosts and restarts the DOSA service.
+
+    Configuration loaded from config/deployment/dosa.yaml
+    """
+    # Build dosa if --build flag is set
+    if build:
+        if not run_build_script("dosa", verbose=verbose):
+            click.echo("Build failed. Aborting deployment.", err=True)
+            sys.exit(1)
+        click.echo()
+
+    config = ConfigPresets.get_dosa_config()
+
+    # Override defaults if provided
+    hostnames = list(hostname) if hostname else config.hostnames
+    ssh_user = user if user else config.user
+    ssh_key = key if key else config.private_key
+    destination_dir = destination if destination else config.install_path
+
+    click.echo(f"Deploying DOSA door automation to {len(hostnames)} host(s)...")
+
+    deployer = DosaDeployer(
+        hostnames=hostnames,
+        user=ssh_user,
+        private_key=ssh_key,
+        source_path=config.source_path,
+        destination_path=destination_dir,
+        service_name=config.systemd_service,
+        config_file=config.config_file,
+        service_file=config.service_file,
+    )
+
+    deployer.deploy_all(verbose=verbose)
+
+    click.echo()
+    click.echo("DOSA deployment complete.")
 
 
 if __name__ == "__main__":
