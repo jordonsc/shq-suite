@@ -25,7 +25,7 @@ pub enum ClientMessage {
     /// Clear CNC alarm state
     ClearAlarm,
     /// Get current door position and state
-    GetStatus,
+    Status,
     /// Set door configuration
     SetConfig {
         open_distance: Option<f64>,
@@ -33,13 +33,23 @@ pub enum ClientMessage {
         close_speed: Option<f64>,
         cnc_axis: Option<String>,
         limit_offset: Option<f64>,
-        stop_delay_ms: Option<u64>,
         open_direction: Option<String>,
     },
     /// Get door configuration
     GetConfig,
     /// Emergency stop
     Stop,
+    /// Query all CNC settings
+    GetCncSettings,
+    /// Get a specific CNC setting
+    GetCncSetting {
+        setting: String,
+    },
+    /// Set a specific CNC setting
+    SetCncSetting {
+        setting: String,
+        value: String,
+    },
     /// No operation (keep-alive)
     Noop,
 }
@@ -59,6 +69,15 @@ pub enum ServerMessage {
         command: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         config: Option<DoorConfig>,
+    },
+    /// CNC settings response (sorted numerically by setting number)
+    CncSettings {
+        settings: indexmap::IndexMap<String, String>,
+    },
+    /// CNC setting response
+    CncSetting {
+        setting: String,
+        value: String,
     },
     /// Error message
     Error {

@@ -88,8 +88,11 @@ class DosaDeployer(BaseDeployer):
             ("Syncing DOSA application", lambda: self.run_rsync(
                 f"{self.source_path}/", f"{self.destination_path}/", hostname, delete=True, verbose=verbose
             )),
-            ("Copying config file", lambda: self.run_rsync(
-                self.config_file, f"{self.destination_path}/config.yaml", hostname, delete=False, verbose=verbose
+            ("Creating config directory", lambda: self.run_ssh_command(
+                hostname, "mkdir -p ~/.config/dosa", verbose=verbose
+            )),
+            ("Copying app config", lambda: self.run_rsync(
+                self.config_file, "~/.config/dosa/config.yaml", hostname, delete=False, verbose=verbose
             )),
             ("Installing systemd service", lambda: self._install_systemd_service(hostname, verbose)),
             ("Restarting DOSA service", lambda: self.run_ssh_command(

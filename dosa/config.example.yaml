@@ -1,3 +1,10 @@
+# WebSocket server configuration
+websocket:
+  # Host address to bind to (0.0.0.0 = all interfaces, 127.0.0.1 = localhost only)
+  host: "0.0.0.0"
+  # Port to listen on
+  port: 8766
+
 door:
   # Distance to open the door in millimeters
   open_distance: 1000.0
@@ -13,10 +20,6 @@ door:
 
   # Offset from limit switch in millimeters
   limit_offset: 3.0
-
-  # Delay in milliseconds after stop command before starting new motion
-  # Allows time for the CNC to fully halt before reversing direction
-  stop_delay_ms: 1000
 
   # CNC controller connection
   # Use one of the following configurations:

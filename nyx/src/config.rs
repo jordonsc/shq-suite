@@ -6,17 +6,38 @@ use tokio::fs;
 
 use crate::messages::AutoDimConfig;
 
+/// WebSocket server configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebSocketConfig {
+    /// Host address to bind to (e.g., "0.0.0.0" for all interfaces)
+    pub host: String,
+    /// Port to listen on
+    pub port: u16,
+}
+
+impl Default for WebSocketConfig {
+    fn default() -> Self {
+        Self {
+            host: "0.0.0.0".to_string(),
+            port: 8765,
+        }
+    }
+}
+
 /// Application configuration stored in ~/.config/shqd/config.json
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
-    #[serde(default)]
     pub auto_dim: AutoDimConfig,
+    pub websocket: WebSocketConfig,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             auto_dim: AutoDimConfig::default(),
+            websocket: WebSocketConfig::default(),
         }
     }
 }
@@ -106,5 +127,10 @@ impl ConfigManager {
         self.config.auto_dim = config;
         self.save().await?;
         Ok(())
+    }
+
+    /// Get the WebSocket configuration
+    pub fn get_websocket_config(&self) -> WebSocketConfig {
+        self.config.websocket.clone()
     }
 }

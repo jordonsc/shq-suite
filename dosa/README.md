@@ -92,9 +92,9 @@ Before using DOSA, configure your grblHAL controller's acceleration settings. Th
 
 The acceleration setting affects how quickly the door stops when executing direction reversals or emergency stops:
 
-- **Low (500 mm/sec²)** - Gentle, smooth stopping. Requires longer `stop_delay_ms`.
-- **Medium (1000 mm/sec²)** - Balanced stopping. Works with default `stop_delay_ms: 1000`.
-- **High (2000+ mm/sec²)** - Aggressive stopping. Can reduce `stop_delay_ms` but may stress mechanics.
+- **Low (500 mm/sec²)** - Gentle, smooth stopping.
+- **Medium (1000 mm/sec²)** - Balanced stopping.
+- **High (2000+ mm/sec²)** - Aggressive stopping but may stress mechanics.
 
 **Example Configuration:**
 ```
@@ -115,28 +115,7 @@ $120=1000       # Set X-axis acceleration to 1000 mm/sec²
 - Motor stalling
 - Lost steps (position errors)
 
-Test your settings carefully and adjust `stop_delay_ms` in the DOSA config to match your controller's deceleration characteristics.
-
-### Automatic Validation
-
-DOSA automatically validates your configuration on startup. It:
-1. Queries the controller's acceleration setting for your configured axis
-2. Calculates the minimum deceleration time from your max speed
-3. Verifies that `stop_delay_ms` is sufficient (with 20% safety margin)
-
-If validation fails, DOSA will refuse to start and provide specific recommendations:
-```
-Error: stop_delay_ms (500 ms) is too short for safe deceleration!
-Maximum speed: 6000 mm/min (100.0 mm/sec)
-Acceleration: 1000 mm/sec²
-Minimum deceleration time: 100 ms
-Recommended stop_delay_ms: 120 ms (with 20% safety margin)
-
-Either:
-1. Increase stop_delay_ms to at least 120 ms in your config, or
-2. Reduce open_speed/close_speed, or
-3. Increase controller acceleration setting $120
-```
+Test your settings carefully to match your controller's deceleration characteristics.
 
 This ensures your door can safely decelerate before reversing direction.
 
@@ -201,7 +180,7 @@ Clears a CNC alarm state by sending the `$X` unlock command to the grblHAL contr
 
 #### Get Status
 ```json
-{"type": "get_status"}
+{"type": "status"}
 ```
 
 #### Set Configuration
@@ -213,7 +192,6 @@ Clears a CNC alarm state by sending the `$X` unlock command to the grblHAL contr
   "close_speed": 5000.0,
   "cnc_axis": "Y",
   "limit_offset": 5.0,
-  "stop_delay_ms": 1500,
   "open_direction": "right"
 }
 ```
@@ -233,6 +211,76 @@ All fields are optional. Only provided fields will be updated.
 {"type": "stop"}
 ```
 
+#### Get All CNC Settings
+Query all CNC controller settings (sends `$$` command to grblHAL):
+```json
+{"type": "get_cnc_settings"}
+```
+
+Response:
+```json
+{
+  "type": "cnc_settings",
+  "settings": {
+    "$0": "10",
+    "$1": "25",
+    "$5": "0",
+    "$120": "1000.000",
+    "$121": "1000.000",
+    "$130": "1500.000",
+    ...
+  }
+}
+```
+
+#### Get Specific CNC Setting
+Get the value of a single CNC setting:
+```json
+{
+  "type": "get_cnc_setting",
+  "setting": "$120"
+}
+```
+
+Response:
+```json
+{
+  "type": "cnc_setting",
+  "setting": "$120",
+  "value": "1000.000"
+}
+```
+
+#### Set CNC Setting
+Set a specific CNC setting (sends command like `$120=1500` to grblHAL):
+```json
+{
+  "type": "set_cnc_setting",
+  "setting": "$120",
+  "value": "1500"
+}
+```
+
+Response on success:
+```json
+{
+  "type": "response",
+  "success": true,
+  "command": "set_cnc_setting"
+}
+```
+
+**Common CNC Settings:**
+- `$5` - Limit pins invert (0=Normally Open, 1=Normally Closed)
+- `$120` - X-axis acceleration (mm/sec²)
+- `$121` - Y-axis acceleration (mm/sec²)
+- `$122` - Z-axis acceleration (mm/sec²)
+- `$130` - X-axis max travel (mm)
+- `$131` - Y-axis max travel (mm)
+- `$132` - Z-axis max travel (mm)
+
+See grblHAL documentation for complete list of settings.
+
 #### Keep-Alive
 ```json
 {"type": "noop"}
@@ -241,7 +289,7 @@ All fields are optional. Only provided fields will be updated.
 ### Server Messages (Responses)
 
 #### Status Update
-Sent automatically when state changes and in response to `get_status`:
+Sent automatically when state changes and in response to `status`:
 ```json
 {
   "type": "status",
