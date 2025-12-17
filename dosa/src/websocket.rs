@@ -210,6 +210,18 @@ impl WebSocketServer {
                     config: None,
                 })
             }
+            ClientMessage::Move { percent } => {
+                if let Err(e) = self.door.move_to_percent(percent).await {
+                    return Ok(ServerMessage::Error {
+                        message: format!("Failed to move door to {}%: {}", percent, e),
+                    });
+                }
+                Ok(ServerMessage::Response {
+                    success: true,
+                    command: "move".to_string(),
+                    config: None,
+                })
+            }
             ClientMessage::Home => {
                 if let Err(e) = self.door.home().await {
                     return Ok(ServerMessage::Error {
