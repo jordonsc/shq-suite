@@ -18,6 +18,10 @@ pub enum ClientMessage {
     Open,
     /// Close the door
     Close,
+    /// Move to a specific percentage (0-100, where 0=closed, 100=fully open)
+    Move {
+        percent: f64,
+    },
     /// Home the door (move to limit switch and set as closed position)
     Home,
     /// Zero the door (set current position as home without homing sequence)
@@ -120,6 +124,10 @@ pub struct DoorStatus {
     /// Returns 0 if not yet homed
     #[serde(serialize_with = "round_to_3dp")]
     pub position_mm: f64,
+    /// Current position as percentage (0.0 = closed, 100.0 = fully open)
+    /// Capped at 0-100 even if position is out of bounds
+    #[serde(serialize_with = "round_to_3dp")]
+    pub position_percent: f64,
     /// Error message if in fault state
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fault_message: Option<String>,

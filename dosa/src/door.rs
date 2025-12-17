@@ -18,6 +18,17 @@ pub struct DoorController {
 }
 
 impl DoorController {
+    /// Calculate position as percentage (0-100), capped at bounds
+    fn calculate_position_percent(position_mm: f64, open_distance: f64) -> f64 {
+        let abs_open = open_distance.abs();
+        if abs_open == 0.0 {
+            return 0.0;
+        }
+
+        let percent = (position_mm.abs() / abs_open) * 100.0;
+        percent.max(0.0).min(100.0)
+    }
+
     /// Create a new door controller
     pub async fn new(cnc: CncController, config: DoorConfig) -> Result<Self> {
         let controller = Self {
@@ -26,6 +37,7 @@ impl DoorController {
             status: Arc::new(Mutex::new(DoorStatus {
                 state: DoorState::Pending,
                 position_mm: 0.0,
+                position_percent: 0.0,
                 fault_message: None,
                 alarm_code: None,
             })),
@@ -48,6 +60,7 @@ impl DoorController {
             status: Arc::new(Mutex::new(DoorStatus {
                 state: DoorState::Fault,
                 position_mm: 0.0,
+                position_percent: 0.0,
                 fault_message: Some(error),
                 alarm_code: None,
             })),
@@ -250,9 +263,11 @@ impl DoorController {
                         if homed {
                             let home_pos = *home_position.lock().await;
                             st.position_mm = mpos - home_pos;
+                            st.position_percent = Self::calculate_position_percent(st.position_mm, cfg.open_distance);
                             tracing::debug!("[Monitor] Position: MPos={}, HomePos={}, Relative={}", mpos, home_pos, st.position_mm);
                         } else {
                             st.position_mm = 0.0;
+                            st.position_percent = 0.0;
                             tracing::debug!("[Monitor] Position: not homed, returning 0.0 (MPos={})", mpos);
                         }
                     }
@@ -423,6 +438,7 @@ impl DoorController {
 
         let mut st = self.status.lock().await;
         st.position_mm = position;
+        st.position_percent = Self::calculate_position_percent(position, cfg.open_distance);
 
         // Update state based on CNC state and position
         if let Ok(cnc_state) = CncController::parse_state(&status_str) {
@@ -590,6 +606,7 @@ impl DoorController {
         {
             let mut status = self.status.lock().await;
             status.position_mm = 0.0;
+            status.position_percent = 0.0;
             status.state = DoorState::Closed;
         }
 
@@ -667,6 +684,7 @@ impl DoorController {
         {
             let mut status = self.status.lock().await;
             status.position_mm = 0.0;
+            status.position_percent = 0.0;
             status.state = DoorState::Closed;
         }
 
@@ -879,6 +897,90 @@ impl DoorController {
         Ok(())
     }
 
+    /// Move to a specific percentage (0-100)
+    pub async fn move_to_percent(&self, percent: f64) -> Result<()> {
+        // Validate percentage
+        if percent < 0.0 || percent > 100.0 {
+            return Err(anyhow::anyhow!("Percentage must be between 0 and 100, got {}", percent));
+        }
+
+        {
+            let status = self.status.lock().await;
+
+            // Check if homed
+            let is_homed = *self.is_homed.lock().await;
+            if !is_homed {
+                return Err(anyhow::anyhow!("Door must be homed before moving. Please run home command first."));
+            }
+
+            // Check if already moving - if so, ignore this command
+            match status.state {
+                DoorState::Opening | DoorState::Closing | DoorState::Homing | DoorState::Halting => {
+                    return Err(anyhow::anyhow!("Door is already moving (state: {:?}). Wait for current operation to complete.", status.state));
+                }
+                DoorState::Fault => {
+                    return Err(anyhow::anyhow!(
+                        "System is in fault state: {}",
+                        status.fault_message.as_ref().unwrap_or(&"Unknown error".to_string())
+                    ));
+                }
+                DoorState::Alarm => {
+                    let alarm_msg = if let Some(code) = &status.alarm_code {
+                        format!("CNC is in alarm state (Code {}). Use clear_alarm command first.", code)
+                    } else {
+                        "CNC is in alarm state. Use clear_alarm command first.".to_string()
+                    };
+                    return Err(anyhow::anyhow!(alarm_msg));
+                }
+                _ => {} // Closed, Open, Intermediate, Pending - allow movement
+            }
+        }
+
+        let config = self.config.read().await;
+        let open_speed = config.open_speed;
+        let close_speed = config.close_speed;
+        let axis = config.cnc_axis.clone();
+
+        // Calculate target position
+        let target_position = if config.open_direction.to_lowercase() == "left" {
+            -(config.open_distance * percent / 100.0)
+        } else {
+            config.open_distance * percent / 100.0
+        };
+
+        // Get current position to determine direction
+        let current_pos = self.status.lock().await.position_mm;
+
+        // Determine if opening or closing
+        let moving_toward_open = target_position.abs() > current_pos.abs();
+        let speed = if moving_toward_open { open_speed } else { close_speed };
+
+        // Set state
+        {
+            let mut status = self.status.lock().await;
+            status.state = if moving_toward_open { DoorState::Opening } else { DoorState::Closing };
+        }
+
+        tracing::info!("Moving to {}% (position {} mm) at {} mm/min", percent, target_position, speed);
+
+        // Send move command
+        let cnc = self.cnc.clone();
+        self.execute_with_reconnect(
+            move || {
+                let cnc = cnc.clone();
+                let axis = axis.clone();
+                async move {
+                    let cnc_read = cnc.read().await;
+                    cnc_read.move_absolute(&axis, target_position, speed).await
+                }
+            },
+            "Move to percent",
+        )
+        .await?;
+
+        Ok(())
+    }
+
     /// Emergency stop
     pub async fn stop(&self) -> Result<()> {
         // Set stop flag
@@ -976,6 +1078,7 @@ impl DoorController {
 
             let mut status = self.status.lock().await;
             status.position_mm = relative_pos;
+            status.position_percent = Self::calculate_position_percent(relative_pos, config.open_distance);
 
             // Determine state based on position
             if homed {
