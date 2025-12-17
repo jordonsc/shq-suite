@@ -1,0 +1,12 @@
+{
+  "websocket": {
+    "host": "0.0.0.0",
+    "port": 8765
+  },
+  "auto_dim": {
+    "enabled": true,
+    "dim_level": 10,
+    "bright_level": 100,
+    "timeout_seconds": 300
+  }
+}

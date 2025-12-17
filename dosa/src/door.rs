@@ -100,6 +100,12 @@ impl DoorController {
     async fn try_reconnect(&self) -> Result<()> {
         tracing::info!("Attempting to reconnect to CNC controller...");
 
+        // Close the old connection explicitly (important for serial ports)
+        {
+            let cnc = self.cnc.read().await;
+            cnc.close().await;
+        }
+
         // Get current config
         let config = self.config.read().await.clone();
 
@@ -108,21 +114,70 @@ impl DoorController {
             .await
             .context("Failed to create new CNC connection")?;
 
-        // Validate stop_delay_ms
-        cnc.validate_stop_delay(
-            &config.cnc_axis,
-            config.open_speed,
-            config.close_speed,
-            config.stop_delay_ms,
-        )
-        .await
-        .context("Stop delay validation failed")?;
-
         // Reconnect
         self.reconnect(cnc, config).await?;
 
         tracing::info!("Reconnection successful");
         Ok(())
+    }
+
+    /// Execute a command with automatic reconnection on connection errors
+    ///
+    /// This helper method:
+    /// 1. Executes the provided async function
+    /// 2. If it fails, checks if the error is a connection error
+    /// 3. Only reconnects on connection errors (not grblHAL command errors)
+    /// 4. Retries the command once after successful reconnection
+    ///
+    /// # Arguments
+    /// * `operation` - The async function to execute
+    /// * `operation_name` - Name of the operation for logging
+    async fn execute_with_reconnect<F, Fut, T>(
+        &self,
+        mut operation: F,
+        operation_name: &str,
+    ) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        match operation().await {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                // Only attempt reconnection on connection errors, not grblHAL errors
+                if CncController::is_connection_error(&e) {
+                    tracing::warn!(
+                        "{} failed due to connection error: {}. Attempting reconnection...",
+                        operation_name,
+                        e
+                    );
+
+                    // Try to reconnect
+                    if let Err(reconnect_err) = self.try_reconnect().await {
+                        self.set_fault(format!("Failed to reconnect: {}", reconnect_err))
+                            .await;
+                        return Err(anyhow::anyhow!(
+                            "{} failed and reconnection failed: {}",
+                            operation_name,
+                            reconnect_err
+                        ));
+                    }
+
+                    // Retry the operation after successful reconnection
+                    operation()
+                        .await
+                        .context(format!("{} failed after reconnection", operation_name))
+                } else {
+                    // grblHAL command error - don't reconnect, just return the error
+                    tracing::debug!(
+                        "{} failed with command error (not reconnecting): {}",
+                        operation_name,
+                        e
+                    );
+                    Err(e)
+                }
+            }
+        }
     }
 
     /// Start background task to monitor position
@@ -139,14 +194,14 @@ impl DoorController {
             loop {
                 ticker.tick().await;
 
-                // Only poll during active movement (Opening, Closing, Homing)
+                // Only poll during active movement (Opening, Closing)
                 // Skip polling when in other states
                 {
                     let st = status.lock().await;
 
                     // Only monitor during movement operations
                     match st.state {
-                        DoorState::Opening | DoorState::Closing | DoorState::Homing => {
+                        DoorState::Opening | DoorState::Closing => {
                             // Continue to poll
                         }
                         _ => {
@@ -288,127 +343,122 @@ impl DoorController {
 
     /// Query CNC controller and update status, then return current status
     pub async fn query_and_get_status(&self) -> Result<DoorStatus> {
-        // Query CNC controller (even if in fault state, to allow recovery)
-        let status_result = {
-            let cnc = self.cnc.read().await;
-            cnc.get_status().await
-        }; // Drop read lock before processing result
-
-        match status_result {
-            Ok(status_str) => {
-                let cfg = self.config.read().await;
-                let homed = *self.is_homed.lock().await;
-                let mut st = self.status.lock().await;
-
-                // Check for alarm state
-                let (is_alarm, alarm_code) = CncController::parse_alarm(&status_str);
-                if is_alarm && st.state != DoorState::Alarm {
-                    tracing::warn!("CNC Alarm detected: Code {:?}", alarm_code);
-                } else if !is_alarm && st.state == DoorState::Alarm {
-                    tracing::info!("CNC Alarm cleared");
-                }
-
-                // If alarm, set state and return
-                if is_alarm {
-                    st.state = DoorState::Alarm;
-                    st.alarm_code = alarm_code;
-                    return Ok(st.clone());
-                }
-
-                // Clear alarm code if no alarm
-                st.alarm_code = None;
-
-                // Clear fault state if we were in fault and now successfully connected
-                if st.state == DoorState::Fault {
-                    st.fault_message = None;
-                    tracing::info!("Connection recovered, clearing fault state");
-                }
-
-                // Parse position (convert to relative by default)
-                drop(st); // Release lock before calling parse_position
-                let position = self.parse_position(&status_str, true).await.unwrap_or(0.0);
-                let mut st = self.status.lock().await;
-                st.position_mm = position;
-
-                // Update state based on CNC state and position
-                if let Ok(cnc_state) = CncController::parse_state(&status_str) {
-                    match cnc_state.as_str() {
-                        "Idle" => {
-                            if homed {
-                                let pos = st.position_mm;
-
-                                // Calculate target open position based on direction
-                                let target_open_pos = if cfg.open_direction.to_lowercase() == "left" {
-                                    -cfg.open_distance
-                                } else {
-                                    cfg.open_distance
-                                };
-
-                                // Check if at closed position (within 0.1mm for floating point precision)
-                                if (pos - 0.0).abs() < 0.1 {
-                                    st.state = DoorState::Closed;
-                                }
-                                // Check if at open position (within 0.1mm for floating point precision)
-                                else if (pos - target_open_pos).abs() < 0.1 {
-                                    st.state = DoorState::Open;
-                                }
-                                // Otherwise keep current state
-                            } else {
-                                st.state = DoorState::Pending;
-                            }
+        // Query CNC controller with automatic reconnection on connection errors
+        // Wrap the entire operation in a timeout to avoid blocking WebSocket
+        let query_operation = async {
+            let cnc = self.cnc.clone();
+            let status_str = self
+                .execute_with_reconnect(
+                    move || {
+                        let cnc = cnc.clone();
+                        async move {
+                            let cnc_read = cnc.read().await;
+                            cnc_read.get_status().await
                         }
-                        "Home" => {
-                            st.state = DoorState::Homing;
-                        }
-                        _ => {}
-                    }
-                }
+                    },
+                    "Status query",
+                )
+                .await?;
 
+            // Parse and update status
+            self.parse_and_update_status(&status_str).await
+        };
+
+        match tokio::time::timeout(Duration::from_secs(3), query_operation).await {
+            Ok(Ok(status)) => Ok(status),
+            Ok(Err(e)) => {
+                // Error occurred during query/reconnection
+                tracing::error!("Status query failed: {}", e);
+                let mut st = self.status.lock().await;
+                st.state = DoorState::Fault;
+                st.fault_message = Some(format!("Connection lost: {}", e));
                 Ok(st.clone())
             }
-            Err(e) => {
-                // Connection error - attempt quick reconnection with tight timeout
-                tracing::warn!("Status query failed: {}. Attempting reconnection...", e);
-
-                // Wrap entire reconnection + retry in 3-second timeout to avoid blocking WebSocket
-                let reconnect_and_retry = async {
-                    // Try to reconnect
-                    self.try_reconnect().await?;
-
-                    // Reconnection succeeded - retry the query
-                    let cnc = self.cnc.read().await;
-                    let status_str = cnc.get_status().await?;
-                    let position = self.parse_position(&status_str, true).await.unwrap_or(0.0);
-
-                    let mut st = self.status.lock().await;
-                    st.position_mm = position;
-                    st.state = DoorState::Pending; // After reconnect, needs re-homing
-
-                    Ok::<DoorStatus, anyhow::Error>(st.clone())
-                };
-
-                match tokio::time::timeout(Duration::from_secs(3), reconnect_and_retry).await {
-                    Ok(Ok(status)) => {
-                        tracing::info!("Reconnection successful");
-                        Ok(status)
-                    }
-                    Ok(Err(reconnect_err)) => {
-                        tracing::error!("Reconnection failed: {}", reconnect_err);
-                        let mut st = self.status.lock().await;
-                        st.state = DoorState::Fault;
-                        st.fault_message = Some(format!("Connection lost: {}", reconnect_err));
-                        Ok(st.clone())
-                    }
-                    Err(_) => {
-                        tracing::error!("Reconnection timed out after 3 seconds");
-                        let mut st = self.status.lock().await;
-                        st.state = DoorState::Fault;
-                        st.fault_message = Some("Reconnection timed out".to_string());
-                        Ok(st.clone())
-                    }
-                }
+            Err(_) => {
+                // Timeout
+                tracing::error!("Status query timed out after 3 seconds");
+                let mut st = self.status.lock().await;
+                st.state = DoorState::Fault;
+                st.fault_message = Some("Status query timed out".to_string());
+                Ok(st.clone())
             }
         }
+    }
+
+    /// Parse status string and update internal status
+    async fn parse_and_update_status(&self, status_str: &str) -> Result<DoorStatus> {
+        let homed = *self.is_homed.lock().await;
+        let mut st = self.status.lock().await;
+
+        // Check for alarm state
+        let (is_alarm, alarm_code) = CncController::parse_alarm(&status_str);
+        if is_alarm && st.state != DoorState::Alarm {
+            tracing::warn!("CNC Alarm detected: Code {:?}", alarm_code);
+        } else if !is_alarm && st.state == DoorState::Alarm {
+            tracing::info!("CNC Alarm cleared");
+        }
+
+        // If alarm, set state and return
+        if is_alarm {
+            st.state = DoorState::Alarm;
+            st.alarm_code = alarm_code;
+            return Ok(st.clone());
+        }
+
+        // Clear alarm code if no alarm
+        st.alarm_code = None;
+
+        // Clear fault state if we were in fault and now successfully connected
+        if st.state == DoorState::Fault {
+            st.fault_message = None;
+            tracing::info!("Connection recovered, clearing fault state");
+        }
+
+        // Parse position (convert to relative by default)
+        drop(st); // Release lock before calling parse_position
+        let position = self.parse_position(&status_str, true).await.unwrap_or(0.0);
+
+        // Get config for state logic
+        let cfg = self.config.read().await;
+
+        let mut st = self.status.lock().await;
+        st.position_mm = position;
+
+        // Update state based on CNC state and position
+        if let Ok(cnc_state) = CncController::parse_state(&status_str) {
+            match cnc_state.as_str() {
+                "Idle" => {
+                    if homed {
+                        let pos = st.position_mm;
+
+                        // Calculate target open position based on direction
+                        let target_open_pos = if cfg.open_direction.to_lowercase() == "left" {
+                            -cfg.open_distance
+                        } else {
+                            cfg.open_distance
+                        };
+
+                        // Check if at closed position (within 0.1mm for floating point precision)
+                        if (pos - 0.0).abs() < 0.1 {
+                            st.state = DoorState::Closed;
+                        }
+                        // Check if at open position (within 0.1mm for floating point precision)
+                        else if (pos - target_open_pos).abs() < 0.1 {
+                            st.state = DoorState::Open;
+                        }
+                        // Otherwise keep current state
+                    } else {
+                        st.state = DoorState::Pending;
+                    }
+                }
+                "Home" => {
+                    st.state = DoorState::Homing;
+                }
+                _ => {}
+            }
+        }
+
+        Ok(st.clone())
     }
 
     /// Update configuration
@@ -461,68 +511,60 @@ impl DoorController {
 
         tracing::info!("Homing door on {} axis", config.cnc_axis);
 
-        // Send home command with reconnection on failure
-        let cnc = self.cnc.read().await;
-        let result = cnc.home_axis(&config.cnc_axis).await;
-        drop(cnc);
-
-        if let Err(e) = result {
-            tracing::warn!("Home command failed: {}. Attempting reconnection...", e);
-            if let Err(reconnect_err) = self.try_reconnect().await {
-                self.set_fault(format!("Failed to reconnect: {}", reconnect_err)).await;
-                return Err(anyhow::anyhow!("Home failed and reconnection failed: {}", reconnect_err));
-            }
-
-            // Retry after successful reconnection
-            let cnc = self.cnc.read().await;
-            cnc.home_axis(&config.cnc_axis)
-                .await
-                .context("Home failed after reconnection")?;
-        }
-
-        // Wait for homing to complete
-        self.wait_for_idle().await?;
+        // Send home command with automatic reconnection on connection errors
+        // Note: home_axis() waits for homing to complete internally
+        let axis = config.cnc_axis.clone();
+        let cnc = self.cnc.clone();
+        self.execute_with_reconnect(
+            move || {
+                let cnc = cnc.clone();
+                let axis = axis.clone();
+                async move {
+                    let cnc_read = cnc.read().await;
+                    cnc_read.home_axis(&axis).await
+                }
+            },
+            "Home command",
+        )
+        .await?;
 
         // Move back by limit offset
         tracing::info!("Moving back by {} mm from limit", config.limit_offset);
-        let cnc = self.cnc.read().await;
-        let result = cnc.move_absolute(&config.cnc_axis, config.limit_offset, config.close_speed).await;
-        drop(cnc);
-
-        if let Err(e) = result {
-            tracing::warn!("Move to offset failed: {}. Attempting reconnection...", e);
-            if let Err(reconnect_err) = self.try_reconnect().await {
-                self.set_fault(format!("Failed to reconnect: {}", reconnect_err)).await;
-                return Err(anyhow::anyhow!("Move failed and reconnection failed: {}", reconnect_err));
-            }
-
-            let cnc = self.cnc.read().await;
-            cnc.move_absolute(&config.cnc_axis, config.limit_offset, config.close_speed)
-                .await
-                .context("Move to offset failed after reconnection")?;
-        }
+        let axis = config.cnc_axis.clone();
+        let limit_offset = config.limit_offset;
+        let close_speed = config.close_speed;
+        let cnc = self.cnc.clone();
+        self.execute_with_reconnect(
+            move || {
+                let cnc = cnc.clone();
+                let axis = axis.clone();
+                async move {
+                    let cnc_read = cnc.read().await;
+                    cnc_read.move_absolute(&axis, limit_offset, close_speed).await
+                }
+            },
+            "Move to offset",
+        )
+        .await?;
 
         // Wait for move to complete
         self.wait_for_idle().await?;
 
         // Reset position to zero (this is now our closed position)
         let reset_cmd = format!("G92 {}0", config.cnc_axis);
-        let cnc = self.cnc.read().await;
-        let result = cnc.send_command(&reset_cmd).await;
-        drop(cnc);
-
-        if let Err(e) = result {
-            tracing::warn!("Reset position failed: {}. Attempting reconnection...", e);
-            if let Err(reconnect_err) = self.try_reconnect().await {
-                self.set_fault(format!("Failed to reconnect: {}", reconnect_err)).await;
-                return Err(anyhow::anyhow!("Reset position failed and reconnection failed: {}", reconnect_err));
-            }
-
-            let cnc = self.cnc.read().await;
-            cnc.send_command(&reset_cmd)
-                .await
-                .context("Reset position failed after reconnection")?;
-        }
+        let cnc = self.cnc.clone();
+        self.execute_with_reconnect(
+            move || {
+                let cnc = cnc.clone();
+                let reset_cmd = reset_cmd.clone();
+                async move {
+                    let cnc_read = cnc.read().await;
+                    cnc_read.send_command(&reset_cmd).await
+                }
+            },
+            "Reset position",
+        )
+        .await?;
 
         // Query current position and record as home position (use raw MPos, not relative)
         let cnc = self.cnc.read().await;
@@ -586,22 +628,20 @@ impl DoorController {
         let reset_cmd = format!("G92 {}0", config.cnc_axis);
         drop(config);
 
-        let cnc = self.cnc.read().await;
-        let result = cnc.send_command(&reset_cmd).await;
-        drop(cnc);
-
-        if let Err(e) = result {
-            tracing::warn!("Zero command failed: {}. Attempting reconnection...", e);
-            if let Err(reconnect_err) = self.try_reconnect().await {
-                self.set_fault(format!("Failed to reconnect: {}", reconnect_err)).await;
-                return Err(anyhow::anyhow!("Zero failed and reconnection failed: {}", reconnect_err));
-            }
-
-            let cnc = self.cnc.read().await;
-            cnc.send_command(&reset_cmd)
-                .await
-                .context("Zero failed after reconnection")?;
-        }
+        // Send reset command with automatic reconnection on connection errors
+        let cnc = self.cnc.clone();
+        self.execute_with_reconnect(
+            move || {
+                let cnc = cnc.clone();
+                let reset_cmd = reset_cmd.clone();
+                async move {
+                    let cnc_read = cnc.read().await;
+                    cnc_read.send_command(&reset_cmd).await
+                }
+            },
+            "Zero command",
+        )
+        .await?;
 
         // Query current position and record as home position (use raw MPos, not relative)
         let cnc = self.cnc.read().await;
@@ -649,21 +689,9 @@ impl DoorController {
 
         // Send unlock command to grblHAL ($X)
         let cnc = self.cnc.read().await;
-        let result = cnc.send_command("$X").await;
-        drop(cnc);
-
-        if let Err(e) = result {
-            tracing::warn!("Clear alarm command failed: {}. Attempting reconnection...", e);
-            if let Err(reconnect_err) = self.try_reconnect().await {
-                self.set_fault(format!("Failed to reconnect: {}", reconnect_err)).await;
-                return Err(anyhow::anyhow!("Clear alarm failed and reconnection failed: {}", reconnect_err));
-            }
-
-            let cnc = self.cnc.read().await;
-            cnc.send_command("$X")
-                .await
-                .context("Clear alarm failed after reconnection")?;
-        }
+        cnc.send_command("$X")
+            .await
+            .context("Failed to clear alarm - controller may not be in a clearable alarm state")?;
 
         tracing::info!("Alarm clear command sent - monitor will update status");
         Ok(())
@@ -746,23 +774,20 @@ impl DoorController {
 
         tracing::info!("Opening door to {} mm at {} mm/min", target_position, open_speed);
 
-        // Send move command with reconnection on failure
-        let cnc = self.cnc.read().await;
-        let result = cnc.move_absolute(&axis, target_position, open_speed).await;
-        drop(cnc);
-
-        if let Err(e) = result {
-            tracing::warn!("Open command failed: {}. Attempting reconnection...", e);
-            if let Err(reconnect_err) = self.try_reconnect().await {
-                self.set_fault(format!("Failed to reconnect: {}", reconnect_err)).await;
-                return Err(anyhow::anyhow!("Open failed and reconnection failed: {}", reconnect_err));
-            }
-
-            let cnc = self.cnc.read().await;
-            cnc.move_absolute(&axis, target_position, open_speed)
-                .await
-                .context("Open failed after reconnection")?;
-        }
+        // Send move command with automatic reconnection on connection errors
+        let cnc = self.cnc.clone();
+        self.execute_with_reconnect(
+            move || {
+                let cnc = cnc.clone();
+                let axis = axis.clone();
+                async move {
+                    let cnc_read = cnc.read().await;
+                    cnc_read.move_absolute(&axis, target_position, open_speed).await
+                }
+            },
+            "Open command",
+        )
+        .await?;
 
         Ok(())
     }
@@ -836,23 +861,20 @@ impl DoorController {
 
         tracing::info!("Closing door to 0 mm at {} mm/min", close_speed);
 
-        // Send move command to home position (0mm) with reconnection on failure
-        let cnc = self.cnc.read().await;
-        let result = cnc.move_absolute(&axis, 0.0, close_speed).await;
-        drop(cnc);
-
-        if let Err(e) = result {
-            tracing::warn!("Close command failed: {}. Attempting reconnection...", e);
-            if let Err(reconnect_err) = self.try_reconnect().await {
-                self.set_fault(format!("Failed to reconnect: {}", reconnect_err)).await;
-                return Err(anyhow::anyhow!("Close failed and reconnection failed: {}", reconnect_err));
-            }
-
-            let cnc = self.cnc.read().await;
-            cnc.move_absolute(&axis, 0.0, close_speed)
-                .await
-                .context("Close failed after reconnection")?;
-        }
+        // Send move command to home position (0mm) with automatic reconnection on connection errors
+        let cnc = self.cnc.clone();
+        self.execute_with_reconnect(
+            move || {
+                let cnc = cnc.clone();
+                let axis = axis.clone();
+                async move {
+                    let cnc_read = cnc.read().await;
+                    cnc_read.move_absolute(&axis, 0.0, close_speed).await
+                }
+            },
+            "Close command",
+        )
+        .await?;
 
         Ok(())
     }
@@ -874,22 +896,18 @@ impl DoorController {
         // Step 1: Send feed hold to decelerate safely
         // Feed hold (!) respects $120 acceleration settings and decelerates properly
         tracing::info!("Stop requested - sending feed hold");
-        let cnc = self.cnc.read().await;
-        let result = cnc.feed_hold().await;
-        drop(cnc);
-
-        if let Err(e) = result {
-            tracing::warn!("Feed hold command failed: {}. Attempting reconnection...", e);
-            if let Err(reconnect_err) = self.try_reconnect().await {
-                self.set_fault(format!("Failed to reconnect: {}", reconnect_err)).await;
-                return Err(anyhow::anyhow!("Feed hold failed and reconnection failed: {}", reconnect_err));
-            }
-
-            let cnc = self.cnc.read().await;
-            cnc.feed_hold()
-                .await
-                .context("Feed hold failed after reconnection")?;
-        }
+        let cnc = self.cnc.clone();
+        self.execute_with_reconnect(
+            move || {
+                let cnc = cnc.clone();
+                async move {
+                    let cnc_read = cnc.read().await;
+                    cnc_read.feed_hold().await
+                }
+            },
+            "Feed hold",
+        )
+        .await?;
 
         // Step 2: Poll status until we see "Hold:0" (motor fully stopped)
         // Hold:1 means still stopping, Hold:0 means stopped
@@ -936,22 +954,18 @@ impl DoorController {
         // Step 3: Send queue flush to clear pending commands gracefully
         // Motor is already stopped, so this is safe (no sudden deceleration)
         tracing::info!("Sending queue flush to clear pending commands");
-        let cnc = self.cnc.read().await;
-        let result = cnc.queue_flush().await;
-        drop(cnc);
-
-        if let Err(e) = result {
-            tracing::warn!("Queue flush command failed: {}. Attempting reconnection...", e);
-            if let Err(reconnect_err) = self.try_reconnect().await {
-                self.set_fault(format!("Failed to reconnect: {}", reconnect_err)).await;
-                return Err(anyhow::anyhow!("Queue flush failed and reconnection failed: {}", reconnect_err));
-            }
-
-            let cnc = self.cnc.read().await;
-            cnc.queue_flush()
-                .await
-                .context("Queue flush failed after reconnection")?;
-        }
+        let cnc = self.cnc.clone();
+        self.execute_with_reconnect(
+            move || {
+                let cnc = cnc.clone();
+                async move {
+                    let cnc_read = cnc.read().await;
+                    cnc_read.queue_flush().await
+                }
+            },
+            "Queue flush",
+        )
+        .await?;
 
         // Verify position is still tracked after reset
         let cnc = self.cnc.read().await;
@@ -1006,12 +1020,15 @@ impl DoorController {
     }
 
     /// Wait for CNC to reach idle state
+    /// Uses longer polling intervals to avoid flooding the serial buffer during
+    /// operations like homing where the controller doesn't respond to queries
     async fn wait_for_idle(&self) -> Result<()> {
         let mut attempts = 0;
-        const MAX_ATTEMPTS: u32 = 100; // 20 seconds max wait
+        const MAX_ATTEMPTS: u32 = 60; // 60 seconds max wait
+        const POLL_INTERVAL_MS: u64 = 1000; // Poll every 1 second
 
         loop {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
             attempts += 1;
 
             if attempts > MAX_ATTEMPTS {
@@ -1024,9 +1041,31 @@ impl DoorController {
                     if state == "Idle" {
                         return Ok(());
                     }
+                    // Log current state if not idle
+                    tracing::debug!("Waiting for idle, current state: {}", state);
                 }
             }
+            // If query times out or fails, just continue waiting
+            // (grblHAL doesn't respond to status queries during some operations like homing)
         }
+    }
+
+    /// Query all CNC settings
+    pub async fn query_cnc_settings(&self) -> Result<indexmap::IndexMap<String, String>> {
+        let cnc = self.cnc.read().await;
+        cnc.query_settings().await
+    }
+
+    /// Get a specific CNC setting
+    pub async fn get_cnc_setting(&self, setting_name: &str) -> Result<String> {
+        let cnc = self.cnc.read().await;
+        cnc.get_setting(setting_name).await
+    }
+
+    /// Set a specific CNC setting
+    pub async fn set_cnc_setting(&self, setting_name: &str, value: &str) -> Result<()> {
+        let cnc = self.cnc.read().await;
+        cnc.set_setting(setting_name, value).await
     }
 }
 

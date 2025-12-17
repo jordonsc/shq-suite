@@ -258,7 +258,7 @@ impl WebSocketServer {
                     config: None,
                 })
             }
-            ClientMessage::GetStatus => {
+            ClientMessage::Status => {
                 // Query controller for fresh status before responding
                 match self.door.query_and_get_status().await {
                     Ok(status) => Ok(ServerMessage::Status {
@@ -276,7 +276,6 @@ impl WebSocketServer {
                 close_speed,
                 cnc_axis,
                 limit_offset,
-                stop_delay_ms,
                 open_direction,
             } => {
                 let mut config = self.door.get_config().await;
@@ -295,9 +294,6 @@ impl WebSocketServer {
                 }
                 if let Some(offset) = limit_offset {
                     config.limit_offset = offset;
-                }
-                if let Some(delay) = stop_delay_ms {
-                    config.stop_delay_ms = delay;
                 }
                 if let Some(dir) = open_direction {
                     config.open_direction = dir;
@@ -323,6 +319,34 @@ impl WebSocketServer {
                     command: "get_config".to_string(),
                     config: Some(config),
                 })
+            }
+            ClientMessage::GetCncSettings => {
+                match self.door.query_cnc_settings().await {
+                    Ok(settings) => Ok(ServerMessage::CncSettings { settings }),
+                    Err(e) => Ok(ServerMessage::Error {
+                        message: format!("Failed to query CNC settings: {}", e),
+                    }),
+                }
+            }
+            ClientMessage::GetCncSetting { setting } => {
+                match self.door.get_cnc_setting(&setting).await {
+                    Ok(value) => Ok(ServerMessage::CncSetting { setting, value }),
+                    Err(e) => Ok(ServerMessage::Error {
+                        message: format!("Failed to get CNC setting {}: {}", setting, e),
+                    }),
+                }
+            }
+            ClientMessage::SetCncSetting { setting, value } => {
+                match self.door.set_cnc_setting(&setting, &value).await {
+                    Ok(()) => Ok(ServerMessage::Response {
+                        success: true,
+                        command: "set_cnc_setting".to_string(),
+                        config: None,
+                    }),
+                    Err(e) => Ok(ServerMessage::Error {
+                        message: format!("Failed to set CNC setting {}={}: {}", setting, value, e),
+                    }),
+                }
             }
             ClientMessage::Noop => Ok(ServerMessage::Response {
                 success: true,

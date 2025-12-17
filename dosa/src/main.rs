@@ -14,10 +14,8 @@ use config::ConfigManager;
 use door::DoorController;
 use websocket::WebSocketServer;
 
-/// Initialize the system (config, CNC, door controller)
-async fn initialize_system() -> Result<(DoorController, ConfigManager)> {
-    // Initialize configuration manager
-    let config_manager = ConfigManager::new().await?;
+/// Initialize the door controller using existing config manager
+async fn initialize_door(config_manager: &ConfigManager) -> Result<DoorController> {
     let door_config = config_manager.get_door_config();
 
     tracing::info!("Door configuration:");
@@ -26,27 +24,16 @@ async fn initialize_system() -> Result<(DoorController, ConfigManager)> {
     tracing::info!("  Close speed: {} mm/min", door_config.close_speed);
     tracing::info!("  CNC axis: {}", door_config.cnc_axis);
     tracing::info!("  Limit offset: {} mm", door_config.limit_offset);
-    tracing::info!("  Stop delay: {} ms", door_config.stop_delay_ms);
 
     // Initialize CNC controller
     let cnc = CncController::new(&door_config.cnc_connection).await?;
     tracing::info!("Connected to CNC controller");
 
-    // Validate stop_delay_ms is sufficient for safe deceleration
-    tracing::info!("Validating stop_delay_ms configuration...");
-    cnc.validate_stop_delay(
-        &door_config.cnc_axis,
-        door_config.open_speed,
-        door_config.close_speed,
-        door_config.stop_delay_ms,
-    )
-    .await?;
-
     // Initialize door controller
     let door = DoorController::new(cnc, door_config).await?;
     tracing::info!("Door controller initialized");
 
-    Ok((door, config_manager))
+    Ok(door)
 }
 
 #[tokio::main]
@@ -61,39 +48,39 @@ async fn main() -> Result<()> {
 
     tracing::info!("Starting DOSA (Door Opening Sensor Automation) v{}", env!("CARGO_PKG_VERSION"));
 
-    // Parse command-line arguments
+    // Load configuration
+    let config_manager = ConfigManager::new().await?;
+    let ws_config = config_manager.get_websocket_config();
+
+    // Parse command-line arguments (can override config values)
     let args: Vec<String> = std::env::args().collect();
     let host = args
         .iter()
         .position(|arg| arg == "--host")
         .and_then(|i| args.get(i + 1))
-        .map(|s| s.as_str())
-        .unwrap_or("0.0.0.0");
+        .map(|s| s.to_string())
+        .unwrap_or(ws_config.host);
 
     let port = args
         .iter()
         .position(|arg| arg == "--port")
         .and_then(|i| args.get(i + 1))
         .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(8766);
+        .unwrap_or(ws_config.port);
 
     let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
 
-    // Try to initialize the system - if any error occurs, continue in fault state
-    let (door, config_manager) = match initialize_system().await {
-        Ok((door, config_manager)) => {
+    // Try to initialize the door - if any error occurs, continue in fault state
+    let door = match initialize_door(&config_manager).await {
+        Ok(door) => {
             tracing::info!("System initialized successfully");
-            (door, config_manager)
+            door
         }
         Err(e) => {
             tracing::error!("System initialization failed: {:?}", e);
             tracing::warn!("Starting in FAULT state - WebSocket API available for status");
-            // Load config manager to get the actual configuration
-            let config_manager = ConfigManager::new().await
-                .unwrap_or_else(|_| panic!("Failed to create config manager"));
             let door_config = config_manager.get_door_config();
-            let door = DoorController::new_fault(format!("{:?}", e), door_config);
-            (door, config_manager)
+            DoorController::new_fault(format!("{:?}", e), door_config)
         }
     };
 

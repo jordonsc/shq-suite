@@ -61,8 +61,10 @@ impl CncController {
         Ok(controller)
     }
 
-    /// Query all grblHAL settings
-    pub async fn query_settings(&self) -> Result<String> {
+    /// Query all grblHAL settings ($$)
+    /// Returns a map of setting names to values (e.g., "$120" -> "1000.000")
+    /// Settings are sorted numerically by the number after the $ sign
+    pub async fn query_settings(&self) -> Result<indexmap::IndexMap<String, String>> {
         let mut conn = self.connection.lock().await;
 
         let cmd = "$$\n";
@@ -82,7 +84,8 @@ impl CncController {
                     .context("Failed to flush command to CNC")?;
 
                 // Read all lines until we get "ok" with timeout
-                let mut all_settings = String::new();
+                // Use Vec to collect, then sort numerically
+                let mut settings_vec = Vec::new();
                 let mut lines_read = 0;
                 const MAX_LINES: usize = 200; // Safety limit
                 const READ_TIMEOUT_MS: u64 = 2000; // 2 second timeout per line
@@ -107,8 +110,11 @@ impl CncController {
                                 break;
                             }
 
-                            if !trimmed.is_empty() {
-                                all_settings.push_str(&line);
+                            // Parse setting line: $120=1000.000
+                            if let Some(eq_pos) = trimmed.find('=') {
+                                let setting_name = trimmed[..eq_pos].to_string();
+                                let setting_value = trimmed[eq_pos + 1..].to_string();
+                                settings_vec.push((setting_name, setting_value));
                                 lines_read += 1;
                             }
 
@@ -125,8 +131,18 @@ impl CncController {
                     }
                 }
 
-                tracing::debug!("CNC settings response: {} lines", all_settings.lines().count());
-                Ok(all_settings)
+                // Sort numerically by extracting the number from "$XXX"
+                settings_vec.sort_by(|a, b| {
+                    let num_a = a.0.trim_start_matches('$').parse::<u32>().unwrap_or(0);
+                    let num_b = b.0.trim_start_matches('$').parse::<u32>().unwrap_or(0);
+                    num_a.cmp(&num_b)
+                });
+
+                // Convert to IndexMap to preserve insertion order
+                let settings: indexmap::IndexMap<String, String> = settings_vec.into_iter().collect();
+
+                tracing::debug!("CNC settings response: {} settings", settings.len());
+                Ok(settings)
             }
             CncConnectionType::Serial(reader) => {
                 let stream = reader.get_mut();
@@ -141,7 +157,8 @@ impl CncController {
                     .context("Failed to flush command to CNC")?;
 
                 // Read all lines until we get "ok" with timeout
-                let mut all_settings = String::new();
+                // Use Vec to collect, then sort numerically
+                let mut settings_vec = Vec::new();
                 let mut lines_read = 0;
                 const MAX_LINES: usize = 200;
                 const READ_TIMEOUT_MS: u64 = 2000;
@@ -166,8 +183,11 @@ impl CncController {
                                 break;
                             }
 
-                            if !trimmed.is_empty() {
-                                all_settings.push_str(&line);
+                            // Parse setting line: $120=1000.000
+                            if let Some(eq_pos) = trimmed.find('=') {
+                                let setting_name = trimmed[..eq_pos].to_string();
+                                let setting_value = trimmed[eq_pos + 1..].to_string();
+                                settings_vec.push((setting_name, setting_value));
                                 lines_read += 1;
                             }
 
@@ -184,8 +204,18 @@ impl CncController {
                     }
                 }
 
-                tracing::debug!("CNC settings response: {} lines", all_settings.lines().count());
-                Ok(all_settings)
+                // Sort numerically by extracting the number from "$XXX"
+                settings_vec.sort_by(|a, b| {
+                    let num_a = a.0.trim_start_matches('$').parse::<u32>().unwrap_or(0);
+                    let num_b = b.0.trim_start_matches('$').parse::<u32>().unwrap_or(0);
+                    num_a.cmp(&num_b)
+                });
+
+                // Convert to IndexMap to preserve insertion order
+                let settings: indexmap::IndexMap<String, String> = settings_vec.into_iter().collect();
+
+                tracing::debug!("CNC settings response: {} settings", settings.len());
+                Ok(settings)
             }
             CncConnectionType::Dummy => {
                 anyhow::bail!("System is in fault state - CNC not connected")
@@ -193,34 +223,29 @@ impl CncController {
         }
     }
 
-    /// Get acceleration setting for a specific axis
-    pub async fn get_axis_acceleration(&self, axis: &str) -> Result<f64> {
+    /// Get a specific CNC setting by name (e.g., "$120")
+    /// Returns the value as a string
+    pub async fn get_setting(&self, setting_name: &str) -> Result<String> {
         let settings = self.query_settings().await?;
 
-        // Determine which setting to look for based on axis
-        let setting_num = match axis.to_uppercase().as_str() {
-            "X" => "120",
-            "Y" => "121",
-            "Z" => "122",
-            "A" => "123",
-            "B" => "124",
-            "C" => "125",
-            _ => anyhow::bail!("Invalid axis: {} (supported: X, Y, Z, A, B, C)", axis),
-        };
+        settings.get(setting_name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Setting {} not found", setting_name))
+    }
 
-        // Parse settings to find $12X=value
-        for line in settings.lines() {
-            if line.starts_with(&format!("${}", setting_num)) {
-                if let Some(value_str) = line.split('=').nth(1) {
-                    return value_str
-                        .trim()
-                        .parse::<f64>()
-                        .context("Failed to parse acceleration value");
-                }
-            }
+    /// Set a specific CNC setting
+    /// Sends the setting command to the controller (e.g., "$120=1000")
+    pub async fn set_setting(&self, setting_name: &str, value: &str) -> Result<()> {
+        // Validate setting name format (should start with $)
+        if !setting_name.starts_with('$') {
+            anyhow::bail!("Invalid setting name: {} (must start with $)", setting_name);
         }
 
-        anyhow::bail!("Acceleration setting ${} not found in controller response", setting_num)
+        let cmd = format!("{}={}", setting_name, value);
+        self.send_command(&cmd).await?;
+
+        tracing::info!("Set CNC setting: {} = {}", setting_name, value);
+        Ok(())
     }
 
     /// Helper to read all available lines from the CNC controller
@@ -340,6 +365,10 @@ impl CncController {
             } else if line.starts_with("GrblHAL") || line.starts_with("Grbl") {
                 // Boot/reset message from controller - log and discard
                 tracing::debug!("CNC boot message: {}", line);
+            } else if line.starts_with("ALARM:") {
+                // Alarm notification from controller (can occur asynchronously)
+                let alarm_code = line.strip_prefix("ALARM:").unwrap_or("unknown");
+                tracing::error!("CNC ALARM triggered: Code {}", alarm_code);
             } else if line.starts_with("<") && line.ends_with(">") {
                 // Status response
                 status_response = Some(line);
@@ -405,9 +434,146 @@ impl CncController {
     }
 
     /// Home the specified axis
+    ///
+    /// Homing is special: grblHAL enters Home mode immediately, then completes the
+    /// two-stage homing cycle (fast seek + slow approach), which can take 30+ seconds.
+    /// We handle the entire sequence here instead of returning immediately.
     pub async fn home_axis(&self, axis: &str) -> Result<String> {
         let command = format!("$H{}", axis);
-        self.send_command(&command).await
+
+        tracing::debug!("Sending CNC homing command: {}", &command);
+
+        let mut conn = self.connection.lock().await;
+        let cmd = format!("{}\n", command.trim());
+
+        // Send the homing command
+        match &mut *conn {
+            CncConnectionType::Tcp(reader) => {
+                // Send homing command
+                {
+                    let stream = reader.get_mut();
+                    stream.write_all(cmd.as_bytes()).await
+                        .context("Failed to send homing command to CNC")?;
+                    stream.flush().await
+                        .context("Failed to flush homing command to CNC")?;
+                }
+
+                // Read immediate status response
+                let mut line = String::new();
+                tokio::time::timeout(
+                    tokio::time::Duration::from_secs(2),
+                    reader.read_line(&mut line)
+                ).await
+                    .context("Timeout waiting for homing to start")??;
+
+                tracing::debug!("Homing started: {}", line.trim());
+
+                // Wait for grblHAL to send status update when homing completes
+                // Keep reading lines until we see Idle state or timeout
+                let start_time = tokio::time::Instant::now();
+                let timeout_duration = tokio::time::Duration::from_secs(60);
+
+                loop {
+                    let remaining_time = timeout_duration.saturating_sub(start_time.elapsed());
+                    if remaining_time.is_zero() {
+                        return Err(anyhow::anyhow!("Homing timeout after 60 seconds"));
+                    }
+
+                    line.clear();
+                    match tokio::time::timeout(remaining_time, reader.read_line(&mut line)).await {
+                        Ok(Ok(_)) => {
+                            let response = line.trim();
+                            tracing::debug!("Homing response: {}", response);
+
+                            // Check for completion
+                            if response == "ok" {
+                                tracing::info!("Homing completed after {:.1}s", start_time.elapsed().as_secs_f32());
+                                return Ok("ok".to_string());
+                            }
+
+                            // Check for alarm in status responses
+                            if let Ok(state) = Self::parse_state(response) {
+                                if state.starts_with("Alarm") {
+                                    return Err(anyhow::anyhow!("Homing failed: {}", state));
+                                }
+                            }
+
+                            // Ignore blank MSG lines and status updates, keep waiting
+                        }
+                        Ok(Err(e)) => {
+                            return Err(anyhow::anyhow!("Error reading during homing: {}", e));
+                        }
+                        Err(_) => {
+                            return Err(anyhow::anyhow!("Homing timeout - no response from controller"));
+                        }
+                    }
+                }
+            }
+            CncConnectionType::Serial(reader) => {
+                // Send homing command
+                {
+                    let stream = reader.get_mut();
+                    stream.write_all(cmd.as_bytes()).await
+                        .context("Failed to send homing command to CNC")?;
+                    stream.flush().await
+                        .context("Failed to flush homing command to CNC")?;
+                }
+
+                // Read immediate status response
+                let mut line = String::new();
+                tokio::time::timeout(
+                    tokio::time::Duration::from_secs(2),
+                    reader.read_line(&mut line)
+                ).await
+                    .context("Timeout waiting for homing to start")??;
+
+                tracing::debug!("Homing started: {}", line.trim());
+
+                // Wait for grblHAL to send status update when homing completes
+                // Keep reading lines until we see Idle state or timeout
+                let start_time = tokio::time::Instant::now();
+                let timeout_duration = tokio::time::Duration::from_secs(60);
+
+                loop {
+                    let remaining_time = timeout_duration.saturating_sub(start_time.elapsed());
+                    if remaining_time.is_zero() {
+                        return Err(anyhow::anyhow!("Homing timeout after 60 seconds"));
+                    }
+
+                    line.clear();
+                    match tokio::time::timeout(remaining_time, reader.read_line(&mut line)).await {
+                        Ok(Ok(_)) => {
+                            let response = line.trim();
+                            tracing::debug!("Homing response: {}", response);
+
+                            // Check for completion
+                            if response == "ok" {
+                                tracing::info!("Homing completed after {:.1}s", start_time.elapsed().as_secs_f32());
+                                return Ok("ok".to_string());
+                            }
+
+                            // Check for alarm in status responses
+                            if let Ok(state) = Self::parse_state(response) {
+                                if state.starts_with("Alarm") {
+                                    return Err(anyhow::anyhow!("Homing failed: {}", state));
+                                }
+                            }
+
+                            // Ignore blank MSG lines and status updates, keep waiting
+                        }
+                        Ok(Err(e)) => {
+                            return Err(anyhow::anyhow!("Error reading during homing: {}", e));
+                        }
+                        Err(_) => {
+                            return Err(anyhow::anyhow!("Homing timeout - no response from controller"));
+                        }
+                    }
+                }
+            }
+            CncConnectionType::Dummy => {
+                Err(anyhow::anyhow!("System is in fault state - CNC not connected"))
+            }
+        }
     }
 
     /// Move to absolute position with feed rate
@@ -429,19 +595,6 @@ impl CncController {
     /// with soft_reset().
     pub async fn feed_hold(&self) -> Result<()> {
         self.send_realtime_command(0x21).await
-    }
-
-    /// Send soft reset command (0x18 = Ctrl-X)
-    ///
-    /// Immediately halts all motion and clears the motion queue. Returns the controller
-    /// to idle state. This is used for emergency stops where we want to abort the current
-    /// operation completely (not pause it).
-    ///
-    /// WARNING: This does NOT respect acceleration settings and will cause immediate
-    /// deceleration. For safe emergency stops, use feed_hold() first, wait for the motor
-    /// to stop, then call soft_reset() to abort the program.
-    pub async fn soft_reset(&self) -> Result<()> {
-        self.send_realtime_command(0x18).await
     }
 
     /// Send queue flush command (0x19 = Ctrl-Y)
@@ -524,82 +677,39 @@ impl CncController {
         (false, None)
     }
 
-    /// Validate that stop_delay_ms is sufficient for safe deceleration
+    /// Check if an error is a connection/communication error (should trigger reconnect)
+    /// vs a grblHAL command error (should not trigger reconnect)
     ///
-    /// Calculates the minimum time required to decelerate from max speed to zero
-    /// and compares it to the configured stop_delay_ms.
-    ///
-    /// Returns Ok(()) if valid, or an error describing the issue.
-    pub async fn validate_stop_delay(
-        &self,
-        axis: &str,
-        open_speed: f64,
-        close_speed: f64,
-        stop_delay_ms: u64,
-    ) -> Result<()> {
-        // Get acceleration from controller
-        let acceleration = self.get_axis_acceleration(axis).await?;
+    /// Connection errors: I/O errors, connection closed
+    /// Command errors: grblHAL error codes, operation timeouts, homing failures
+    pub fn is_connection_error(err: &anyhow::Error) -> bool {
+        let err_msg = err.to_string().to_lowercase();
 
-        tracing::info!(
-            "Controller {} axis acceleration: {} mm/sec²",
-            axis,
-            acceleration
-        );
-
-        // Find maximum speed (in mm/min, need to convert to mm/sec)
-        let max_speed_mm_per_min = f64::max(open_speed, close_speed);
-        let max_speed_mm_per_sec = max_speed_mm_per_min / 60.0;
-
-        // Calculate deceleration time: time = velocity / acceleration
-        let decel_time_sec = max_speed_mm_per_sec / acceleration;
-        let decel_time_ms = decel_time_sec * 1000.0;
-
-        // Add 20% safety margin
-        let required_delay_ms = (decel_time_ms * 1.2).ceil() as u64;
-
-        tracing::info!(
-            "Deceleration time from {} mm/min: {:.0} ms (recommended: {} ms with 20% margin)",
-            max_speed_mm_per_min,
-            decel_time_ms,
-            required_delay_ms
-        );
-
-        if stop_delay_ms < required_delay_ms {
-            anyhow::bail!(
-                "stop_delay_ms ({} ms) is too short for safe deceleration!\n\
-                 Maximum speed: {:.0} mm/min ({:.1} mm/sec)\n\
-                 Acceleration: {} mm/sec²\n\
-                 Minimum deceleration time: {:.0} ms\n\
-                 Recommended stop_delay_ms: {} ms (with 20% safety margin)\n\
-                 \n\
-                 Either:\n\
-                 1. Increase stop_delay_ms to at least {} ms in your config, or\n\
-                 2. Reduce open_speed/close_speed, or\n\
-                 3. Increase controller acceleration setting ${}",
-                stop_delay_ms,
-                max_speed_mm_per_min,
-                max_speed_mm_per_sec,
-                acceleration,
-                decel_time_ms,
-                required_delay_ms,
-                required_delay_ms,
-                match axis.to_uppercase().as_str() {
-                    "X" => "120",
-                    "Y" => "121",
-                    "Z" => "122",
-                    "A" => "123",
-                    "B" => "124",
-                    "C" => "125",
-                    _ => "12X",
-                }
-            );
+        // These should NOT trigger reconnection
+        if err_msg.contains("cnc error: error:") ||
+           err_msg.contains("homing timeout") ||
+           err_msg.contains("homing failed") {
+            return false;
         }
 
-        tracing::info!(
-            "✓ stop_delay_ms ({} ms) is adequate for safe deceleration",
-            stop_delay_ms
-        );
+        // These indicate connection/communication problems and should trigger reconnection
+        err_msg.contains("failed to send") ||
+        err_msg.contains("failed to read") ||
+        err_msg.contains("connection closed") ||
+        err_msg.contains("failed to flush") ||
+        err_msg.contains("failed to connect")
+    }
 
-        Ok(())
+    /// Close the connection explicitly
+    /// This is important for serial connections to release the port before reconnecting
+    pub async fn close(&self) {
+        let mut conn = self.connection.lock().await;
+        *conn = CncConnectionType::Dummy;
+        drop(conn);
+
+        // Give the OS time to release the resource (especially important for serial)
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        tracing::debug!("CNC connection closed");
     }
 }

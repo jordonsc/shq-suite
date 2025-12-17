@@ -4,6 +4,25 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tokio::fs;
 
+/// WebSocket server configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebSocketConfig {
+    /// Host address to bind to (e.g., "0.0.0.0" for all interfaces)
+    pub host: String,
+    /// Port to listen on
+    pub port: u16,
+}
+
+impl Default for WebSocketConfig {
+    fn default() -> Self {
+        Self {
+            host: "0.0.0.0".to_string(),
+            port: 8766,
+        }
+    }
+}
+
 /// CNC connection type
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -40,9 +59,6 @@ pub struct DoorConfig {
     /// Offset from limit switch in millimeters
     pub limit_offset: f64,
 
-    /// Delay in milliseconds after stop command before starting new motion
-    pub stop_delay_ms: u64,
-
     /// Direction to move when opening: "left" or "right"
     /// - "right": Move in positive direction (e.g., 0 -> +1000)
     /// - "left": Move in negative direction (e.g., 0 -> -1000)
@@ -60,7 +76,6 @@ impl Default for DoorConfig {
             close_speed: 4000.0,
             cnc_axis: "X".to_string(),
             limit_offset: 3.0,
-            stop_delay_ms: 1000,
             open_direction: "right".to_string(),
             cnc_connection: CncConnection::default(),
         }
@@ -72,12 +87,14 @@ impl Default for DoorConfig {
 #[serde(default)]
 pub struct Config {
     pub door: DoorConfig,
+    pub websocket: WebSocketConfig,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             door: DoorConfig::default(),
+            websocket: WebSocketConfig::default(),
         }
     }
 }
@@ -167,5 +184,10 @@ impl ConfigManager {
         self.config.door = config;
         self.save().await?;
         Ok(())
+    }
+
+    /// Get the WebSocket configuration
+    pub fn get_websocket_config(&self) -> WebSocketConfig {
+        self.config.websocket.clone()
     }
 }

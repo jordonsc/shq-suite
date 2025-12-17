@@ -28,26 +28,27 @@ async fn main() -> Result<()> {
 
     tracing::info!("Starting Nyx Display Server v{}", env!("CARGO_PKG_VERSION"));
 
-    // Parse command-line arguments
+    // Initialize configuration manager
+    let config_manager = ConfigManager::new().await?;
+    let ws_config = config_manager.get_websocket_config();
+
+    // Parse command-line arguments (can override config values)
     let args: Vec<String> = std::env::args().collect();
     let host = args
         .iter()
         .position(|arg| arg == "--host")
         .and_then(|i| args.get(i + 1))
-        .map(|s| s.as_str())
-        .unwrap_or("0.0.0.0");
+        .map(|s| s.to_string())
+        .unwrap_or(ws_config.host);
 
     let port = args
         .iter()
         .position(|arg| arg == "--port")
         .and_then(|i| args.get(i + 1))
         .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(8765);
+        .unwrap_or(ws_config.port);
 
     let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
-
-    // Initialize configuration manager
-    let config_manager = ConfigManager::new().await?;
     let auto_dim_config = config_manager.get_auto_dim_config();
 
     // Initialize display controller
