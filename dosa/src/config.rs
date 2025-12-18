@@ -56,9 +56,6 @@ pub struct DoorConfig {
     /// CNC axis for door movement (X, Y, Z, A, B, or C)
     pub cnc_axis: String,
 
-    /// Offset from limit switch in millimeters
-    pub limit_offset: f64,
-
     /// Direction to move when opening: "left" or "right"
     /// - "right": Move in positive direction (e.g., 0 -> +1000)
     /// - "left": Move in negative direction (e.g., 0 -> -1000)
@@ -75,7 +72,6 @@ impl Default for DoorConfig {
             open_speed: 6000.0,
             close_speed: 4000.0,
             cnc_axis: "X".to_string(),
-            limit_offset: 3.0,
             open_direction: "right".to_string(),
             cnc_connection: CncConnection::default(),
         }

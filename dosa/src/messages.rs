@@ -36,7 +36,6 @@ pub enum ClientMessage {
         open_speed: Option<f64>,
         close_speed: Option<f64>,
         cnc_axis: Option<String>,
-        limit_offset: Option<f64>,
         open_direction: Option<String>,
     },
     /// Get door configuration

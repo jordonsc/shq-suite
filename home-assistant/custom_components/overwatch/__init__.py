@@ -52,8 +52,13 @@ async def async_setup(hass: HomeAssistant, config: dict):
         _LOGGER.error("No host specified for Overwatch voice server")
         return False
 
-    # Lazy import to avoid blocking the event loop
-    from .client import OverwatchClient
+    # Import client module in executor to avoid blocking the event loop
+    # The protobuf imports trigger blocking I/O operations
+    def import_client():
+        from .client import OverwatchClient
+        return OverwatchClient
+
+    OverwatchClient = await hass.async_add_executor_job(import_client)
 
     # Create client
     client = OverwatchClient(host, port)

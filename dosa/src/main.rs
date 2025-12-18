@@ -23,7 +23,8 @@ async fn initialize_door(config_manager: &ConfigManager) -> Result<DoorControlle
     tracing::info!("  Open speed: {} mm/min", door_config.open_speed);
     tracing::info!("  Close speed: {} mm/min", door_config.close_speed);
     tracing::info!("  CNC axis: {}", door_config.cnc_axis);
-    tracing::info!("  Limit offset: {} mm", door_config.limit_offset);
+    tracing::info!("  Open direction: {}", door_config.open_direction);
+    tracing::info!("  (Homing pulloff configured via grblHAL $27)");
 
     // Initialize CNC controller
     let cnc = CncController::new(&door_config.cnc_connection).await?;

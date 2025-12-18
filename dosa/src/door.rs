@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::time::{interval, Duration};
 
 use crate::cnc::CncController;
@@ -15,6 +15,7 @@ pub struct DoorController {
     is_homed: Arc<Mutex<bool>>,
     home_position: Arc<Mutex<f64>>, // MPos when we set home (for calculating relative position)
     stop_requested: Arc<Mutex<bool>>,
+    status_tx: broadcast::Sender<DoorStatus>, // Broadcasts status changes
 }
 
 impl DoorController {
@@ -31,6 +32,8 @@ impl DoorController {
 
     /// Create a new door controller
     pub async fn new(cnc: CncController, config: DoorConfig) -> Result<Self> {
+        let (status_tx, _) = broadcast::channel(100);
+
         let controller = Self {
             cnc: Arc::new(RwLock::new(Arc::new(cnc))),
             config: Arc::new(RwLock::new(config)),
@@ -44,6 +47,7 @@ impl DoorController {
             is_homed: Arc::new(Mutex::new(false)),
             home_position: Arc::new(Mutex::new(0.0)),
             stop_requested: Arc::new(Mutex::new(false)),
+            status_tx,
         };
 
         // Start background position monitoring
@@ -52,8 +56,15 @@ impl DoorController {
         Ok(controller)
     }
 
+    /// Subscribe to status updates
+    pub fn subscribe_status(&self) -> broadcast::Receiver<DoorStatus> {
+        self.status_tx.subscribe()
+    }
+
     /// Create a door controller in fault state (when initialization fails)
     pub fn new_fault(error: String, config: DoorConfig) -> Self {
+        let (status_tx, _) = broadcast::channel(100);
+
         let controller = Self {
             cnc: Arc::new(RwLock::new(Arc::new(CncController::dummy()))),
             config: Arc::new(RwLock::new(config)),
@@ -67,6 +78,7 @@ impl DoorController {
             is_homed: Arc::new(Mutex::new(false)),
             home_position: Arc::new(Mutex::new(0.0)),
             stop_requested: Arc::new(Mutex::new(false)),
+            status_tx,
         };
 
         // Start position monitor - it will skip monitoring while in fault state
@@ -200,9 +212,11 @@ impl DoorController {
         let status = self.status.clone();
         let is_homed = self.is_homed.clone();
         let home_position = self.home_position.clone();
+        let status_tx = self.status_tx.clone();
 
         tokio::spawn(async move {
             let mut ticker = interval(Duration::from_millis(200));
+            let mut last_broadcast_status: Option<DoorStatus> = None;
 
             loop {
                 ticker.tick().await;
@@ -319,6 +333,21 @@ impl DoorController {
                             }
                             _ => {}
                         }
+                    }
+
+                    // Broadcast status if it changed
+                    let current_status = st.clone();
+                    drop(st); // Release lock before broadcasting
+
+                    let should_broadcast = match &last_broadcast_status {
+                        None => true,
+                        Some(prev) => prev != &current_status,
+                    };
+
+                    if should_broadcast {
+                        // Ignore send errors (no receivers)
+                        let _ = status_tx.send(current_status.clone());
+                        last_broadcast_status = Some(current_status);
                     }
                 }
             }
@@ -544,27 +573,10 @@ impl DoorController {
         )
         .await?;
 
-        // Move back by limit offset
-        tracing::info!("Moving back by {} mm from limit", config.limit_offset);
-        let axis = config.cnc_axis.clone();
-        let limit_offset = config.limit_offset;
-        let close_speed = config.close_speed;
-        let cnc = self.cnc.clone();
-        self.execute_with_reconnect(
-            move || {
-                let cnc = cnc.clone();
-                let axis = axis.clone();
-                async move {
-                    let cnc_read = cnc.read().await;
-                    cnc_read.move_absolute(&axis, limit_offset, close_speed).await
-                }
-            },
-            "Move to offset",
-        )
-        .await?;
-
-        // Wait for move to complete
-        self.wait_for_idle().await?;
+        // grblHAL automatically backs off from the limit switch after homing
+        // Configure the pulloff distance with grblHAL setting $27 (homing pulloff in mm)
+        // Example: $27=3.0 will back off 3mm from the limit switch
+        tracing::info!("Homing complete, grblHAL pulloff handled by controller");
 
         // Reset position to zero (this is now our closed position)
         let reset_cmd = format!("G92 {}0", config.cnc_axis);
@@ -1069,50 +1081,63 @@ impl DoorController {
         )
         .await?;
 
-        // Verify position is still tracked after reset
-        let cnc = self.cnc.read().await;
-        if let Ok(status_str) = cnc.get_status().await {
-            let config = self.config.read().await;
-            let homed = *self.is_homed.lock().await;
-            let relative_pos = self.parse_position(&status_str, true).await.unwrap_or(0.0);
+        // Verify position is still tracked after reset (with timeout to prevent hanging)
+        let status_query = async {
+            let cnc = self.cnc.read().await;
+            cnc.get_status().await
+        };
 
-            let mut status = self.status.lock().await;
-            status.position_mm = relative_pos;
-            status.position_percent = Self::calculate_position_percent(relative_pos, config.open_distance);
+        match tokio::time::timeout(Duration::from_secs(3), status_query).await {
+            Ok(Ok(status_str)) => {
+                let config = self.config.read().await;
+                let homed = *self.is_homed.lock().await;
+                let relative_pos = self.parse_position(&status_str, true).await.unwrap_or(0.0);
 
-            // Determine state based on position
-            if homed {
-                // Calculate target open position based on direction
-                let target_open_pos = if config.open_direction.to_lowercase() == "left" {
-                    -config.open_distance
+                let mut status = self.status.lock().await;
+                status.position_mm = relative_pos;
+                status.position_percent = Self::calculate_position_percent(relative_pos, config.open_distance);
+
+                // Determine state based on position
+                if homed {
+                    // Calculate target open position based on direction
+                    let target_open_pos = if config.open_direction.to_lowercase() == "left" {
+                        -config.open_distance
+                    } else {
+                        config.open_distance
+                    };
+
+                    // Check if at closed position (within 0.1mm for floating point precision)
+                    if relative_pos.abs() < 0.1 {
+                        status.state = DoorState::Closed;
+                    }
+                    // Check if at open position (within 0.1mm for floating point precision)
+                    else if (relative_pos - target_open_pos).abs() < 0.1 {
+                        status.state = DoorState::Open;
+                    }
+                    // At intermediate position - we're stopped but not at a defined position
+                    else {
+                        status.state = DoorState::Intermediate;
+                    }
                 } else {
-                    config.open_distance
-                };
+                    status.state = DoorState::Pending;
+                }
 
-                // Check if at closed position (within 0.1mm for floating point precision)
-                if relative_pos.abs() < 0.1 {
-                    status.state = DoorState::Closed;
-                }
-                // Check if at open position (within 0.1mm for floating point precision)
-                else if (relative_pos - target_open_pos).abs() < 0.1 {
-                    status.state = DoorState::Open;
-                }
-                // At intermediate position - we're stopped but not at a defined position
-                // Clear any motion state (Closing/Opening) to prevent interrupt loops
-                else if matches!(status.state, DoorState::Closing | DoorState::Opening) {
-                    status.state = DoorState::Intermediate;
-                }
-            } else {
-                status.state = DoorState::Pending;
+                tracing::info!("Stop complete, position verified at {} mm (relative to home)", relative_pos);
             }
-
-            tracing::info!("Stop complete, position verified at {} mm (relative to home)", relative_pos);
-        } else {
-            // Update status even if we can't verify position
-            let homed = *self.is_homed.lock().await;
-            let mut status = self.status.lock().await;
-            status.state = if homed { DoorState::Closed } else { DoorState::Pending };
-            tracing::warn!("Stop complete, but could not verify position");
+            Ok(Err(e)) => {
+                // Status query failed
+                tracing::warn!("Stop complete, but status query failed: {}", e);
+                let homed = *self.is_homed.lock().await;
+                let mut status = self.status.lock().await;
+                status.state = if homed { DoorState::Intermediate } else { DoorState::Pending };
+            }
+            Err(_) => {
+                // Status query timed out
+                tracing::error!("Stop complete, but status query timed out after 3 seconds");
+                let homed = *self.is_homed.lock().await;
+                let mut status = self.status.lock().await;
+                status.state = if homed { DoorState::Intermediate } else { DoorState::Pending };
+            }
         }
 
         // Clear stop flag
@@ -1181,6 +1206,7 @@ impl Clone for DoorController {
             is_homed: self.is_homed.clone(),
             home_position: self.home_position.clone(),
             stop_requested: self.stop_requested.clone(),
+            status_tx: self.status_tx.clone(),
         }
     }
 }

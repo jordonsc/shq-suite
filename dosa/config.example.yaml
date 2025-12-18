@@ -18,8 +18,10 @@ door:
   # CNC axis for door movement (X, Y, Z, A, B, or C)
   cnc_axis: "X"
 
-  # Offset from limit switch in millimeters
-  limit_offset: 3.0
+  # Direction to move when opening: "left" or "right"
+  # - "right": Move in positive direction (e.g., 0 -> +1000)
+  # - "left": Move in negative direction (e.g., 0 -> -1000)
+  open_direction: "right"
 
   # CNC controller connection
   # Use one of the following configurations:

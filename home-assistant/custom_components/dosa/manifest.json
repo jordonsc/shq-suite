@@ -1,0 +1,10 @@
+{
+  "domain": "dosa",
+  "name": "DOSA Door Controller",
+  "documentation": "https://github.com/yourusername/shq-suite",
+  "requirements": ["websockets>=12.0"],
+  "codeowners": [],
+  "version": "1.0.0",
+  "iot_class": "local_push",
+  "config_flow": false
+}
