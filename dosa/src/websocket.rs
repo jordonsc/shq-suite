@@ -10,7 +10,7 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 use crate::config::ConfigManager;
 use crate::door::DoorController;
-use crate::messages::{ClientMessage, ServerMessage};
+use crate::messages::{ClientMessage, DoorStatus, ServerMessage};
 
 type ClientId = usize;
 
@@ -64,39 +64,81 @@ impl WebSocketServer {
     fn start_status_broadcaster(&self) {
         let door = self.door.clone();
         let clients = self.clients.clone();
+        let mut status_rx = door.subscribe_status();
 
         tokio::spawn(async move {
-            let mut ticker = interval(Duration::from_millis(500));
-            let mut last_status = None;
+            let mut ticker = interval(Duration::from_secs(1));
+            let mut last_broadcast_status: Option<DoorStatus> = None;
 
+            // Unified broadcaster: event-driven with fallback polling
             loop {
-                ticker.tick().await;
+                tokio::select! {
+                    // Priority 1: Event-driven updates from position monitor (immediate)
+                    result = status_rx.recv() => {
+                        match result {
+                            Ok(status) => {
+                                // Only broadcast if status actually changed
+                                let should_broadcast = match &last_broadcast_status {
+                                    None => true,
+                                    Some(prev) => prev != &status,
+                                };
 
-                // Get current status
-                let status = door.get_status().await;
+                                if should_broadcast {
+                                    let message = ServerMessage::Status {
+                                        version: env!("CARGO_PKG_VERSION").to_string(),
+                                        door: status.clone(),
+                                    };
 
-                // Only broadcast if status has changed
-                let should_broadcast = match &last_status {
-                    None => true,
-                    Some(prev) => prev != &status,
-                };
+                                    if let Ok(json) = serde_json::to_string(&message) {
+                                        let clients_lock = clients.lock().await;
+                                        for (client_id, tx) in clients_lock.iter() {
+                                            if let Err(e) = tx.send(json.clone()) {
+                                                tracing::debug!("Failed to broadcast to client {}: {}", client_id, e);
+                                            }
+                                        }
+                                    }
 
-                if should_broadcast {
-                    let message = ServerMessage::Status {
-                        version: env!("CARGO_PKG_VERSION").to_string(),
-                        door: status.clone(),
-                    };
-
-                    if let Ok(json) = serde_json::to_string(&message) {
-                        let clients_lock = clients.lock().await;
-                        for (client_id, tx) in clients_lock.iter() {
-                            if let Err(e) = tx.send(json.clone()) {
-                                tracing::debug!("Failed to broadcast to client {}: {}", client_id, e);
+                                    last_broadcast_status = Some(status);
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                tracing::warn!("Status broadcaster lagged, skipped {} messages", skipped);
+                            }
+                            Err(broadcast::error::RecvError::Closed) => {
+                                tracing::error!("Status channel closed, stopping broadcaster");
+                                break;
                             }
                         }
                     }
 
-                    last_status = Some(status);
+                    // Priority 2: Fallback polling for non-movement state changes (every 1 second)
+                    _ = ticker.tick() => {
+                        let status = door.get_status().await;
+
+                        // Only broadcast if status has changed since last broadcast
+                        let should_broadcast = match &last_broadcast_status {
+                            None => true,
+                            Some(prev) => prev != &status,
+                        };
+
+                        if should_broadcast {
+                            let message = ServerMessage::Status {
+                                version: env!("CARGO_PKG_VERSION").to_string(),
+                                door: status.clone(),
+                            };
+
+                            if let Ok(json) = serde_json::to_string(&message) {
+                                let clients_lock = clients.lock().await;
+                                for (client_id, tx) in clients_lock.iter() {
+                                    if let Err(e) = tx.send(json.clone()) {
+                                        tracing::debug!("Failed to broadcast to client {}: {}", client_id, e);
+                                    }
+                                }
+                            }
+
+                            last_broadcast_status = Some(status);
+                        }
+                    }
                 }
             }
         });
@@ -131,10 +173,19 @@ impl WebSocketServer {
                 msg = read.next() => {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
-                            if let Ok(response) = self.handle_message(&text).await {
-                                let response_json = serde_json::to_string(&response)?;
-                                write.send(Message::Text(response_json)).await?;
-                            }
+                            let response = match self.handle_message(&text).await {
+                                Ok(resp) => resp,
+                                Err(e) => {
+                                    // Send error response for invalid messages
+                                    tracing::warn!("Invalid message from client {}: {}", client_id, e);
+                                    ServerMessage::Error {
+                                        message: format!("Invalid command: {}", e),
+                                    }
+                                }
+                            };
+
+                            let response_json = serde_json::to_string(&response)?;
+                            write.send(Message::Text(response_json)).await?;
                         }
                         Some(Ok(Message::Close(_))) | None => {
                             tracing::info!("Client {} disconnected", client_id);
@@ -271,23 +322,18 @@ impl WebSocketServer {
                 })
             }
             ClientMessage::Status => {
-                // Query controller for fresh status before responding
-                match self.door.query_and_get_status().await {
-                    Ok(status) => Ok(ServerMessage::Status {
-                        version: env!("CARGO_PKG_VERSION").to_string(),
-                        door: status,
-                    }),
-                    Err(e) => Ok(ServerMessage::Error {
-                        message: format!("Failed to query status: {}", e),
-                    }),
-                }
+                // Return cached status (updated in real-time by position monitor and event broadcasts)
+                let status = self.door.get_status().await;
+                Ok(ServerMessage::Status {
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    door: status,
+                })
             }
             ClientMessage::SetConfig {
                 open_distance,
                 open_speed,
                 close_speed,
                 cnc_axis,
-                limit_offset,
                 open_direction,
             } => {
                 let mut config = self.door.get_config().await;
@@ -303,9 +349,6 @@ impl WebSocketServer {
                 }
                 if let Some(axis) = cnc_axis {
                     config.cnc_axis = axis;
-                }
-                if let Some(offset) = limit_offset {
-                    config.limit_offset = offset;
                 }
                 if let Some(dir) = open_direction {
                     config.open_direction = dir;
