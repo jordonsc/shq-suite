@@ -125,6 +125,20 @@ class DosaClient:
             return response.get('success', False)
         return False
 
+    async def jog(self, distance: float, feed_rate: float = None) -> bool:
+        """Jog the door by a relative distance in mm."""
+        command = {
+            'type': 'jog',
+            'distance': distance
+        }
+        if feed_rate is not None:
+            command['feed_rate'] = feed_rate
+
+        response = await self._send_command(command)
+        if response and response.get('type') == 'response':
+            return response.get('success', False)
+        return False
+
     async def home(self) -> bool:
         """Home the door."""
         response = await self._send_command({'type': 'home'})

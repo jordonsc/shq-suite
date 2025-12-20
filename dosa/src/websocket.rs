@@ -273,6 +273,18 @@ impl WebSocketServer {
                     config: None,
                 })
             }
+            ClientMessage::Jog { distance, feed_rate } => {
+                if let Err(e) = self.door.jog(distance, feed_rate).await {
+                    return Ok(ServerMessage::Error {
+                        message: format!("Failed to jog door {} mm: {}", distance, e),
+                    });
+                }
+                Ok(ServerMessage::Response {
+                    success: true,
+                    command: "jog".to_string(),
+                    config: None,
+                })
+            }
             ClientMessage::Home => {
                 if let Err(e) = self.door.home().await {
                     return Ok(ServerMessage::Error {
@@ -328,6 +340,15 @@ impl WebSocketServer {
                     version: env!("CARGO_PKG_VERSION").to_string(),
                     door: status,
                 })
+            }
+            ClientMessage::RawStatus => {
+                // Query CNC controller directly and return raw response
+                match self.door.get_raw_status().await {
+                    Ok(raw) => Ok(ServerMessage::RawStatus { raw }),
+                    Err(e) => Ok(ServerMessage::Error {
+                        message: format!("Failed to get raw status: {}", e),
+                    }),
+                }
             }
             ClientMessage::SetConfig {
                 open_distance,

@@ -582,6 +582,13 @@ impl CncController {
         self.send_command(&command).await
     }
 
+    /// Jog axis by a relative distance at specified feed rate
+    /// Uses the $J jog command which enables real-time feed override and rapid stop
+    pub async fn jog(&self, axis: &str, distance: f64, feed_rate: f64) -> Result<String> {
+        let command = format!("$J=G21G91{}{}F{}", axis, distance, feed_rate);
+        self.send_command(&command).await
+    }
+
     /// Get current position (send ? status query)
     pub async fn get_status(&self) -> Result<String> {
         self.send_command_with_options("?", true, 1000).await

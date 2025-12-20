@@ -359,6 +359,12 @@ impl DoorController {
         self.status.lock().await.clone()
     }
 
+    /// Get raw status directly from CNC controller
+    pub async fn get_raw_status(&self) -> Result<String> {
+        let cnc = self.cnc.read().await;
+        cnc.get_status().await
+    }
+
     /// Parse position from status string and optionally convert to relative position
     ///
     /// # Arguments
@@ -522,27 +528,16 @@ impl DoorController {
         {
             let status = self.status.lock().await;
 
-            // Check if in fault state
-            if status.state == DoorState::Fault {
-                return Err(anyhow::anyhow!(
-                    "System is in fault state: {}",
-                    status.fault_message.as_ref().unwrap_or(&"Unknown error".to_string())
-                ));
-            }
-
-            // Check if in alarm state
-            if status.state == DoorState::Alarm {
-                let alarm_msg = if let Some(code) = &status.alarm_code {
-                    format!("CNC is in alarm state (Code {}). Use clear_alarm command first.", code)
-                } else {
-                    "CNC is in alarm state. Use clear_alarm command first.".to_string()
-                };
-                return Err(anyhow::anyhow!(alarm_msg));
-            }
-
             // Check if already homing
             if status.state == DoorState::Homing {
                 return Ok(());
+            }
+
+            // If in alarm state, try to clear it first
+            if status.state == DoorState::Alarm {
+                tracing::info!("System in alarm state, attempting to clear before homing");
+                drop(status);
+                self.clear_alarm().await?;
             }
         }
 
@@ -631,22 +626,11 @@ impl DoorController {
         {
             let status = self.status.lock().await;
 
-            // Check if in fault state
-            if status.state == DoorState::Fault {
-                return Err(anyhow::anyhow!(
-                    "System is in fault state: {}",
-                    status.fault_message.as_ref().unwrap_or(&"Unknown error".to_string())
-                ));
-            }
-
-            // Check if in alarm state
+            // If in alarm state, try to clear it first
             if status.state == DoorState::Alarm {
-                let alarm_msg = if let Some(code) = &status.alarm_code {
-                    format!("CNC is in alarm state (Code {}). Use clear_alarm command first.", code)
-                } else {
-                    "CNC is in alarm state. Use clear_alarm command first.".to_string()
-                };
-                return Err(anyhow::anyhow!(alarm_msg));
+                tracing::info!("System in alarm state, attempting to clear before zeroing");
+                drop(status);
+                self.clear_alarm().await?;
             }
         }
 
@@ -706,25 +690,108 @@ impl DoorController {
 
     /// Clear alarm state
     pub async fn clear_alarm(&self) -> Result<()> {
-        {
+        let current_state = {
             let status = self.status.lock().await;
+            status.state.clone()
+        };
 
-            // Check if actually in alarm state
-            if status.state != DoorState::Alarm {
-                return Ok(());
-            }
+        // Log current state
+        if current_state == DoorState::Alarm {
+            tracing::info!("Clear alarm requested - system is in alarm state");
+        } else {
+            tracing::info!("Clear alarm requested - system is in {:?} state (will attempt clear anyway)", current_state);
         }
 
-        tracing::info!("Clearing CNC alarm");
+        // Step 1: Send soft reset (0x18 / Ctrl-X) to reset controller state
+        tracing::info!("Sending soft reset (0x18) to CNC controller");
+        let cnc = self.cnc.clone();
+        self.execute_with_reconnect(
+            move || {
+                let cnc = cnc.clone();
+                async move {
+                    let cnc_read = cnc.read().await;
+                    cnc_read.send_realtime_command(0x18).await
+                }
+            },
+            "Soft reset before alarm clear",
+        )
+        .await
+        .context("Failed to send soft reset")?;
 
-        // Send unlock command to grblHAL ($X)
-        let cnc = self.cnc.read().await;
-        cnc.send_command("$X")
-            .await
-            .context("Failed to clear alarm - controller may not be in a clearable alarm state")?;
+        // Wait for controller to process reset
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-        tracing::info!("Alarm clear command sent - monitor will update status");
-        Ok(())
+        // Step 2: Send unlock command ($X) to clear the alarm
+        tracing::info!("Sending unlock command ($X) to CNC controller");
+        let cnc = self.cnc.clone();
+        let result = self.execute_with_reconnect(
+            move || {
+                let cnc = cnc.clone();
+                async move {
+                    let cnc_read = cnc.read().await;
+                    cnc_read.send_command("$X").await
+                }
+            },
+            "Clear alarm",
+        )
+        .await;
+
+        match result {
+            Ok(_) => {
+                tracing::info!("Clear alarm sequence completed successfully");
+
+                // Query status to verify alarm was cleared
+                tracing::debug!("Querying status after alarm clear to update clients");
+                let cnc = self.cnc.read().await;
+                if let Ok(status_str) = cnc.get_status().await {
+                    drop(cnc);
+
+                    // Check if alarm is still present
+                    let (is_alarm, alarm_code) = CncController::parse_alarm(&status_str);
+
+                    if is_alarm {
+                        tracing::warn!("Alarm still present after clear attempt: {:?}", alarm_code);
+                        let mut st = self.status.lock().await;
+                        st.state = DoorState::Alarm;
+                        st.alarm_code = alarm_code;
+                        let updated_status = st.clone();
+                        drop(st);
+                        let _ = self.status_tx.send(updated_status);
+                    } else {
+                        tracing::info!("Alarm successfully cleared, resetting to pending state");
+
+                        // Reset homed flag - soft reset loses position reference
+                        {
+                            let mut is_homed = self.is_homed.lock().await;
+                            *is_homed = false;
+                        }
+
+                        // Update status to pending state
+                        {
+                            let mut st = self.status.lock().await;
+                            st.state = DoorState::Pending;
+                            st.alarm_code = None;
+                            st.position_mm = 0.0;
+                            st.position_percent = 0.0;
+                            let updated_status = st.clone();
+                            drop(st);
+                            let _ = self.status_tx.send(updated_status);
+                        }
+
+                        tracing::info!("System reset to pending state - homing required");
+                    }
+                } else {
+                    drop(cnc);
+                    tracing::warn!("Failed to query status after alarm clear");
+                }
+
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!("Clear alarm sequence failed: {}", e);
+                Err(e).context("Failed to clear alarm")
+            }
+        }
     }
 
     /// Open the door
@@ -903,6 +970,68 @@ impl DoorController {
                 }
             },
             "Close command",
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Jog the door by a relative distance in mm
+    pub async fn jog(&self, distance: f64, feed_rate: Option<f64>) -> Result<()> {
+        {
+            let status = self.status.lock().await;
+
+            // Check state - don't allow jogging during certain states
+            match status.state {
+                DoorState::Opening | DoorState::Closing | DoorState::Homing | DoorState::Halting => {
+                    return Err(anyhow::anyhow!("Cannot jog while door is moving (state: {:?})", status.state));
+                }
+                DoorState::Fault => {
+                    return Err(anyhow::anyhow!(
+                        "System is in fault state: {}",
+                        status.fault_message.as_ref().unwrap_or(&"Unknown error".to_string())
+                    ));
+                }
+                DoorState::Alarm => {
+                    let alarm_msg = if let Some(code) = &status.alarm_code {
+                        format!("CNC is in alarm state (Code {}). Use clear_alarm command first.", code)
+                    } else {
+                        "CNC is in alarm state. Use clear_alarm command first.".to_string()
+                    };
+                    return Err(anyhow::anyhow!(alarm_msg));
+                }
+                _ => {} // Allow jogging in any non-moving state (including when not homed)
+            }
+        }
+
+        let config = self.config.read().await;
+        let axis = config.cnc_axis.clone();
+
+        // Use provided feed rate or default to open_speed
+        let jog_feed_rate = feed_rate.unwrap_or(config.open_speed);
+
+        // Calculate jog distance based on direction
+        let jog_distance = if config.open_direction.to_lowercase() == "left" {
+            -distance
+        } else {
+            distance
+        };
+        drop(config);
+
+        tracing::info!("Jogging {} mm at {} mm/min", jog_distance, jog_feed_rate);
+
+        // Send jog command with automatic reconnection on connection errors
+        let cnc = self.cnc.clone();
+        self.execute_with_reconnect(
+            move || {
+                let cnc = cnc.clone();
+                let axis = axis.clone();
+                async move {
+                    let cnc_read = cnc.read().await;
+                    cnc_read.jog(&axis, jog_distance, jog_feed_rate).await
+                }
+            },
+            "Jog command",
         )
         .await?;
 
