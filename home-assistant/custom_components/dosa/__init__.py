@@ -1,9 +1,11 @@
 """DOSA integration for Home Assistant."""
 import logging
+import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.const import Platform, EVENT_HOMEASSISTANT_STOP
 from homeassistant.helpers import discovery
+import homeassistant.helpers.config_validation as cv
 
 from .const import DOMAIN
 from .coordinator import DosaCoordinator
@@ -11,6 +13,13 @@ from .coordinator import DosaCoordinator
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = [Platform.COVER, Platform.BUTTON]
+
+# Service schemas
+SERVICE_JOG_SCHEMA = vol.Schema({
+    vol.Required("device_id"): cv.string,
+    vol.Required("distance"): vol.Coerce(float),
+    vol.Optional("feed_rate"): vol.Coerce(float),
+})
 
 
 async def async_setup(hass: HomeAssistant, config: dict):
@@ -46,6 +55,28 @@ async def async_setup(hass: HomeAssistant, config: dict):
             await coordinator.async_shutdown()
 
     hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, async_shutdown)
+
+    # Register services
+    async def handle_jog(call: ServiceCall) -> None:
+        """Handle jog service call."""
+        device_id = call.data.get("device_id")
+        distance = call.data.get("distance")
+        feed_rate = call.data.get("feed_rate")
+
+        if device_id not in coordinators:
+            _LOGGER.error(f"Device {device_id} not found")
+            return
+
+        coordinator = coordinators[device_id]
+        await coordinator.async_send_command(
+            coordinator.client.jog,
+            distance,
+            feed_rate
+        )
+
+    hass.services.async_register(
+        DOMAIN, "jog", handle_jog, schema=SERVICE_JOG_SCHEMA
+    )
 
     # Forward setup to platforms
     await discovery.async_load_platform(

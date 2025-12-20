@@ -22,6 +22,11 @@ pub enum ClientMessage {
     Move {
         percent: f64,
     },
+    /// Jog the CNC axis by a specific distance
+    Jog {
+        distance: f64,
+        feed_rate: Option<f64>,
+    },
     /// Home the door (move to limit switch and set as closed position)
     Home,
     /// Zero the door (set current position as home without homing sequence)
@@ -30,6 +35,8 @@ pub enum ClientMessage {
     ClearAlarm,
     /// Get current door position and state
     Status,
+    /// Get raw status directly from CNC controller
+    RawStatus,
     /// Set door configuration
     SetConfig {
         open_distance: Option<f64>,
@@ -81,6 +88,10 @@ pub enum ServerMessage {
     CncSetting {
         setting: String,
         value: String,
+    },
+    /// Raw status response from CNC controller
+    RawStatus {
+        raw: String,
     },
     /// Error message
     Error {

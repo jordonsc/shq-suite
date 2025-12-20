@@ -1,0 +1,33 @@
+jog:
+  name: Jog
+  description: Jog the door by a relative distance in millimeters
+  fields:
+    device_id:
+      name: Device ID
+      description: The DOSA device ID to jog
+      required: true
+      example: "door_1"
+      selector:
+        text:
+    distance:
+      name: Distance
+      description: Distance to jog in millimeters (positive opens, negative closes)
+      required: true
+      example: 10.0
+      selector:
+        number:
+          min: -1000
+          max: 1000
+          step: 0.1
+          unit_of_measurement: "mm"
+    feed_rate:
+      name: Feed Rate
+      description: Feed rate in mm/min (optional, uses default if not specified)
+      required: false
+      example: 500.0
+      selector:
+        number:
+          min: 1
+          max: 10000
+          step: 1
+          unit_of_measurement: "mm/min"

@@ -18,6 +18,28 @@ from .coordinator import DosaCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
+# grblHAL alarm code descriptions
+ALARM_CODES = {
+    "1": "Hard limit triggered",
+    "2": "Soft limit triggered",
+    "3": "Abort during cycle",
+    "4": "Probe fail (initial)",
+    "5": "Probe fail (contact)",
+    "6": "Homing fail (reset)",
+    "7": "Homing fail (door)",
+    "8": "Homing fail (pulloff)",
+    "9": "Homing fail (approach)",
+    "10": "Spindle control error",
+    "11": "Homing required",
+    "12": "Limits engaged",
+    "13": "Probe protection",
+    "14": "Spindle at speed timeout",
+    "15": "Homing fail (dual approach)",
+    "16": "Power-on self test (POS) failed",
+    "17": "Motor fault",
+    "18": "Homing fail (autosquaring approach)",
+}
+
 
 async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
     """Set up the DOSA cover platform."""
@@ -130,9 +152,16 @@ class DosaCover(CoordinatorEntity, CoverEntity):
         if fault_msg := door.get("fault_message"):
             attrs["fault_message"] = fault_msg
 
-        # Add alarm code if present
+        # Add alarm information if present
         if alarm_code := door.get("alarm_code"):
             attrs["alarm_code"] = alarm_code
+            # Add human-readable alarm description
+            attrs["alarm_description"] = ALARM_CODES.get(
+                alarm_code, f"Unknown alarm code: {alarm_code}"
+            )
+            attrs["has_alarm"] = True
+        else:
+            attrs["has_alarm"] = False
 
         return attrs
 
