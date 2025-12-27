@@ -44,6 +44,7 @@ pub enum ClientMessage {
         close_speed: Option<f64>,
         cnc_axis: Option<String>,
         open_direction: Option<String>,
+        auto_home: Option<bool>,
     },
     /// Get door configuration
     GetConfig,

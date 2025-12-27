@@ -286,11 +286,15 @@ impl WebSocketServer {
                 })
             }
             ClientMessage::Home => {
-                if let Err(e) = self.door.home().await {
-                    return Ok(ServerMessage::Error {
-                        message: format!("Failed to home door: {}", e),
-                    });
-                }
+                // Spawn homing in background to avoid blocking WebSocket
+                let door = self.door.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = door.home().await {
+                        tracing::error!("Homing failed: {}", e);
+                    }
+                });
+
+                // Return immediately so client can receive status broadcasts
                 Ok(ServerMessage::Response {
                     success: true,
                     command: "home".to_string(),
@@ -356,6 +360,7 @@ impl WebSocketServer {
                 close_speed,
                 cnc_axis,
                 open_direction,
+                auto_home,
             } => {
                 let mut config = self.door.get_config().await;
 
@@ -373,6 +378,9 @@ impl WebSocketServer {
                 }
                 if let Some(dir) = open_direction {
                     config.open_direction = dir;
+                }
+                if let Some(auto) = auto_home {
+                    config.auto_home = auto;
                 }
 
                 self.door.update_config(config.clone()).await;

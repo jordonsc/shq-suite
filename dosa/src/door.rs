@@ -15,6 +15,8 @@ pub struct DoorController {
     is_homed: Arc<Mutex<bool>>,
     home_position: Arc<Mutex<f64>>, // MPos when we set home (for calculating relative position)
     stop_requested: Arc<Mutex<bool>>,
+    auto_home_done: Arc<Mutex<bool>>, // Tracks if auto-home has been performed
+    discard_next_poll: Arc<Mutex<bool>>, // Flag to discard next status poll (set when state is updated manually)
     status_tx: broadcast::Sender<DoorStatus>, // Broadcasts status changes
 }
 
@@ -47,6 +49,8 @@ impl DoorController {
             is_homed: Arc::new(Mutex::new(false)),
             home_position: Arc::new(Mutex::new(0.0)),
             stop_requested: Arc::new(Mutex::new(false)),
+            auto_home_done: Arc::new(Mutex::new(false)),
+            discard_next_poll: Arc::new(Mutex::new(false)),
             status_tx,
         };
 
@@ -78,6 +82,8 @@ impl DoorController {
             is_homed: Arc::new(Mutex::new(false)),
             home_position: Arc::new(Mutex::new(0.0)),
             stop_requested: Arc::new(Mutex::new(false)),
+            auto_home_done: Arc::new(Mutex::new(false)),
+            discard_next_poll: Arc::new(Mutex::new(false)),
             status_tx,
         };
 
@@ -212,7 +218,10 @@ impl DoorController {
         let status = self.status.clone();
         let is_homed = self.is_homed.clone();
         let home_position = self.home_position.clone();
+        let discard_next_poll = self.discard_next_poll.clone();
         let status_tx = self.status_tx.clone();
+        let auto_home_done = self.auto_home_done.clone();
+        let door_controller = self.clone();
 
         tokio::spawn(async move {
             let mut ticker = interval(Duration::from_millis(200));
@@ -221,29 +230,58 @@ impl DoorController {
             loop {
                 ticker.tick().await;
 
-                // Only poll during active movement (Opening, Closing)
-                // Skip polling when in other states
+                // Skip polling during Homing (controller doesn't respond) and Fault (no connection)
+                // Poll in all other states to detect alarms when idle
                 {
                     let st = status.lock().await;
 
-                    // Only monitor during movement operations
                     match st.state {
-                        DoorState::Opening | DoorState::Closing => {
-                            // Continue to poll
+                        DoorState::Homing => {
+                            // Don't poll during homing - controller doesn't respond to status queries
+                            continue;
+                        }
+                        DoorState::Fault => {
+                            // Don't poll when in fault state (no valid CNC connection)
+                            continue;
                         }
                         _ => {
-                            // Don't poll when not moving
-                            continue;
+                            // Poll in all other states (Opening, Closing, Closed, Open, Intermediate, Pending, Halting)
                         }
                     }
                 }
 
-                // Query CNC status during movement
+                // Query CNC status
                 let cnc_read = cnc.read().await;
                 if let Ok(status_str) = cnc_read.get_status().await {
+                    // Check discard flag first - if set, skip this poll iteration
+                    let mut discard = discard_next_poll.lock().await;
+                    if *discard {
+                        *discard = false;
+                        drop(discard);
+                        tracing::debug!("Discarding status poll due to discard flag");
+                        continue;
+                    }
+                    drop(discard);
+
                     let cfg = config.read().await;
                     let homed = *is_homed.lock().await;
                     let mut st = status.lock().await;
+
+                    // Re-check state after receiving response to avoid race conditions
+                    // If state changed to Homing/Fault while we were waiting for CNC response, skip processing
+                    match st.state {
+                        DoorState::Homing => {
+                            drop(st);
+                            drop(cfg);
+                            continue;
+                        }
+                        DoorState::Fault => {
+                            drop(st);
+                            drop(cfg);
+                            continue;
+                        }
+                        _ => {}
+                    }
 
                     // Check for alarm state
                     let (is_alarm, alarm_code) = CncController::parse_alarm(&status_str);
@@ -316,10 +354,12 @@ impl DoorController {
                                             tracing::info!("Door is in open position");
                                         }
                                     }
-                                    // Otherwise door is between positions - keep previous state or set to closed if transitioning
-                                    else if prev_state == DoorState::Opening || prev_state == DoorState::Closing {
-                                        // Movement stopped mid-travel
+                                    // Otherwise door is at an intermediate position
+                                    else {
                                         st.state = DoorState::Intermediate;
+                                        if prev_state == DoorState::Opening || prev_state == DoorState::Closing {
+                                            tracing::info!("Door stopped at intermediate position: {} mm", pos);
+                                        }
                                     }
                                 } else {
                                     st.state = DoorState::Pending;
@@ -347,7 +387,29 @@ impl DoorController {
                     if should_broadcast {
                         // Ignore send errors (no receivers)
                         let _ = status_tx.send(current_status.clone());
-                        last_broadcast_status = Some(current_status);
+                        last_broadcast_status = Some(current_status.clone());
+                    }
+
+                    // Check for auto-home on first Pending state
+                    if current_status.state == DoorState::Pending {
+                        let mut auto_home_flag = auto_home_done.lock().await;
+                        if !*auto_home_flag {
+                            let cfg = config.read().await;
+                            if cfg.auto_home {
+                                tracing::info!("Auto-home enabled, starting homing sequence");
+                                *auto_home_flag = true;
+                                drop(auto_home_flag);
+                                drop(cfg);
+
+                                // Spawn home in background to avoid blocking the monitor
+                                let controller = door_controller.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = controller.home().await {
+                                        tracing::error!("Auto-home failed: {}", e);
+                                    }
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -490,14 +552,17 @@ impl DoorController {
                         };
 
                         // Check if at closed position (within 0.1mm for floating point precision)
-                        if (pos - 0.0).abs() < 0.1 {
+                        if pos.abs() < 0.1 {
                             st.state = DoorState::Closed;
                         }
                         // Check if at open position (within 0.1mm for floating point precision)
                         else if (pos - target_open_pos).abs() < 0.1 {
                             st.state = DoorState::Open;
                         }
-                        // Otherwise keep current state
+                        // Otherwise door is at an intermediate position
+                        else {
+                            st.state = DoorState::Intermediate;
+                        }
                     } else {
                         st.state = DoorState::Pending;
                     }
@@ -532,22 +597,29 @@ impl DoorController {
             if status.state == DoorState::Homing {
                 return Ok(());
             }
-
-            // If in alarm state, try to clear it first
-            if status.state == DoorState::Alarm {
-                tracing::info!("System in alarm state, attempting to clear before homing");
-                drop(status);
-                self.clear_alarm().await?;
-            }
         }
+
+        // Always clear alarm before homing (soft reset + $X)
+        // This ensures we can home even if an alarm occurred but wasn't detected
+        tracing::info!("Clearing any potential alarms before homing");
+        self.clear_alarm().await?;
 
         let config = self.config.read().await;
 
-        // Set state to homing
-        {
+        // Set state to homing and discard any in-flight polls
+        // Note: home_axis() blocks until complete, so state must be set BEFORE command
+        let homing_status = {
+            let mut discard = self.discard_next_poll.lock().await;
+            *discard = true;
+            drop(discard);
+
             let mut status = self.status.lock().await;
             status.state = DoorState::Homing;
-        }
+            status.clone()
+        };
+
+        // Broadcast homing state to clients (position monitor won't broadcast during homing)
+        let _ = self.status_tx.send(homing_status);
 
         tracing::info!("Homing door on {} axis", config.cnc_axis);
 
@@ -610,12 +682,16 @@ impl DoorController {
             *is_homed = true;
         }
 
-        {
+        let updated_status = {
             let mut status = self.status.lock().await;
             status.position_mm = 0.0;
             status.position_percent = 0.0;
             status.state = DoorState::Closed;
-        }
+            status.clone()
+        };
+
+        // Broadcast status update to all clients
+        let _ = self.status_tx.send(updated_status);
 
         tracing::info!("Home operation complete - door is now at closed position");
         Ok(())
@@ -623,16 +699,10 @@ impl DoorController {
 
     /// Zero the door (set current position as home without homing sequence)
     pub async fn zero(&self) -> Result<()> {
-        {
-            let status = self.status.lock().await;
-
-            // If in alarm state, try to clear it first
-            if status.state == DoorState::Alarm {
-                tracing::info!("System in alarm state, attempting to clear before zeroing");
-                drop(status);
-                self.clear_alarm().await?;
-            }
-        }
+        // Always clear alarm before zeroing (soft reset + $X)
+        // This ensures we can zero even if an alarm occurred but wasn't detected
+        tracing::info!("Clearing any potential alarms before zeroing");
+        self.clear_alarm().await?;
 
         tracing::info!("Zeroing door at current position");
 
@@ -677,12 +747,16 @@ impl DoorController {
             *is_homed = true;
         }
 
-        {
+        let updated_status = {
             let mut status = self.status.lock().await;
             status.position_mm = 0.0;
             status.position_percent = 0.0;
             status.state = DoorState::Closed;
-        }
+            status.clone()
+        };
+
+        // Broadcast status update to all clients
+        let _ = self.status_tx.send(updated_status);
 
         tracing::info!("Zero operation complete - current position set as home (closed)");
         Ok(())
@@ -863,12 +937,6 @@ impl DoorController {
         };
         drop(config);
 
-        // Set state to opening
-        {
-            let mut status = self.status.lock().await;
-            status.state = DoorState::Opening;
-        }
-
         tracing::info!("Opening door to {} mm at {} mm/min", target_position, open_speed);
 
         // Send move command with automatic reconnection on connection errors
@@ -885,6 +953,16 @@ impl DoorController {
             "Open command",
         )
         .await?;
+
+        // Set state to opening AFTER sending command to avoid race condition
+        {
+            let mut discard = self.discard_next_poll.lock().await;
+            *discard = true;
+            drop(discard);
+
+            let mut status = self.status.lock().await;
+            status.state = DoorState::Opening;
+        }
 
         Ok(())
     }
@@ -950,12 +1028,6 @@ impl DoorController {
         let axis = config.cnc_axis.clone();
         drop(config);
 
-        // Set state to closing
-        {
-            let mut status = self.status.lock().await;
-            status.state = DoorState::Closing;
-        }
-
         tracing::info!("Closing door to 0 mm at {} mm/min", close_speed);
 
         // Send move command to home position (0mm) with automatic reconnection on connection errors
@@ -972,6 +1044,16 @@ impl DoorController {
             "Close command",
         )
         .await?;
+
+        // Set state to closing AFTER sending command to avoid race condition
+        {
+            let mut discard = self.discard_next_poll.lock().await;
+            *discard = true;
+            drop(discard);
+
+            let mut status = self.status.lock().await;
+            status.state = DoorState::Closing;
+        }
 
         Ok(())
     }
@@ -1095,12 +1177,7 @@ impl DoorController {
         // Determine if opening or closing
         let moving_toward_open = target_position.abs() > current_pos.abs();
         let speed = if moving_toward_open { open_speed } else { close_speed };
-
-        // Set state
-        {
-            let mut status = self.status.lock().await;
-            status.state = if moving_toward_open { DoorState::Opening } else { DoorState::Closing };
-        }
+        let new_state = if moving_toward_open { DoorState::Opening } else { DoorState::Closing };
 
         tracing::info!("Moving to {}% (position {} mm) at {} mm/min", percent, target_position, speed);
 
@@ -1119,10 +1196,25 @@ impl DoorController {
         )
         .await?;
 
+        // Set state AFTER sending command to avoid race condition
+        {
+            let mut discard = self.discard_next_poll.lock().await;
+            *discard = true;
+            drop(discard);
+
+            let mut status = self.status.lock().await;
+            status.state = new_state;
+        }
+
         Ok(())
     }
 
-    /// Emergency stop
+    /// Stop mid-movement.
+    ///
+    /// This method safely decelerates the door to a stop using feed hold, 
+    /// then flushes the command queue to clear any pending actions.
+    ///
+    /// Blocking call.
     pub async fn stop(&self) -> Result<()> {
         // Set stop flag
         let mut stop_flag = self.stop_requested.lock().await;
@@ -1335,6 +1427,8 @@ impl Clone for DoorController {
             is_homed: self.is_homed.clone(),
             home_position: self.home_position.clone(),
             stop_requested: self.stop_requested.clone(),
+            auto_home_done: self.auto_home_done.clone(),
+            discard_next_poll: self.discard_next_poll.clone(),
             status_tx: self.status_tx.clone(),
         }
     }

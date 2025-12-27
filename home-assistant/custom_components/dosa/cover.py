@@ -73,6 +73,12 @@ class DosaCover(CoordinatorEntity, CoverEntity):
         self._attr_unique_id = f"{device_id}_door"
         self._attr_name = f"{coordinator.name} Door"
 
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        super()._handle_coordinator_update()
+        _LOGGER.debug(f"Cover entity received coordinator update: {self.coordinator.data}")
+
     @property
     def device_info(self) -> DeviceInfo:
         """Return device information."""

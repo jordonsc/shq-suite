@@ -4,7 +4,7 @@ import logging
 from datetime import timedelta
 from typing import Any, Dict, Optional
 
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .client import DosaClient
@@ -116,11 +116,14 @@ class DosaCoordinator(DataUpdateCoordinator):
         except asyncio.CancelledError:
             pass
 
+    @callback
     def _handle_status_update(self, data: Dict[str, Any]):
         """Handle incoming status update from server."""
         if data.get('type') == 'status':
+            _LOGGER.debug(f"Received status update: {data}")
             # Update coordinator data with new status
             self.async_set_updated_data(data)
+            _LOGGER.debug(f"Updated coordinator data, triggering entity updates")
 
     async def _async_update_data(self) -> Dict[str, Any]:
         """Fetch data from API endpoint (fallback polling)."""

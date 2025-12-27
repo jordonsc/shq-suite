@@ -196,7 +196,7 @@ class DosaClient:
             async for message in self._websocket:
                 try:
                     data = json.loads(message)
-                    _LOGGER.debug(f"Received message: {data}")
+                    _LOGGER.debug(f"WebSocket received message: {data}")
 
                     msg_type = data.get('type')
 

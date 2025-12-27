@@ -61,6 +61,10 @@ pub struct DoorConfig {
     /// - "left": Move in negative direction (e.g., 0 -> -1000)
     pub open_direction: String,
 
+    /// Automatically home on startup when entering Pending state
+    /// Default: false
+    pub auto_home: bool,
+
     /// CNC controller connection
     pub cnc_connection: CncConnection,
 }
@@ -73,6 +77,7 @@ impl Default for DoorConfig {
             close_speed: 4000.0,
             cnc_axis: "X".to_string(),
             open_direction: "right".to_string(),
+            auto_home: false,
             cnc_connection: CncConnection::default(),
         }
     }
