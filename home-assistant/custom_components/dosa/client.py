@@ -168,11 +168,11 @@ class DosaClient:
         return False
 
     async def _keepalive_loop(self):
-        """Send NOOP commands every 30 seconds to keep connection alive."""
+        """Send NOOP commands every 15 seconds to keep connection alive."""
         import asyncio
         while self._connected:
             try:
-                await asyncio.sleep(30)
+                await asyncio.sleep(15)
                 if self._connected and self._websocket:
                     await self._websocket.send(json.dumps({'type': 'noop'}))
                     _LOGGER.debug("Sent keepalive NOOP")

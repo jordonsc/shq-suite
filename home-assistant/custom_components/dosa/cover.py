@@ -174,6 +174,10 @@ class DosaCover(CoordinatorEntity, CoverEntity):
     @property
     def available(self) -> bool:
         """Return if entity is available."""
+        # Check if we've received an update within the availability timeout (30 seconds)
+        if not self.coordinator.is_available():
+            return False
+
         if not self.coordinator.data:
             return False
 
