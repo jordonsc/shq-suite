@@ -238,11 +238,16 @@ impl WebSocketServer {
 
         match message {
             ClientMessage::Open => {
-                if let Err(e) = self.door.open().await {
-                    return Ok(ServerMessage::Error {
-                        message: format!("Failed to open door: {}", e),
-                    });
-                }
+                // Spawn open in background to avoid blocking WebSocket
+                // This allows the client to continue receiving status broadcasts during movement
+                let door = self.door.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = door.open().await {
+                        tracing::error!("Open failed: {}", e);
+                    }
+                });
+
+                // Return immediately so client can receive status broadcasts
                 Ok(ServerMessage::Response {
                     success: true,
                     command: "open".to_string(),
@@ -250,11 +255,16 @@ impl WebSocketServer {
                 })
             }
             ClientMessage::Close => {
-                if let Err(e) = self.door.close().await {
-                    return Ok(ServerMessage::Error {
-                        message: format!("Failed to close door: {}", e),
-                    });
-                }
+                // Spawn close in background to avoid blocking WebSocket
+                // This allows the client to continue receiving status broadcasts during movement
+                let door = self.door.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = door.close().await {
+                        tracing::error!("Close failed: {}", e);
+                    }
+                });
+
+                // Return immediately so client can receive status broadcasts
                 Ok(ServerMessage::Response {
                     success: true,
                     command: "close".to_string(),
@@ -262,11 +272,16 @@ impl WebSocketServer {
                 })
             }
             ClientMessage::Move { percent } => {
-                if let Err(e) = self.door.move_to_percent(percent).await {
-                    return Ok(ServerMessage::Error {
-                        message: format!("Failed to move door to {}%: {}", percent, e),
-                    });
-                }
+                // Spawn move in background to avoid blocking WebSocket
+                // This allows the client to continue receiving status broadcasts during movement
+                let door = self.door.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = door.move_to_percent(percent).await {
+                        tracing::error!("Move to {}% failed: {}", percent, e);
+                    }
+                });
+
+                // Return immediately so client can receive status broadcasts
                 Ok(ServerMessage::Response {
                     success: true,
                     command: "move".to_string(),
@@ -274,11 +289,16 @@ impl WebSocketServer {
                 })
             }
             ClientMessage::Jog { distance, feed_rate } => {
-                if let Err(e) = self.door.jog(distance, feed_rate).await {
-                    return Ok(ServerMessage::Error {
-                        message: format!("Failed to jog door {} mm: {}", distance, e),
-                    });
-                }
+                // Spawn jog in background to avoid blocking WebSocket
+                // This allows the client to continue receiving status broadcasts during movement
+                let door = self.door.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = door.jog(distance, feed_rate).await {
+                        tracing::error!("Jog {} mm failed: {}", distance, e);
+                    }
+                });
+
+                // Return immediately so client can receive status broadcasts
                 Ok(ServerMessage::Response {
                     success: true,
                     command: "jog".to_string(),
@@ -326,11 +346,16 @@ impl WebSocketServer {
                 })
             }
             ClientMessage::Stop => {
-                if let Err(e) = self.door.stop().await {
-                    return Ok(ServerMessage::Error {
-                        message: format!("Failed to stop door: {}", e),
-                    });
-                }
+                // Spawn stop in background to avoid blocking WebSocket
+                // This allows the client to continue receiving status broadcasts during the stop sequence
+                let door = self.door.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = door.stop().await {
+                        tracing::error!("Stop failed: {}", e);
+                    }
+                });
+
+                // Return immediately so client can receive status broadcasts
                 Ok(ServerMessage::Response {
                     success: true,
                     command: "stop".to_string(),

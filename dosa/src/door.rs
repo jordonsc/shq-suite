@@ -230,8 +230,8 @@ impl DoorController {
             loop {
                 ticker.tick().await;
 
-                // Skip polling during Homing (controller doesn't respond) and Fault (no connection)
-                // Poll in all other states to detect alarms when idle
+                // Skip polling during Homing (controller doesn't respond), Fault (no connection),
+                // and Halting (stop() function is actively polling)
                 {
                     let st = status.lock().await;
 
@@ -244,8 +244,13 @@ impl DoorController {
                             // Don't poll when in fault state (no valid CNC connection)
                             continue;
                         }
+                        DoorState::Halting => {
+                            // Don't poll when halting - stop() function is actively polling
+                            // to avoid competing for CNC lock and delaying stop sequence
+                            continue;
+                        }
                         _ => {
-                            // Poll in all other states (Opening, Closing, Closed, Open, Intermediate, Pending, Halting)
+                            // Poll in all other states (Opening, Closing, Closed, Open, Intermediate, Pending)
                         }
                     }
                 }
@@ -268,7 +273,7 @@ impl DoorController {
                     let mut st = status.lock().await;
 
                     // Re-check state after receiving response to avoid race conditions
-                    // If state changed to Homing/Fault while we were waiting for CNC response, skip processing
+                    // If state changed to Homing/Fault/Halting while we were waiting for CNC response, skip processing
                     match st.state {
                         DoorState::Homing => {
                             drop(st);
@@ -276,6 +281,11 @@ impl DoorController {
                             continue;
                         }
                         DoorState::Fault => {
+                            drop(st);
+                            drop(cfg);
+                            continue;
+                        }
+                        DoorState::Halting => {
                             drop(st);
                             drop(cfg);
                             continue;
@@ -1211,7 +1221,7 @@ impl DoorController {
 
     /// Stop mid-movement.
     ///
-    /// This method safely decelerates the door to a stop using feed hold, 
+    /// This method safely decelerates the door to a stop using feed hold,
     /// then flushes the command queue to clear any pending actions.
     ///
     /// Blocking call.
@@ -1221,8 +1231,12 @@ impl DoorController {
         *stop_flag = true;
         drop(stop_flag);
 
-        // Set state to halting
+        // Set state to halting AND discard next monitor poll to prevent competition
         {
+            let mut discard = self.discard_next_poll.lock().await;
+            *discard = true;
+            drop(discard);
+
             let mut status = self.status.lock().await;
             status.state = DoorState::Halting;
         }
@@ -1246,10 +1260,11 @@ impl DoorController {
 
         // Step 2: Poll status until we see "Hold:0" (motor fully stopped)
         // Hold:1 means still stopping, Hold:0 means stopped
+        // Broadcast position updates during deceleration for smooth UI updates
         tracing::info!("Polling status until motor stops (Hold:0)");
         let mut attempts = 0;
         const MAX_ATTEMPTS: u32 = 50; // 5 seconds max wait (100ms * 50)
-        
+
         loop {
             tokio::time::sleep(Duration::from_millis(100)).await;
             attempts += 1;
@@ -1262,10 +1277,28 @@ impl DoorController {
             let cnc = self.cnc.read().await;
             if let Ok(status_str) = cnc.get_status().await {
                 drop(cnc);
-                
+
+                // Parse and broadcast position update during halt
+                let config = self.config.read().await;
+                let homed = *self.is_homed.lock().await;
+                if homed {
+                    if let Ok(relative_pos) = self.parse_position(&status_str, true).await {
+                        let mut status = self.status.lock().await;
+                        status.position_mm = relative_pos;
+                        status.position_percent = Self::calculate_position_percent(relative_pos, config.open_distance);
+                        let current_status = status.clone();
+                        drop(status);
+
+                        // Broadcast position update to clients
+                        let _ = self.status_tx.send(current_status);
+                        tracing::debug!("Broadcast halt position: {} mm ({}%)", relative_pos, Self::calculate_position_percent(relative_pos, config.open_distance));
+                    }
+                }
+                drop(config);
+
                 if let Ok(state) = CncController::parse_state(&status_str) {
                     tracing::debug!("Current state: {}", state);
-                    
+
                     // Check for Hold:0 (fully stopped)
                     if state == "Hold:0" {
                         tracing::info!("Motor stopped (Hold:0)");
@@ -1288,19 +1321,11 @@ impl DoorController {
 
         // Step 3: Send queue flush to clear pending commands gracefully
         // Motor is already stopped, so this is safe (no sudden deceleration)
+        // Don't use execute_with_reconnect here to minimize delay
         tracing::info!("Sending queue flush to clear pending commands");
-        let cnc = self.cnc.clone();
-        self.execute_with_reconnect(
-            move || {
-                let cnc = cnc.clone();
-                async move {
-                    let cnc_read = cnc.read().await;
-                    cnc_read.queue_flush().await
-                }
-            },
-            "Queue flush",
-        )
-        .await?;
+        let cnc = self.cnc.read().await;
+        cnc.queue_flush().await?;
+        drop(cnc);
 
         // Verify position is still tracked after reset (with timeout to prevent hanging)
         let status_query = async {
@@ -1314,34 +1339,41 @@ impl DoorController {
                 let homed = *self.is_homed.lock().await;
                 let relative_pos = self.parse_position(&status_str, true).await.unwrap_or(0.0);
 
-                let mut status = self.status.lock().await;
-                status.position_mm = relative_pos;
-                status.position_percent = Self::calculate_position_percent(relative_pos, config.open_distance);
+                let final_status = {
+                    let mut status = self.status.lock().await;
+                    status.position_mm = relative_pos;
+                    status.position_percent = Self::calculate_position_percent(relative_pos, config.open_distance);
 
-                // Determine state based on position
-                if homed {
-                    // Calculate target open position based on direction
-                    let target_open_pos = if config.open_direction.to_lowercase() == "left" {
-                        -config.open_distance
+                    // Determine state based on position
+                    if homed {
+                        // Calculate target open position based on direction
+                        let target_open_pos = if config.open_direction.to_lowercase() == "left" {
+                            -config.open_distance
+                        } else {
+                            config.open_distance
+                        };
+
+                        // Check if at closed position (within 0.1mm for floating point precision)
+                        if relative_pos.abs() < 0.1 {
+                            status.state = DoorState::Closed;
+                        }
+                        // Check if at open position (within 0.1mm for floating point precision)
+                        else if (relative_pos - target_open_pos).abs() < 0.1 {
+                            status.state = DoorState::Open;
+                        }
+                        // At intermediate position - we're stopped but not at a defined position
+                        else {
+                            status.state = DoorState::Intermediate;
+                        }
                     } else {
-                        config.open_distance
-                    };
+                        status.state = DoorState::Pending;
+                    }
 
-                    // Check if at closed position (within 0.1mm for floating point precision)
-                    if relative_pos.abs() < 0.1 {
-                        status.state = DoorState::Closed;
-                    }
-                    // Check if at open position (within 0.1mm for floating point precision)
-                    else if (relative_pos - target_open_pos).abs() < 0.1 {
-                        status.state = DoorState::Open;
-                    }
-                    // At intermediate position - we're stopped but not at a defined position
-                    else {
-                        status.state = DoorState::Intermediate;
-                    }
-                } else {
-                    status.state = DoorState::Pending;
-                }
+                    status.clone()
+                };
+
+                // Broadcast final status to all clients
+                let _ = self.status_tx.send(final_status);
 
                 tracing::info!("Stop complete, position verified at {} mm (relative to home)", relative_pos);
             }
@@ -1349,15 +1381,25 @@ impl DoorController {
                 // Status query failed
                 tracing::warn!("Stop complete, but status query failed: {}", e);
                 let homed = *self.is_homed.lock().await;
-                let mut status = self.status.lock().await;
-                status.state = if homed { DoorState::Intermediate } else { DoorState::Pending };
+                let final_status = {
+                    let mut status = self.status.lock().await;
+                    status.state = if homed { DoorState::Intermediate } else { DoorState::Pending };
+                    status.clone()
+                };
+                // Broadcast final status
+                let _ = self.status_tx.send(final_status);
             }
             Err(_) => {
                 // Status query timed out
                 tracing::error!("Stop complete, but status query timed out after 3 seconds");
                 let homed = *self.is_homed.lock().await;
-                let mut status = self.status.lock().await;
-                status.state = if homed { DoorState::Intermediate } else { DoorState::Pending };
+                let final_status = {
+                    let mut status = self.status.lock().await;
+                    status.state = if homed { DoorState::Intermediate } else { DoorState::Pending };
+                    status.clone()
+                };
+                // Broadcast final status
+                let _ = self.status_tx.send(final_status);
             }
         }
 
