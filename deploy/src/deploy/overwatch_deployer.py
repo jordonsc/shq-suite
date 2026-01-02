@@ -43,6 +43,7 @@ class OverwatchDeployer(BaseDeployer):
         self.sounds_path = self._resolve_source_path(sounds_path)
         self.config_file = self._expand_path(config_file)
         self.service_file = self._expand_path(service_file)
+        self.asound_conf = self._resolve_source_path("assets/asound.conf")
 
     def _install_systemd_service(self, hostname: str, verbose: bool = False) -> bool:
         """
@@ -68,6 +69,23 @@ class OverwatchDeployer(BaseDeployer):
 
         return self.run_ssh_command(hostname, commands, verbose=verbose)
 
+    def _install_asound_conf(self, hostname: str, verbose: bool = False) -> bool:
+        """
+        Install ALSA sound configuration file.
+
+        Args:
+            hostname: Target hostname
+            verbose: Show verbose output
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # Copy to temp location first, then use sudo to move to /etc
+        if not self.run_rsync(self.asound_conf, "/tmp/asound.conf", hostname, delete=False, verbose=verbose):
+            return False
+
+        return self.run_ssh_command(hostname, "sudo cp /tmp/asound.conf /etc/asound.conf", verbose=verbose)
+
     def deploy_to_host(self, hostname: str, verbose: bool = False) -> bool:
         """
         Deploy voice server to a single host.
@@ -77,6 +95,7 @@ class OverwatchDeployer(BaseDeployer):
         - Syncing sounds directory
         - Copying config file
         - Installing systemd service
+        - Installing ALSA config to /etc/asound.conf
         - Restarting service
 
         Args:
@@ -99,6 +118,7 @@ class OverwatchDeployer(BaseDeployer):
                 self.config_file, f"{self.destination_path}/config.yaml", hostname, delete=False, verbose=verbose
             )),
             ("Installing systemd service", lambda: self._install_systemd_service(hostname, verbose)),
+            ("Installing ALSA config", lambda: self._install_asound_conf(hostname, verbose)),
             ("Restarting Overwatch service", lambda: self.run_ssh_command(
                 hostname, f"systemctl --user restart {self.service_name}", verbose=verbose
             )),
