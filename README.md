@@ -16,6 +16,7 @@ Directory structure for applications:
  * `dosa`: Door Opening Sensor Automation - automated door control via grblHAL CNC controller (Rust)
  * `home-assistant`: The Home Assistant custom components that integrate with the above tools (Python)
  * `deploy`: A tool to deploy each application to respective devices (symlink to `setup` in root) (Python)
+ * `shelly`: CLI tool to discover, audit, and configure Shelly smart home devices on the local network (Python)
 
 Deployment Configuration
 ------------------------
@@ -88,6 +89,28 @@ release:
 	# Use the deployer tool to ship to the Pi:
 	cd ..
 	./setup overwatch
+
+Shelly Device Management
+------------------------
+The Shelly tool discovers and configures Shelly devices on the local network via mDNS. It supports
+both Gen1 and Gen2 APIs.
+
+    cd shelly/src
+
+    # Scan & display all devices
+    python shelly.py
+
+    # Initialise devices (disable cloud, BT, WiFi AP; set transition times)
+    python shelly.py --init
+
+    # Target a specific device
+    python shelly.py -d <device_id> --init
+
+    # Calibrate dimmers / trigger firmware updates
+    python shelly.py --calibrate
+    python shelly.py --update
+
+See [docs/Shelly.md](docs/Shelly.md) for full documentation.
 
 ### Overwatch Sounds
 Overwatch sounds are categorised in one of two taxonomies:
