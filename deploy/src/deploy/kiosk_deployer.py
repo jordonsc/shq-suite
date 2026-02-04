@@ -146,6 +146,7 @@ class KioskDeployer(BaseDeployer):
         """
         cmds = [
             "systemctl --user daemon-reload",
+            "gsettings set org.gnome.desktop.interface color-scheme 'prefer-dark'",
             "systemctl --user enable kiosk.service",
             "systemctl --user restart kiosk.service",
             "systemctl --user enable display.service",
