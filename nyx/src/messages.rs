@@ -16,6 +16,8 @@ pub enum ClientMessage {
     GetAutoDimConfig,
     Wake,
     Sleep,
+    Navigate { url: String },
+    GetUrl,
     Noop,
 }
 
@@ -33,6 +35,8 @@ pub enum ServerMessage {
         command: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         config: Option<AutoDimConfig>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
     },
     Error {
         message: String,
