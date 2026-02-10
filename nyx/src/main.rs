@@ -1,4 +1,5 @@
 mod auto_dim;
+mod cdp;
 mod config;
 mod display;
 mod messages;

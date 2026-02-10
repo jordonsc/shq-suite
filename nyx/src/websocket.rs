@@ -8,6 +8,7 @@ use tokio::sync::{broadcast, Mutex};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 use crate::auto_dim::AutoDimManager;
+use crate::cdp;
 use crate::config::ConfigManager;
 use crate::display::DisplayController;
 use crate::messages::{AutoDimConfig, ClientMessage, ServerMessage};
@@ -93,10 +94,14 @@ impl WebSocketServer {
                 msg = read.next() => {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
-                            if let Ok(response) = self.handle_message(&text).await {
-                                let response_json = serde_json::to_string(&response)?;
-                                write.send(Message::Text(response_json)).await?;
-                            }
+                            let response = match self.handle_message(&text).await {
+                                Ok(resp) => resp,
+                                Err(e) => ServerMessage::Error {
+                                    message: format!("Invalid message: {}", e),
+                                },
+                            };
+                            let response_json = serde_json::to_string(&response)?;
+                            write.send(Message::Text(response_json)).await?;
                         }
                         Some(Ok(Message::Close(_))) | None => {
                             tracing::info!("Client {} disconnected", client_id);
@@ -170,6 +175,7 @@ impl WebSocketServer {
                     success: true,
                     command: "set_display".to_string(),
                     config: None,
+                    url: None,
                 })
             }
             ClientMessage::SetBrightness { brightness } => {
@@ -185,6 +191,7 @@ impl WebSocketServer {
                     success: true,
                     command: "set_brightness".to_string(),
                     config: None,
+                    url: None,
                 })
             }
             ClientMessage::GetMetrics => self.collect_metrics().await,
@@ -220,6 +227,7 @@ impl WebSocketServer {
                     success: true,
                     command: "set_auto_dim_config".to_string(),
                     config: None,
+                    url: None,
                 })
             }
             ClientMessage::GetAutoDimConfig => {
@@ -228,6 +236,7 @@ impl WebSocketServer {
                     success: true,
                     command: "get_auto_dim_config".to_string(),
                     config: Some(config),
+                    url: None,
                 })
             }
             ClientMessage::Wake => {
@@ -237,6 +246,7 @@ impl WebSocketServer {
                     success: true,
                     command: "wake".to_string(),
                     config: None,
+                    url: None,
                 })
             }
             ClientMessage::Sleep => {
@@ -246,12 +256,49 @@ impl WebSocketServer {
                     success: true,
                     command: "sleep".to_string(),
                     config: None,
+                    url: None,
                 })
+            }
+            ClientMessage::Navigate { url } => {
+                match cdp::navigate(&url).await {
+                    Ok(()) => {
+                        tracing::info!("Navigated Chrome to {}", url);
+                        Ok(ServerMessage::Response {
+                            success: true,
+                            command: "navigate".to_string(),
+                            config: None,
+                            url: Some(url),
+                        })
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to navigate: {:#}", e);
+                        Ok(ServerMessage::Error {
+                            message: format!("Navigate failed: {:#}", e),
+                        })
+                    }
+                }
+            }
+            ClientMessage::GetUrl => {
+                match cdp::get_current_url().await {
+                    Ok(url) => Ok(ServerMessage::Response {
+                        success: true,
+                        command: "get_url".to_string(),
+                        config: None,
+                        url: Some(url),
+                    }),
+                    Err(e) => {
+                        tracing::error!("Failed to get URL: {:#}", e);
+                        Ok(ServerMessage::Error {
+                            message: format!("Get URL failed: {:#}", e),
+                        })
+                    }
+                }
             }
             ClientMessage::Noop => Ok(ServerMessage::Response {
                 success: true,
                 command: "noop".to_string(),
                 config: None,
+                url: None,
             }),
         }
     }
