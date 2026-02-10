@@ -1,0 +1,10 @@
+{
+  "domain": "centurion",
+  "name": "Centurion Garage Door",
+  "version": "1.0.0",
+  "documentation": "https://github.com/yourusername/shq-suite",
+  "requirements": [],
+  "codeowners": [],
+  "config_flow": true,
+  "iot_class": "local_polling"
+}
