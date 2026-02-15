@@ -1,9 +1,10 @@
 """SHQ Display integration for Home Assistant."""
 import logging
+import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.const import Platform, EVENT_HOMEASSISTANT_STOP
-from homeassistant.helpers import discovery
+from homeassistant.helpers import config_validation as cv, discovery
 
 from .const import DOMAIN
 from .coordinator import SHQDisplayCoordinator
@@ -38,6 +39,26 @@ async def async_setup(hass: HomeAssistant, config: dict):
         _LOGGER.info(f"Coordinator created for {name}")
 
     hass.data[DOMAIN] = coordinators
+
+    # Register navigate service
+    async def handle_navigate(call):
+        device_id = call.data["device_id"]
+        url = call.data["url"]
+        coordinator = hass.data[DOMAIN].get(device_id)
+        if coordinator is None:
+            _LOGGER.error(f"Unknown device_id: {device_id}")
+            return
+        await coordinator.async_send_command(coordinator.client.navigate, url)
+
+    hass.services.async_register(
+        DOMAIN,
+        "navigate",
+        handle_navigate,
+        schema=vol.Schema({
+            vol.Required("device_id"): cv.string,
+            vol.Required("url"): cv.url,
+        }),
+    )
 
     # Register shutdown handler
     async def async_shutdown(event):

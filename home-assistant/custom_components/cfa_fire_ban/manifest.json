@@ -1,0 +1,10 @@
+{
+  "domain": "cfa_fire_ban",
+  "name": "CFA Fire Ban",
+  "documentation": "https://www.cfa.vic.gov.au/warnings-restrictions/total-fire-bans-and-ratings",
+  "requirements": [],
+  "codeowners": [],
+  "version": "1.0.0",
+  "iot_class": "cloud_polling",
+  "config_flow": false
+}

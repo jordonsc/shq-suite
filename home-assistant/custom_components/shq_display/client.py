@@ -158,6 +158,11 @@ class SHQDisplayClient:
         response = await self._send_command(command)
         return response.get('success', False) if response else False
 
+    async def navigate(self, url: str) -> bool:
+        """Navigate Chrome to a URL."""
+        response = await self._send_command({'type': 'navigate', 'url': url})
+        return response.get('success', False) if response else False
+
     async def get_auto_dim_config(self) -> Optional[Dict[str, Any]]:
         """Get auto-dim configuration."""
         response = await self._send_command({'type': 'get_auto_dim_config'})

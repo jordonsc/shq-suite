@@ -29,6 +29,8 @@ pub enum ServerMessage {
         version: String,
         display: DisplayMetrics,
         auto_dim: AutoDimStatus,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
     },
     Response {
         success: bool,
