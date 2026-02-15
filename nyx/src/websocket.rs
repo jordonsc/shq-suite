@@ -263,6 +263,7 @@ impl WebSocketServer {
                 match cdp::navigate(&url).await {
                     Ok(()) => {
                         tracing::info!("Navigated Chrome to {}", url);
+                        self.broadcast_metrics().await;
                         Ok(ServerMessage::Response {
                             success: true,
                             command: "navigate".to_string(),
@@ -307,11 +308,13 @@ impl WebSocketServer {
     async fn collect_metrics(&self) -> Result<ServerMessage> {
         let display = self.display.get_metrics().await?;
         let auto_dim = self.auto_dim.get_status().await;
+        let url = cdp::get_current_url().await.ok();
 
         Ok(ServerMessage::Metrics {
             version: env!("CARGO_PKG_VERSION").to_string(),
             display,
             auto_dim,
+            url,
         })
     }
 

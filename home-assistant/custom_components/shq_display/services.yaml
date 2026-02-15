@@ -1,0 +1,16 @@
+navigate:
+  name: Navigate
+  description: Navigate a kiosk display to a URL
+  fields:
+    device_id:
+      name: Device ID
+      description: The device ID of the kiosk (as defined in configuration.yaml)
+      required: true
+      selector:
+        text:
+    url:
+      name: URL
+      description: The URL to navigate to
+      required: true
+      selector:
+        text:

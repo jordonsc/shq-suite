@@ -26,6 +26,7 @@ async def async_setup_platform(
 
     for device_id, coordinator in coordinators.items():
         entities.append(SHQDisplayVersionSensor(coordinator))
+        entities.append(SHQDisplayUrlSensor(coordinator))
 
     async_add_entities(entities)
 
@@ -48,3 +49,29 @@ class SHQDisplayVersionSensor(CoordinatorEntity, SensorEntity):
             return None
 
         return self.coordinator.data.get('version', 'Unknown')
+
+    @property
+    def available(self) -> bool:
+        return self.coordinator.is_available()
+
+
+class SHQDisplayUrlSensor(CoordinatorEntity, SensorEntity):
+    """URL sensor for SHQ Display."""
+
+    def __init__(self, coordinator):
+        """Initialize the URL sensor."""
+        super().__init__(coordinator)
+        self._attr_name = f"{coordinator.name} URL"
+        self._attr_unique_id = f"{DOMAIN}_{coordinator.device_id}_url"
+        self._attr_icon = "mdi:web"
+
+    @property
+    def native_value(self) -> Optional[str]:
+        """Return the current URL."""
+        if not self.coordinator.data:
+            return None
+        return self.coordinator.data.get('url')
+
+    @property
+    def available(self) -> bool:
+        return self.coordinator.is_available()
