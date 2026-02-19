@@ -67,7 +67,9 @@ class ActronClimateBase(CoordinatorEntity, ClimateEntity):
     Tracks in-flight API commands per slot (e.g. "temperature", "mode").
     When a new command arrives for the same slot, the previous one is
     cancelled — its retry sleeps and API waits get interrupted via
-    CancelledError, and only the latest command's refresh runs.
+    CancelledError. Callers are responsible for triggering a coordinator
+    refresh if needed; optimistic commands deliberately skip it so that
+    a refresh for one entity doesn't clear another entity's optimistic state.
     """
 
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
@@ -87,8 +89,8 @@ class ActronClimateBase(CoordinatorEntity, ClimateEntity):
         self._pending_commands[key] = current
 
         try:
-            await coro
-            await self.coordinator.async_request_refresh()
+            async with self.coordinator.command_lock:
+                await coro
         except asyncio.CancelledError:
             # Check if we were superseded by a newer command (intentional)
             # vs cancelled by HA shutdown (propagate)
@@ -178,6 +180,7 @@ class ActronClimate(ActronClimateBase):
             "mode",
             self.coordinator.api.set_mode(self._status, sdk_mode),
         )
+        await self.coordinator.async_request_refresh()
 
     async def async_set_temperature(self, **kwargs) -> None:
         """Set target temperature."""
@@ -188,6 +191,7 @@ class ActronClimate(ActronClimateBase):
             "temperature",
             self.coordinator.api.set_temperature(self._status, temp),
         )
+        await self.coordinator.async_request_refresh()
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
         """Set fan mode."""
@@ -198,6 +202,7 @@ class ActronClimate(ActronClimateBase):
             "fan_mode",
             self.coordinator.api.set_fan_mode(self._status, sdk_fan),
         )
+        await self.coordinator.async_request_refresh()
 
 
 class ActronZoneClimate(ActronClimateBase):
@@ -282,9 +287,19 @@ class ActronZoneClimate(ActronClimateBase):
         """Toggle zone with optimistic state update.
 
         Sets the state immediately for responsive UI, then sends the API
-        command. On failure, reverts the optimistic state.
+        command. No coordinator refresh is triggered on success — the
+        optimistic state stays in place until the next scheduled poll so
+        that concurrent zone toggles don't clear each other's state.
+        On failure, the optimistic state is reverted immediately.
         """
         self._optimistic_active = enabled
+        # Mutate the shared enabled_zones list in coordinator data so that
+        # concurrent zone toggles build their commands against the updated
+        # state, not the stale one.  The coordinator refresh will replace
+        # this object with real data anyway.
+        zones_list = self._status.user_aircon_settings.enabled_zones
+        if self._zone_index < len(zones_list):
+            zones_list[self._zone_index] = enabled
         self.coordinator.reset_poll_timer()
         self.async_write_ha_state()
 
@@ -295,6 +310,7 @@ class ActronZoneClimate(ActronClimateBase):
                     self._status, self._zone_index, enabled
                 ),
             )
+            # No async_request_refresh() — see docstring above
         except Exception:
             self._optimistic_active = None
             self.async_write_ha_state()
@@ -326,3 +342,4 @@ class ActronZoneClimate(ActronClimateBase):
                 self._status, self._zone_index, temp
             ),
         )
+        await self.coordinator.async_request_refresh()

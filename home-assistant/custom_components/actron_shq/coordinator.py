@@ -1,5 +1,6 @@
 """DataUpdateCoordinator for Actron SHQ integration."""
 
+import asyncio
 import logging
 from datetime import timedelta
 
@@ -19,6 +20,7 @@ class ActronCoordinator(DataUpdateCoordinator):
         """Initialise the coordinator."""
         self.api = api
         self.serial: str | None = None
+        self.command_lock = asyncio.Lock()
 
         super().__init__(
             hass,
