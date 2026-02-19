@@ -102,15 +102,20 @@ class ActronSwitch(CoordinatorEntity, SwitchEntity):
         super()._handle_coordinator_update()
 
     async def _optimistic_toggle(self, enabled: bool) -> None:
-        """Toggle with optimistic state update."""
+        """Toggle with optimistic state update.
+
+        No coordinator refresh on success — optimistic state stays until the
+        next scheduled poll so concurrent toggles don't clear each other.
+        """
         self._optimistic_state = enabled
         self.coordinator.reset_poll_timer()
         self.async_write_ha_state()
 
         try:
             api_method = getattr(self.coordinator.api, self._config.api_method)
-            await api_method(self.coordinator.data, enabled)
-            await self.coordinator.async_request_refresh()
+            async with self.coordinator.command_lock:
+                await api_method(self.coordinator.data, enabled)
+            # No async_request_refresh() — see docstring above
         except Exception:
             self._optimistic_state = None
             self.async_write_ha_state()

@@ -21,6 +21,15 @@ class ActronSHQConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._api: ActronAirAPI | None = None
         self._device_code: str | None = None
 
+    async def async_remove(self) -> None:
+        """Clean up if the flow is abandoned mid-auth."""
+        if self._api is not None:
+            try:
+                await self._api.close()
+            except Exception:
+                pass
+            self._api = None
+
     async def async_step_user(self, user_input=None):
         """Step 1: Request a device code and show it to the user."""
         await self.async_set_unique_id(DOMAIN)
@@ -45,6 +54,12 @@ class ActronSHQConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._poll_interval = response.get("interval", 5)
         except Exception:
             _LOGGER.exception("Failed to request device code")
+            if self._api is not None:
+                try:
+                    await self._api.close()
+                except Exception:
+                    pass
+                self._api = None
             errors["base"] = "unknown"
             return self.async_show_form(
                 step_id="user",
