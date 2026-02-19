@@ -1,0 +1,19 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Actron SHQ — Authenticate",
+        "description": "Open the following URL and enter the code to link your Actron account:\n\n**URL:** {url}\n\n**Code:** `{code}`\n\nPress submit once you have completed authentication.",
+        "data": {}
+      }
+    },
+    "error": {
+      "auth_failed": "Authentication failed or timed out. Please try again.",
+      "no_systems": "No AC systems found on this account.",
+      "unknown": "An unexpected error occurred."
+    },
+    "abort": {
+      "already_configured": "Actron SHQ is already configured."
+    }
+  }
+}
