@@ -1,6 +1,6 @@
 # Home Assistant Custom Components
 
-Five custom integrations for Home Assistant.
+Six custom integrations for Home Assistant.
 
 ## Components
 
@@ -11,6 +11,7 @@ Five custom integrations for Home Assistant.
 | `dosa` | WebSocket | 8766 | YAML | Door controller (CNC-driven) |
 | `centurion` | HTTP REST | — | Config Flow | Centurion garage door |
 | `cfa_fire_ban` | HTTP (RSS) | — | YAML | CFA fire ban & danger ratings |
+| `actron_shq` | Cloud API | — | Config Flow | Actron air conditioning control |
 
 ## shq_display (Nyx Kiosk Control)
 
@@ -92,6 +93,20 @@ cfa_fire_ban:
 **Architecture**: `DataUpdateCoordinator` polling CFA RSS feed every 30 min. Parses XML for TFB status and fire danger rating.
 
 **Key files**: `const.py` (districts), `coordinator.py` (RSS fetch/parse), `binary_sensor.py`, `sensor.py`
+
+## actron_shq (Actron Air Conditioning)
+
+**Entities**: Climate (main unit + per-zone), Sensors (outdoor temp, humidity)
+
+**Config**: UI config flow — OAuth2 device-code authentication
+
+**Communication**: Cloud API via `actron-neo-api` SDK, polled every 60s
+
+**Architecture**: `DataUpdateCoordinator` with fault-tolerant API wrapper (exponential backoff, auth retry, 60s timeout). Config stores only `refresh_token`.
+
+**Key files**: `api.py` (fault-tolerant wrapper), `coordinator.py` (polling), `config_flow.py` (device-code OAuth2), `climate.py` (main + zone entities), `sensor.py` (outdoor temp, humidity)
+
+**Climate features**: HVAC modes (off/cool/heat/auto/fan_only), fan modes (low/medium/high/auto), target temperature. Zones support on/off and target temperature only.
 
 ## Common Patterns
 
