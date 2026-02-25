@@ -1,6 +1,6 @@
 import logging
 import requests
-from homeassistant.components.cover import CoverEntity
+from homeassistant.components.cover import CoverEntity, CoverEntityFeature
 from homeassistant.const import STATE_CLOSED, STATE_OPEN, STATE_OPENING, STATE_CLOSING
 from .const import DOMAIN, CONF_IP_ADDRESS, CONF_API_KEY
 
@@ -16,10 +16,14 @@ class CenturionGarageDoor(CoverEntity):
         self._ip = ip
         self._api_key = api_key
         self._state = STATE_CLOSED
+        self._position = 0
         self._attr_unique_id = f"centurion_garage_{ip.replace('.', '_')}"
 
     def _base_url(self):
         return f"http://{self._ip}/api?key={self._api_key}"
+
+    def _api_call(self, params):
+        return requests.get(f"{self._base_url()}&{params}", timeout=5)
 
     @property
     def device_info(self):
@@ -36,35 +40,12 @@ class CenturionGarageDoor(CoverEntity):
 
     @property
     def supported_features(self):
-        # OPEN, CLOSE, STOP
-        return 7
-
-    def update(self):
-        try:
-            url = f"{self._base_url()}&status=json"
-            _LOGGER.debug(f"Fetching door status from: {url}")
-            response = requests.get(url, timeout=5)
-            data = response.json()
-            door_state = str(data.get("door", "")).lower()
-            _LOGGER.debug(f"Centurion returned door state: {door_state}")
-
-            if "opening" in door_state:
-                self._state = STATE_OPENING
-            elif "closing" in door_state:
-                self._state = STATE_CLOSING
-            elif "open" in door_state:
-                self._state = STATE_OPEN
-            elif "close" in door_state:
-                self._state = STATE_CLOSED
-            elif "stopped" in door_state or "error" in door_state:
-                self._state = None
-                _LOGGER.warning(f"Door in stopped/error state: {door_state}")
-            else:
-                _LOGGER.warning(f"Unexpected door state: {door_state}")
-                self._state = None
-
-        except Exception as e:
-            _LOGGER.error(f"Error updating Centurion door status: {e}")
+        return (
+            CoverEntityFeature.OPEN
+            | CoverEntityFeature.CLOSE
+            | CoverEntityFeature.STOP
+            | CoverEntityFeature.SET_POSITION
+        )
 
     @property
     def name(self):
@@ -75,27 +56,73 @@ class CenturionGarageDoor(CoverEntity):
         return self._state == STATE_CLOSED
 
     @property
-    def state(self):
-        return self._state
+    def is_opening(self):
+        return self._state == STATE_OPENING
 
-    def open_cover(self, **kwargs):
-        try:
-            requests.get(f"{self._base_url()}&door=open")
-            self._state = STATE_OPEN
-            self.schedule_update_ha_state()
-        except Exception as e:
-            _LOGGER.error(f"Error sending open command: {e}")
+    @property
+    def is_closing(self):
+        return self._state == STATE_CLOSING
 
-    def close_cover(self, **kwargs):
-        try:
-            requests.get(f"{self._base_url()}&door=close")
-            self._state = STATE_CLOSED
-            self.schedule_update_ha_state()
-        except Exception as e:
-            _LOGGER.error(f"Error sending close command: {e}")
+    @property
+    def current_cover_position(self):
+        return self._position
 
-    def stop_cover(self, **kwargs):
+    async def async_update(self):
         try:
-            requests.get(f"{self._base_url()}&door=stop")
+            response = await self.hass.async_add_executor_job(
+                self._api_call, "status=json"
+            )
+            data = response.json()
+            door_state = str(data.get("door", "")).lower()
+            _LOGGER.debug("Centurion returned door state: %s", door_state)
+
+            if "opening" in door_state:
+                self._state = STATE_OPENING
+                self._position = 50
+            elif "closing" in door_state:
+                self._state = STATE_CLOSING
+                self._position = 50
+            elif "open" in door_state:
+                self._state = STATE_OPEN
+                self._position = 100
+            elif "close" in door_state:
+                self._state = STATE_CLOSED
+                self._position = 0
+            elif "stopped" in door_state or "error" in door_state:
+                self._state = STATE_OPEN
+                self._position = 50
+                _LOGGER.warning("Door in stopped/error state: %s", door_state)
+            else:
+                _LOGGER.warning("Unexpected door state: %s", door_state)
+                self._state = STATE_OPEN
+                self._position = 50
+
         except Exception as e:
-            _LOGGER.error(f"Error sending stop command: {e}")
+            _LOGGER.error("Error updating Centurion door status: %s", e)
+
+    async def async_open_cover(self, **kwargs):
+        try:
+            await self.hass.async_add_executor_job(self._api_call, "door=open")
+            self._state = STATE_OPENING
+            self._position = 50
+            self.async_write_ha_state()
+        except Exception as e:
+            _LOGGER.error("Error sending open command: %s", e)
+
+    async def async_close_cover(self, **kwargs):
+        try:
+            await self.hass.async_add_executor_job(self._api_call, "door=close")
+            self._state = STATE_CLOSING
+            self._position = 50
+            self.async_write_ha_state()
+        except Exception as e:
+            _LOGGER.error("Error sending close command: %s", e)
+
+    async def async_stop_cover(self, **kwargs):
+        try:
+            await self.hass.async_add_executor_job(self._api_call, "door=stop")
+        except Exception as e:
+            _LOGGER.error("Error sending stop command: %s", e)
+
+    async def async_set_cover_position(self, **kwargs):
+        self.async_write_ha_state()
