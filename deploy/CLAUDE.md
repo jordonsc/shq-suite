@@ -5,7 +5,8 @@ Python CLI tool for deploying all SHQ components to their respective Raspberry P
 ## Usage
 
 ```bash
-./setup ha                          # Deploy HA components to redacted.host
+./setup ha                          # Deploy HA components + reload config
+./setup ha --restart                # Deploy HA components + full service restart
 ./setup kiosk                       # Deploy Nyx to all kiosks
 ./setup kiosk -h redacted.host    # Deploy to specific kiosk
 ./setup overwatch --build           # Build + deploy Overwatch
@@ -42,6 +43,8 @@ config/
 ├── app/                # Runtime configs pushed to devices
 │   ├── overwatch.yaml  # AWS Polly creds, sounds, voices
 │   └── dosa.yaml       # Door params, CNC connection
+├── ha/                 # HA server config files
+│   └── configuration.yaml  # Main HA configuration (modbus, templates, etc)
 └── service/            # systemd unit file templates
     ├── kiosk/
     │   ├── kiosk.service   # Chromium (has {dashboard_url} placeholder)
@@ -57,6 +60,7 @@ config/
 | Target | What | Destination |
 |--------|------|-------------|
 | `redacted.host` | HA custom_components | `/etc/hass/custom_components` |
+| `redacted.host` | configuration.yaml | `/etc/hass/configuration.yaml` |
 | `kiosk02-07` | Nyx binary | `/home/shq/display/display/` |
 | `kiosk02-07` | Wallpaper, services | `~/.config/systemd/user/` |
 | `redacted.host` | Binary, sounds, config | `~/overwatch/` |

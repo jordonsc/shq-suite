@@ -1,5 +1,9 @@
 """Home Assistant deployment module."""
 
+import os
+import urllib.error
+import urllib.request
+from pathlib import Path
 from typing import List
 
 from .base import BaseDeployer
@@ -29,14 +33,58 @@ class HomeAssistantDeployer(BaseDeployer):
             service_name: Name of the systemd service
         """
         super().__init__(hostnames, user, private_key, source_path, destination_path, service_name)
+        # configuration.yaml lives in deploy/config/ha/ (gitignored, user-specific)
+        self.config_file = Path(__file__).parent.parent.parent / "config" / "ha" / "configuration.yaml"
+        # www/ directory for custom frontend resources (icons, etc.)
+        self.www_path = Path(source_path).parent / "www"
 
-    def deploy_to_host(self, hostname: str, verbose: bool = False) -> bool:
+    def _reload_ha_config(self, verbose: bool = False) -> bool:
+        """
+        Reload Home Assistant configuration via the REST API.
+
+        Uses $HA_URL and $HA_TOKEN environment variables.
+
+        Returns:
+            True if successful, False otherwise
+        """
+        ha_url = os.environ.get("HA_URL")
+        ha_token = os.environ.get("HA_TOKEN")
+
+        if not ha_url or not ha_token:
+            print("FAILED")
+            print("  $HA_URL and $HA_TOKEN must be set for config reload.")
+            print("  Use --restart for a full service restart instead.")
+            return False
+
+        url = f"{ha_url}/api/services/homeassistant/reload_all"
+        headers = {
+            "Authorization": f"Bearer {ha_token}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            req = urllib.request.Request(url, data=b"{}", headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                if verbose:
+                    print(f"({resp.status}) ", end="", flush=True)
+            return True
+        except urllib.error.HTTPError as e:
+            print(f"FAILED ({e.code})")
+            if verbose and e.read:
+                print(f"  {e.read().decode()}")
+            return False
+        except urllib.error.URLError as e:
+            print(f"FAILED ({e.reason})")
+            return False
+
+    def deploy_to_host(self, hostname: str, verbose: bool = False, restart: bool = False) -> bool:
         """
         Deploy Home Assistant component to a single host.
 
         Args:
             hostname: Target hostname
             verbose: Show verbose output
+            restart: Full service restart instead of config reload
 
         Returns:
             True if successful, False otherwise
@@ -48,16 +96,48 @@ class HomeAssistantDeployer(BaseDeployer):
         if not self.run_rsync(self.source_path, self.destination_path, hostname, verbose=verbose, delete=False):
             print("FAILED")
             return False
-        
         print("done", flush=True)
 
-        # Restart the homeassistant service (system service, not user service)
-        print(f" * Restarting service.. ", end="", flush=True)
-        restart_cmd = f"sudo systemctl restart {self.service_name}.service"
-        if not self.run_ssh_command(hostname, restart_cmd, verbose=verbose):
-            print(f"Failed to restart {self.service_name} service.")
-            return False
+        # Deploy www/ directory if it exists (needs sudo as /etc/hass is root-owned)
+        if self.www_path.exists():
+            print(f" * Deploying www/.. ", end="", flush=True)
+            tmp_www = "/tmp/ha_www"
+            # destination_path is e.g. /etc/hass, www goes inside it
+            final_www = str(Path(self.destination_path) / "www")
+            if not self.run_rsync(str(self.www_path) + "/", tmp_www, hostname, verbose=verbose, delete=False):
+                print("FAILED")
+                return False
+            if not self.run_ssh_command(hostname, f"sudo cp -a {tmp_www}/. {final_www}/ && rm -rf {tmp_www}", verbose=verbose):
+                print("FAILED")
+                return False
+            print("done", flush=True)
 
-        print("done")
+        # Deploy configuration.yaml if it exists (needs sudo as /etc/hass is root-owned)
+        if self.config_file.exists():
+            print(f" * Deploying configuration.yaml.. ", end="", flush=True)
+            tmp_dest = "/tmp/ha_configuration.yaml"
+            final_dest = self.destination_path + "/configuration.yaml"
+            if not self.run_rsync(self.config_file, tmp_dest, hostname, verbose=verbose, delete=False):
+                print("FAILED")
+                return False
+            if not self.run_ssh_command(hostname, f"sudo mv {tmp_dest} {final_dest}", verbose=verbose):
+                print("FAILED")
+                return False
+            print("done", flush=True)
+
+        if restart:
+            # Full service restart via systemd
+            print(f" * Restarting service.. ", end="", flush=True)
+            restart_cmd = f"sudo systemctl restart {self.service_name}.service"
+            if not self.run_ssh_command(hostname, restart_cmd, verbose=verbose):
+                print(f"Failed to restart {self.service_name} service.")
+                return False
+            print("done")
+        else:
+            # Reload configuration via HA REST API
+            print(f" * Reloading configuration.. ", end="", flush=True)
+            if not self._reload_ha_config(verbose=verbose):
+                return False
+            print("done")
 
         return True

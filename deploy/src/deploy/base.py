@@ -204,12 +204,13 @@ class BaseDeployer(ABC):
         """
         pass
 
-    def deploy_all(self, verbose: bool = False) -> None:
+    def deploy_all(self, verbose: bool = False, **kwargs) -> None:
         """
         Deploy to all configured hosts.
 
         Args:
             verbose: Show verbose output
+            **kwargs: Additional arguments passed to deploy_to_host
         """
         for hostname in self.hostnames:
-            self.deploy_to_host(hostname, verbose=verbose)
+            self.deploy_to_host(hostname, verbose=verbose, **kwargs)

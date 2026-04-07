@@ -1,8 +1,11 @@
+import logging
 import requests
 from datetime import timedelta
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.helpers.entity import DeviceInfo
 from .const import CONF_IP_ADDRESS, CONF_API_KEY, DOMAIN
+
+_LOGGER = logging.getLogger(__name__)
 
 SCAN_INTERVAL = timedelta(seconds=30)
 
@@ -12,17 +15,22 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     async_add_entities([
         CenturionLampSwitch(ip, api_key),
         CenturionVacationSwitch(ip, api_key)
-    ])
+    ], update_before_add=True)
 
 class CenturionBaseSwitch(SwitchEntity):
     def __init__(self, ip, api_key):
         self._ip = ip
         self._api_key = api_key
         self._is_on = False
+        self._available = True
         self._skip_next_update = False
 
     def _base_url(self):
         return f"http://{self._ip}/api?key={self._api_key}"
+
+    @property
+    def available(self):
+        return self._available
 
     @property
     def device_info(self):
@@ -67,8 +75,11 @@ class CenturionLampSwitch(CenturionBaseSwitch):
             r = requests.get(f"{self._base_url()}&status=json", timeout=5)
             data = r.json()
             self._is_on = str(data.get("lamp", "off")).lower() == "on"
-        except Exception:
-            self._is_on = False
+            self._available = True
+        except Exception as e:
+            if self._available:
+                _LOGGER.error("Centurion lamp switch unreachable: %s", e)
+            self._available = False
 
 class CenturionVacationSwitch(CenturionBaseSwitch):
     def __init__(self, ip, api_key):
@@ -104,5 +115,8 @@ class CenturionVacationSwitch(CenturionBaseSwitch):
             r = requests.get(f"{self._base_url()}&status=json", timeout=5)
             data = r.json()
             self._is_on = str(data.get("vacation", "off")).lower() == "on"
-        except Exception:
-            self._is_on = False
+            self._available = True
+        except Exception as e:
+            if self._available:
+                _LOGGER.error("Centurion vacation switch unreachable: %s", e)
+            self._available = False

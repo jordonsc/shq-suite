@@ -77,6 +77,10 @@ Keep the docs concise and factual. Don't pad them out — only document what a f
 | `redacted.host` | Voice/TTS server (RPi 5, console-only) |
 | `redacted.host` | Also runs DOSA door controller |
 
+## Home Assistant API Access
+
+Claude Code has direct access to the HA REST API via the `./ha` helper script (uses `$HA_URL` and `$HA_TOKEN` env vars from `~/.bashrc`). An MCP server is also configured in `~/.claude.json` for basic device control. See `home-assistant/CLAUDE.md` for API usage details.
+
 ## Key Gotchas
 
 - **Chrome CDP Host header**: Raw HTTP to Chrome's `/json` must include port in `Host` header (`Host: 127.0.0.1:9222`), else WebSocket URLs get port 80

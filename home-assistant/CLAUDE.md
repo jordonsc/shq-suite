@@ -76,7 +76,7 @@ dosa:
 
 **Config**: UI config flow — prompts for IP address and API key
 
-**Communication**: Simple HTTP GET with query params (`?key={api_key}&door=open`)
+**Communication**: Simple HTTP GET with query params (`?key={api_key}&door=open`). All entities have availability tracking — go unavailable when the controller is unreachable, recover automatically on next successful poll.
 
 **Key files**: `config_flow.py`, `cover.py`, `switch.py`
 
@@ -107,6 +107,106 @@ cfa_fire_ban:
 **Key files**: `api.py` (fault-tolerant wrapper), `coordinator.py` (polling), `config_flow.py` (device-code OAuth2), `climate.py` (main + zone entities), `sensor.py` (outdoor temp, humidity)
 
 **Climate features**: HVAC modes (off/cool/heat/auto/fan_only), fan modes (low/medium/high/auto), target temperature. Zones support on/off and target temperature only.
+
+## Home Assistant REST API
+
+A helper script `./ha` in the project root wraps the HA REST API with authentication. It uses `$HA_URL` and `$HA_TOKEN` env vars (set in `~/.bashrc`).
+
+```bash
+# Usage: ./ha <get|post> <path> [json_body]
+
+# List all entity states
+./ha get /api/states
+
+# Get a single entity state
+./ha get /api/states/light.living_downlights
+
+# List all automations (config)
+./ha get /api/config/automation/config
+
+# Get a specific automation config
+./ha get /api/config/automation/config/{id}
+
+# List all scripts/scenes (config)
+./ha get /api/config/script/config
+./ha get /api/config/scene/config
+
+# Call a service
+./ha post /api/services/light/turn_on '{"entity_id": "light.living_downlights"}'
+
+# Filter entities by domain
+./ha get /api/states | \
+  python3 -c "import json,sys; [print(e['entity_id'],e['state']) for e in json.load(sys.stdin) if e['entity_id'].startswith('light.')]"
+```
+
+### MCP Server (home-assistant)
+
+An MCP server is configured in `~/.claude.json` for basic voice-assistant-style control (turn on/off, set temperature, media, etc). Useful for quick device control but **does not** support listing entities, reading automations, or managing config — use the REST API for those.
+
+## Victron Cerbo GX — Network Battery (Modbus TCP)
+
+A Victron MultiPlus-II with battery backup for network infrastructure, monitored via a Cerbo GX at `REDACTED-IP` using Modbus TCP (port 502). The battery is connected to the MultiPlus, not the Cerbo directly — so no BMS-reported SOC; it's estimated from voltage.
+
+**Modbus units**: Unit 100 = system-level, Unit 227 = VE.Bus (MultiPlus)
+
+**Entities** (all prefixed `network_battery_`, configured in `configuration.yaml`):
+
+| Sensor | Register | Unit | Description |
+|--------|----------|------|-------------|
+| `voltage` | 840 | 100 | Battery voltage (V) |
+| `current` | 841 | 100 | Battery current (A, signed) |
+| `power` | 842 | 100 | Battery power (W, signed) |
+| `state` | 844 | 100 | 0=idle, 1=charging, 2=discharging |
+| `grid_power` | 820 | 100 | Grid input power (W) |
+| `ac_consumption` | 817 | 100 | AC output consumption (W) |
+| `ac_input_voltage` | 3 | 227 | Grid voltage (V) |
+| `ac_input_power` | 12 | 227 | MultiPlus AC input (W) |
+| `ac_output_power` | 23 | 227 | MultiPlus AC output (W) |
+| `soc_estimate` | — | — | Template: voltage-based SOC estimate (44V=0%, 55.2V=100%) |
+| `grid_available` | — | — | Template: binary sensor from grid_power > 0 |
+
+**Automations**:
+- `Network Battery - Power Outage Detected` — Overwatch warn announcement + PagerDuty alert when grid drops for 10s
+- `Network Battery - Power Restored` — Overwatch notify announcement + PagerDuty resolve when grid returns
+
+**Config**: Modbus sensors defined in `deploy/config/ha/configuration.yaml` (gitignored). Poll interval: 10s.
+
+## Custom Icons (`www/shq-icons.js`)
+
+Custom SVG icon set for HA, registered as `shq:` prefix (e.g. `shq:floor-lamp`).
+
+**File**: `home-assistant/www/shq-icons.js` — deployed to `/etc/hass/www/` via `./setup ha`
+
+**Adding a new icon**:
+1. Design or source an SVG at 24x24 viewBox
+2. Extract the `d` attribute from the `<path>` element
+3. Add an entry to `SHQ_ICONS` in `shq-icons.js` with a `path` key (and optional `viewBox` if not 24x24)
+4. Deploy: `./setup ha`
+5. Cache-bust the Lovelace resource so browsers pick up the change:
+```python
+python3 << 'EOF'
+import asyncio, json, os, time
+async def main():
+    import websockets
+    url = os.environ["HA_URL"].replace("http", "ws") + "/api/websocket"
+    async with websockets.connect(url) as ws:
+        await ws.recv()
+        await ws.send(json.dumps({"type": "auth", "access_token": os.environ["HA_TOKEN"]}))
+        await ws.recv()
+        await ws.send(json.dumps({
+            "id": 1,
+            "type": "lovelace/resources/update",
+            "resource_id": "e54a34a4b1de4e8d8090d25306468adb",
+            "url": f"/local/shq-icons.js?v={int(time.time())}",
+        }))
+        print(await ws.recv())
+asyncio.run(main())
+EOF
+```
+
+**Icon format**: HA renders icons as filled SVG paths (not stroked). The `d` value must define closed filled shapes, not stroke outlines. All icons use `fill` — `stroke` attributes are ignored.
+
+**Lovelace resource**: Registered once via Settings → Dashboards → Resources as `/local/shq-icons.js` (type: JavaScript Module). The resource ID `e54a34a4b1de4e8d8090d25306468adb` is used for cache-busting updates.
 
 ## Common Patterns
 

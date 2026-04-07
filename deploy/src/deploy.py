@@ -106,12 +106,19 @@ def cli():
     default="shq_display",
     help="Name of the custom component to deploy (default: shq_display).",
 )
-def ha(hostname, user, key, verbose, component):
+@click.option(
+    "--restart",
+    "-r",
+    is_flag=True,
+    help="Full service restart instead of config reload (use when custom component code has changed).",
+)
+def ha(hostname, user, key, verbose, component, restart):
     """
     Deploy Home Assistant custom component.
 
     Deploys the SHQ Display custom component to Home Assistant hosts
-    and restarts the homeassistant service.
+    and reloads the configuration. Use --restart for a full service restart
+    (needed when custom component Python code has changed).
 
     Configuration loaded from config/deployment/ha.yaml
     """
@@ -133,7 +140,7 @@ def ha(hostname, user, key, verbose, component):
         service_name=config.systemd_service,
     )
 
-    deployer.deploy_all(verbose=verbose)
+    deployer.deploy_all(verbose=verbose, restart=restart)
 
     click.echo()
     click.echo("Home Assistant deployment complete.")
