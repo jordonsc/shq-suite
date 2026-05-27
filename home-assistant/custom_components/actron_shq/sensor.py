@@ -3,6 +3,7 @@
 import logging
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
+from homeassistant.helpers.entity import EntityCategory
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import PERCENTAGE, UnitOfTemperature
 from homeassistant.core import HomeAssistant
@@ -25,6 +26,7 @@ async def async_setup_entry(
     async_add_entities([
         ActronOutdoorTemperatureSensor(coordinator),
         ActronHumiditySensor(coordinator),
+        ActronControllerStateSensor(coordinator),
     ])
 
 
@@ -66,3 +68,38 @@ class ActronHumiditySensor(CoordinatorEntity, SensorEntity):
         if not self.coordinator.data:
             return None
         return self.coordinator.data.humidity
+
+
+class ActronControllerStateSensor(CoordinatorEntity, SensorEntity):
+    """Diagnostic sensor exposing coordinator state.
+
+    States: ``idle``, ``pending``, ``timeout``, ``rate_limited``. Attributes
+    include the pending overlay keys, last command, burst window, and poll
+    interval — useful for debugging why a commanded change hasn't shown up.
+    """
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_icon = "mdi:heart-pulse"
+    _attr_options = ["idle", "pending", "timeout", "rate_limited"]
+    _attr_device_class = SensorDeviceClass.ENUM
+
+    def __init__(self, coordinator: ActronCoordinator) -> None:
+        """Initialise the sensor."""
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{DOMAIN}_{coordinator.serial}_controller_state"
+        self._attr_name = "Actron Controller State"
+
+    @property
+    def available(self) -> bool:
+        """Always available so rate-limited state stays visible."""
+        return True
+
+    @property
+    def native_value(self) -> str:
+        """Return the current controller state."""
+        return self.coordinator.controller_state
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        """Return diagnostic attributes."""
+        return self.coordinator.controller_state_attributes

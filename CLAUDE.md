@@ -47,6 +47,12 @@ Keep the docs concise and factual. Don't pad them out — only document what a f
 | `deploy/` | Python | SSH/rsync deployment tool for all components |
 | `shelly/` | Python | CLI for discovering and configuring Shelly smart devices |
 
+## Reference Docs
+
+| Doc | Description |
+|-----|-------------|
+| [`docs/actron-local-control.md`](docs/actron-local-control.md) | Actron A/C hardware identity, comms architecture, and the ICUNO-MOD Modbus path for local control (incl. register map + the per-zone-temp limitation) |
+
 ## Common Patterns
 
 ### Rust Applications (nyx, overwatch, dosa)

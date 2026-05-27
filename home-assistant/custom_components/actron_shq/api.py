@@ -10,6 +10,15 @@ from actron_neo_api import ActronAirAPI, ActronAirAPIError, ActronAirAuthError
 _LOGGER = logging.getLogger(__name__)
 
 
+class ActronRateLimitError(Exception):
+    """Raised when the Actron cloud API returns a 429 or 503 response.
+
+    These are signalled via the ``Status:`` prefix in the SDK's error message
+    (the SDK doesn't expose HTTP status codes structurally). When raised, the
+    caller should back off immediately rather than retrying.
+    """
+
+
 class ActronAPI:
     """Fault-tolerant wrapper around ActronAirAPI.
 
@@ -70,6 +79,15 @@ class ActronAPI:
                 duration = time.monotonic() - start
                 error_type = type(e).__name__
                 last_error = e
+
+                if isinstance(e, ActronAirAPIError):
+                    msg = str(e)
+                    if "Status: 429" in msg or "Status: 503" in msg:
+                        _LOGGER.warning(
+                            "[%s] Rate limited after %.2fs: %s",
+                            method_name, duration, e,
+                        )
+                        raise ActronRateLimitError(msg) from e
 
                 if attempt < self._max_retries:
                     delay = min(

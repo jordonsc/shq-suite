@@ -23,6 +23,7 @@ class ActronSwitchConfig:
     key: str
     name: str
     icon: str
+    overlay_key: str
     read_attr: str
     api_method: str
 
@@ -32,6 +33,7 @@ SWITCH_CONFIGS = [
         key="continuous_fan",
         name="Actron Continuous Fan",
         icon="mdi:fan-clock",
+        overlay_key="continuous_fan_enabled",
         read_attr="continuous_fan_enabled",
         api_method="set_continuous_fan",
     ),
@@ -39,6 +41,7 @@ SWITCH_CONFIGS = [
         key="away_mode",
         name="Actron Away Mode",
         icon="mdi:home-export-outline",
+        overlay_key="away_mode",
         read_attr="away_mode",
         api_method="set_away_mode",
     ),
@@ -46,6 +49,7 @@ SWITCH_CONFIGS = [
         key="quiet_mode",
         name="Actron Quiet Mode",
         icon="mdi:volume-off",
+        overlay_key="quiet_mode_enabled",
         read_attr="quiet_mode_enabled",
         api_method="set_quiet_mode",
     ),
@@ -53,6 +57,7 @@ SWITCH_CONFIGS = [
         key="turbo_mode",
         name="Actron Turbo Mode",
         icon="mdi:rocket-launch",
+        overlay_key="turbo_enabled",
         read_attr="turbo_enabled",
         api_method="set_turbo_mode",
     ),
@@ -80,7 +85,6 @@ class ActronSwitch(CoordinatorEntity, SwitchEntity):
         """Initialise the switch."""
         super().__init__(coordinator)
         self._config = config
-        self._optimistic_state: bool | None = None
         self._attr_unique_id = f"{DOMAIN}_{coordinator.serial}_{config.key}"
         self._attr_name = config.name
         self._attr_icon = config.icon
@@ -91,40 +95,35 @@ class ActronSwitch(CoordinatorEntity, SwitchEntity):
 
     @property
     def is_on(self) -> bool:
-        """Return whether the feature is enabled."""
-        if self._optimistic_state is not None:
-            return self._optimistic_state
-        return getattr(self._settings, self._config.read_attr, False)
+        """Return whether the feature is enabled (overlay-aware)."""
+        return self.coordinator.get_optimistic(
+            self._config.overlay_key,
+            getattr(self._settings, self._config.read_attr, False),
+        )
 
-    def _handle_coordinator_update(self) -> None:
-        """Clear optimistic state when real data arrives."""
-        self._optimistic_state = None
-        super()._handle_coordinator_update()
-
-    async def _optimistic_toggle(self, enabled: bool) -> None:
-        """Toggle with optimistic state update.
-
-        No coordinator refresh on success — optimistic state stays until the
-        next scheduled poll so concurrent toggles don't clear each other.
-        """
-        self._optimistic_state = enabled
-        self.coordinator.reset_poll_timer()
-        self.async_write_ha_state()
-
+    async def _toggle(self, enabled: bool) -> None:
+        """Toggle with optimistic overlay set on the coordinator."""
+        overlay = {self._config.overlay_key: enabled}
+        self.coordinator.set_optimistic(
+            overlay, f"{self._config.api_method}({enabled})"
+        )
         try:
             api_method = getattr(self.coordinator.api, self._config.api_method)
             async with self.coordinator.command_lock:
                 await api_method(self.coordinator.data, enabled)
-            # No async_request_refresh() — see docstring above
         except Exception:
-            self._optimistic_state = None
-            self.async_write_ha_state()
+            self.coordinator.clear_optimistic(list(overlay.keys()))
             raise
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the feature on."""
-        await self._optimistic_toggle(True)
+        await self._toggle(True)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the feature off."""
-        await self._optimistic_toggle(False)
+        await self._toggle(False)
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        """Expose a `pending` flag when this switch has an unconfirmed command."""
+        return {"pending": self.coordinator.is_pending(self._config.overlay_key)}

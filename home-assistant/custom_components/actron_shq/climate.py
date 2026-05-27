@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import time
 
 from homeassistant.components.climate import (
     ClimateEntity,
@@ -11,15 +12,22 @@ from homeassistant.components.climate import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN
+from .api import ActronRateLimitError
+from .const import (
+    DOMAIN,
+    LAST_ZONE_OFF_HOLD_SECONDS,
+    ZONE_CONFIRM_POLL_SECONDS,
+    ZONE_CONFIRM_TIMEOUT_SECONDS,
+    ZONE_RESEND_INTERVAL_SECONDS,
+)
 from .coordinator import ActronCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-# HA mode -> SDK mode
 HA_TO_SDK_MODE = {
     HVACMode.OFF: "OFF",
     HVACMode.COOL: "COOL",
@@ -28,10 +36,8 @@ HA_TO_SDK_MODE = {
     HVACMode.FAN_ONLY: "FAN",
 }
 
-# SDK mode -> HA mode
 SDK_TO_HA_MODE = {v: k for k, v in HA_TO_SDK_MODE.items()}
 
-# SDK fan mode -> HA fan mode (lowercase for HA)
 SDK_TO_HA_FAN = {
     "HIGH": "high",
     "MEDIUM": "medium",
@@ -62,14 +68,13 @@ async def async_setup_entry(
 
 
 class ActronClimateBase(CoordinatorEntity, ClimateEntity):
-    """Base class for Actron climate entities with command cancellation.
+    """Base class with per-slot command cancellation.
 
-    Tracks in-flight API commands per slot (e.g. "temperature", "mode").
-    When a new command arrives for the same slot, the previous one is
-    cancelled — its retry sleeps and API waits get interrupted via
-    CancelledError. Callers are responsible for triggering a coordinator
-    refresh if needed; optimistic commands deliberately skip it so that
-    a refresh for one entity doesn't clear another entity's optimistic state.
+    Rapid UI adjustments (e.g. dragging a temperature slider) produce multiple
+    commands for the same slot. Only the most recent should win — in-flight
+    predecessors are cancelled so their retry sleeps and API waits abort.
+    Optimistic state lives in the coordinator's overlay, not on the entity,
+    so concurrent commands on different entities don't interfere.
     """
 
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
@@ -79,28 +84,38 @@ class ActronClimateBase(CoordinatorEntity, ClimateEntity):
         super().__init__(coordinator)
         self._pending_commands: dict[str, asyncio.Task] = {}
 
-    async def _execute_command(self, key: str, coro) -> None:
-        """Run a command, cancelling any in-flight command for the same slot."""
-        pending = self._pending_commands.get(key)
+    async def _run_command(
+        self,
+        slot: str,
+        overlay: dict,
+        command_desc: str,
+        coro,
+        baselines: dict | None = None,
+    ) -> None:
+        """Apply optimistic overlay, run the API call, reconcile on failure."""
+        self.coordinator.set_optimistic(overlay, command_desc, baselines=baselines)
+
+        pending = self._pending_commands.get(slot)
         if pending is not None and not pending.done():
             pending.cancel()
 
         current = asyncio.current_task()
-        self._pending_commands[key] = current
+        self._pending_commands[slot] = current
 
         try:
             async with self.coordinator.command_lock:
                 await coro
         except asyncio.CancelledError:
-            # Check if we were superseded by a newer command (intentional)
-            # vs cancelled by HA shutdown (propagate)
-            if self._pending_commands.get(key) is not current:
-                _LOGGER.debug("Command '%s' superseded by newer request", key)
+            if self._pending_commands.get(slot) is not current:
+                _LOGGER.debug("Command '%s' superseded by newer request", slot)
                 return
             raise
+        except Exception:
+            self.coordinator.clear_optimistic(list(overlay.keys()))
+            raise
         finally:
-            if self._pending_commands.get(key) is current:
-                self._pending_commands.pop(key, None)
+            if self._pending_commands.get(slot) is current:
+                self._pending_commands.pop(slot, None)
 
 
 class ActronClimate(ActronClimateBase):
@@ -134,10 +149,11 @@ class ActronClimate(ActronClimateBase):
 
     @property
     def hvac_mode(self) -> HVACMode:
-        """Return current HVAC mode."""
-        if not self._settings.is_on:
+        """Return current HVAC mode (overlay-aware)."""
+        is_on = self.coordinator.get_optimistic("is_on", self._settings.is_on)
+        if not is_on:
             return HVACMode.OFF
-        sdk_mode = self._settings.mode
+        sdk_mode = self.coordinator.get_optimistic("mode", self._settings.mode)
         return SDK_TO_HA_MODE.get(sdk_mode, HVACMode.OFF)
 
     @property
@@ -159,16 +175,18 @@ class ActronClimate(ActronClimateBase):
     def target_temperature(self) -> float | None:
         """Return the target temperature based on current mode."""
         mode = self.hvac_mode
-        if mode in (HVACMode.COOL, HVACMode.AUTO, HVACMode.FAN_ONLY):
-            return self._settings.temperature_setpoint_cool_c
         if mode == HVACMode.HEAT:
-            return self._settings.temperature_setpoint_heat_c
-        return self._settings.temperature_setpoint_cool_c
+            return self.coordinator.get_optimistic(
+                "temp_heat", self._settings.temperature_setpoint_heat_c
+            )
+        return self.coordinator.get_optimistic(
+            "temp_cool", self._settings.temperature_setpoint_cool_c
+        )
 
     @property
     def fan_mode(self) -> str | None:
-        """Return current fan mode."""
-        sdk_fan = self._settings.fan_mode
+        """Return current fan mode (overlay-aware)."""
+        sdk_fan = self.coordinator.get_optimistic("fan_mode", self._settings.fan_mode)
         return SDK_TO_HA_FAN.get(sdk_fan, None)
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
@@ -176,33 +194,49 @@ class ActronClimate(ActronClimateBase):
         sdk_mode = HA_TO_SDK_MODE.get(hvac_mode)
         if sdk_mode is None:
             return
-        await self._execute_command(
+        overlay: dict = {"is_on": sdk_mode != "OFF"}
+        if sdk_mode != "OFF":
+            overlay["mode"] = sdk_mode
+        await self._run_command(
             "mode",
+            overlay,
+            f"set_mode({sdk_mode})",
             self.coordinator.api.set_mode(self._status, sdk_mode),
         )
-        await self.coordinator.async_request_refresh()
 
     async def async_set_temperature(self, **kwargs) -> None:
         """Set target temperature."""
         temp = kwargs.get(ATTR_TEMPERATURE)
         if temp is None:
             return
-        await self._execute_command(
+        key = "temp_heat" if self.hvac_mode == HVACMode.HEAT else "temp_cool"
+        await self._run_command(
             "temperature",
+            {key: temp},
+            f"set_temperature({temp})",
             self.coordinator.api.set_temperature(self._status, temp),
         )
-        await self.coordinator.async_request_refresh()
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
         """Set fan mode."""
         sdk_fan = HA_TO_SDK_FAN.get(fan_mode)
         if sdk_fan is None:
             return
-        await self._execute_command(
+        await self._run_command(
             "fan_mode",
+            {"fan_mode": sdk_fan},
+            f"set_fan_mode({sdk_fan})",
             self.coordinator.api.set_fan_mode(self._status, sdk_fan),
         )
-        await self.coordinator.async_request_refresh()
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        """Expose a `pending` flag when any command is unconfirmed."""
+        return {
+            "pending": self.coordinator.any_pending(
+                ["is_on", "mode", "fan_mode", "temp_cool", "temp_heat"]
+            )
+        }
 
 
 class ActronZoneClimate(ActronClimateBase):
@@ -220,7 +254,6 @@ class ActronZoneClimate(ActronClimateBase):
         """Initialise a zone climate entity."""
         super().__init__(coordinator)
         self._zone_index = zone_index
-        self._optimistic_active: bool | None = None
         zone_name = getattr(zone, "title", None) or f"Zone {zone_index}"
         self._attr_unique_id = f"{DOMAIN}_{coordinator.serial}_zone_{zone_index}"
         self._attr_name = f"Actron {zone_name}"
@@ -246,27 +279,25 @@ class ActronZoneClimate(ActronClimateBase):
         return [HVACMode.OFF]
 
     def _parent_ha_mode(self) -> HVACMode:
-        """Get the parent unit's current HA mode."""
-        if not self._parent_settings.is_on:
+        """Get the parent unit's current HA mode (overlay-aware)."""
+        is_on = self.coordinator.get_optimistic("is_on", self._parent_settings.is_on)
+        if not is_on:
             return HVACMode.OFF
-        sdk_mode = self._parent_settings.mode
+        sdk_mode = self.coordinator.get_optimistic(
+            "mode", self._parent_settings.mode
+        )
         return SDK_TO_HA_MODE.get(sdk_mode, HVACMode.OFF)
 
     @property
     def hvac_mode(self) -> HVACMode:
-        """Return current zone HVAC mode."""
-        if self._optimistic_active is not None:
-            is_active = self._optimistic_active
-        else:
-            is_active = getattr(self._zone, "is_active", False)
+        """Return current zone HVAC mode (overlay-aware)."""
+        is_active = self.coordinator.get_optimistic(
+            f"zone_{self._zone_index}_active",
+            getattr(self._zone, "is_active", False),
+        )
         if not is_active:
             return HVACMode.OFF
         return self._parent_ha_mode()
-
-    def _handle_coordinator_update(self) -> None:
-        """Clear optimistic state when real data arrives."""
-        self._optimistic_active = None
-        super()._handle_coordinator_update()
 
     @property
     def current_temperature(self) -> float | None:
@@ -277,52 +308,180 @@ class ActronZoneClimate(ActronClimateBase):
     def target_temperature(self) -> float | None:
         """Return zone target temperature based on parent mode."""
         parent_mode = self._parent_ha_mode()
-        if parent_mode in (HVACMode.COOL, HVACMode.AUTO, HVACMode.FAN_ONLY):
-            return getattr(self._zone, "temperature_setpoint_cool_c", None)
         if parent_mode == HVACMode.HEAT:
-            return getattr(self._zone, "temperature_setpoint_heat_c", None)
-        return getattr(self._zone, "temperature_setpoint_cool_c", None)
+            return self.coordinator.get_optimistic(
+                f"zone_{self._zone_index}_temp_heat",
+                getattr(self._zone, "temperature_setpoint_heat_c", None),
+            )
+        return self.coordinator.get_optimistic(
+            f"zone_{self._zone_index}_temp_cool",
+            getattr(self._zone, "temperature_setpoint_cool_c", None),
+        )
 
-    async def _optimistic_zone_toggle(self, enabled: bool) -> None:
-        """Toggle zone with optimistic state update.
+    def _set_enabled_zone_local(self, enabled: bool) -> None:
+        """Mutate the shared ``enabled_zones`` list for this zone.
 
-        Sets the state immediately for responsive UI, then sends the API
-        command. No coordinator refresh is triggered on success — the
-        optimistic state stays in place until the next scheduled poll so
-        that concurrent zone toggles don't clear each other's state.
-        On failure, the optimistic state is reverted immediately.
+        Concurrent zone commands build their SDK payloads from this list (the
+        SDK sends the whole ``EnabledZones`` array), so it must reflect our
+        intent between polls. The next coordinator poll replaces the object.
         """
-        self._optimistic_active = enabled
-        # Mutate the shared enabled_zones list in coordinator data so that
-        # concurrent zone toggles build their commands against the updated
-        # state, not the stale one.  The coordinator refresh will replace
-        # this object with real data anyway.
         zones_list = self._status.user_aircon_settings.enabled_zones
         if self._zone_index < len(zones_list):
             zones_list[self._zone_index] = enabled
-        self.coordinator.reset_poll_timer()
-        self.async_write_ha_state()
+
+    def _other_confirmed_active_zones(self) -> int:
+        """Count zones (other than this one) active *on the controller*.
+
+        A zone with a pending overlay is an in-flight HA request, not confirmed
+        controller state, so it is excluded — this is what lets us wait for a
+        just-enabled zone to actually take effect before turning another off.
+        """
+        zones = getattr(self._status, "remote_zone_info", None) or []
+        count = 0
+        for i, z in enumerate(zones):
+            if i == self._zone_index:
+                continue
+            if not getattr(z, "is_active", False):
+                continue
+            if self.coordinator.is_pending(f"zone_{i}_active"):
+                continue
+            count += 1
+        return count
+
+    async def _await_other_active_zone(self) -> bool:
+        """Block until another zone is confirmed active on the controller.
+
+        Returns True once another zone is active (safe to turn this one off),
+        or False if the hold window elapses with no other active zone.
+        """
+        if self._other_confirmed_active_zones() > 0:
+            return True
+        _LOGGER.info(
+            "Zone %s turn-off held: it is the last active zone, waiting up to "
+            "%ss for another zone to activate on the controller",
+            self._zone_index, LAST_ZONE_OFF_HOLD_SECONDS,
+        )
+        deadline = time.monotonic() + LAST_ZONE_OFF_HOLD_SECONDS
+        while time.monotonic() < deadline:
+            # Keep polling fast so a newly-enabled zone is detected promptly.
+            self.coordinator.extend_burst()
+            await asyncio.sleep(ZONE_CONFIRM_POLL_SECONDS)
+            if self._other_confirmed_active_zones() > 0:
+                return True
+        return False
+
+    async def _send_until_confirmed(self, key: str, enabled: bool) -> None:
+        """Re-issue the zone enable command until the controller confirms it.
+
+        The cloud sometimes accepts a command (HTTP 200) without applying it, so
+        firing once is unreliable. We re-send every ``ZONE_RESEND_INTERVAL_SECONDS``
+        until the overlay clears (confirmed/reconciled) or the timeout elapses.
+        """
+        deadline = time.monotonic() + ZONE_CONFIRM_TIMEOUT_SECONDS
+        while True:
+            # Re-assert our intent on the shared list before each send so
+            # concurrent commands (and the SDK's full-array payload) stay correct
+            # even if a poll has since reverted it to the server value.
+            self._set_enabled_zone_local(enabled)
+            try:
+                async with self.coordinator.command_lock:
+                    await self.coordinator.api.enable_zone(
+                        self._status, self._zone_index, enabled
+                    )
+            except ActronRateLimitError:
+                _LOGGER.warning(
+                    "Zone %s toggle hit a rate limit; stopping re-sends and "
+                    "leaving the overlay to reconcile",
+                    self._zone_index,
+                )
+                return
+
+            waited = 0.0
+            while waited < ZONE_RESEND_INTERVAL_SECONDS:
+                if not self.coordinator.is_pending(key):
+                    return  # confirmed, or dropped by reconciliation
+                if time.monotonic() >= deadline:
+                    _LOGGER.warning(
+                        "Zone %s toggle (enabled=%s) not confirmed within %ss",
+                        self._zone_index, enabled, ZONE_CONFIRM_TIMEOUT_SECONDS,
+                    )
+                    return
+                self.coordinator.extend_burst()
+                await asyncio.sleep(ZONE_CONFIRM_POLL_SECONDS)
+                waited += ZONE_CONFIRM_POLL_SECONDS
+
+    async def _toggle_zone(self, enabled: bool) -> None:
+        """Enable/disable this zone: optimistic overlay, last-zone guard, resend.
+
+        Mirrors ``_run_command``'s overlay + per-slot cancellation, but adds:
+          * a hold-until-another-zone-active guard before turning off the last
+            active zone (which would shut down and latch off the whole system);
+          * re-sending the command until the controller confirms it.
+        The waits run *outside* ``command_lock`` so a concurrent zone turn-on
+        can still reach the controller while we wait on it.
+        """
+        key = f"zone_{self._zone_index}_active"
+        # Capture the true pre-command baseline BEFORE mutating enabled_zones
+        # — z.is_active reads directly from enabled_zones.
+        baseline = getattr(self._zone, "is_active", False)
+        self._set_enabled_zone_local(enabled)
+
+        self.coordinator.set_optimistic(
+            {key: enabled},
+            f"zone[{self._zone_index}].enable({enabled})",
+            baselines={key: baseline},
+        )
+
+        pending = self._pending_commands.get("zone_active")
+        if pending is not None and not pending.done():
+            pending.cancel()
+        current = asyncio.current_task()
+        self._pending_commands["zone_active"] = current
 
         try:
-            await self._execute_command(
-                "mode",
-                self.coordinator.api.enable_zone(
-                    self._status, self._zone_index, enabled
-                ),
-            )
-            # No async_request_refresh() — see docstring above
-        except Exception:
-            self._optimistic_active = None
-            self.async_write_ha_state()
+            # Guard only when actually switching an active zone off and it is
+            # currently the last one active — turning off an already-off zone is
+            # a no-op and must not trip the hold.
+            if (
+                not enabled
+                and baseline
+                and self._other_confirmed_active_zones() == 0
+            ):
+                if not await self._await_other_active_zone():
+                    _LOGGER.warning(
+                        "Refusing to turn off zone %s: no other zone became "
+                        "active within %ss (would shut down the system)",
+                        self._zone_index, LAST_ZONE_OFF_HOLD_SECONDS,
+                    )
+                    # Revert optimistic state — the zone stays on.
+                    self._set_enabled_zone_local(True)
+                    self.coordinator.clear_optimistic([key])
+                    raise HomeAssistantError(
+                        "Cannot turn off the last active zone — this would shut "
+                        "down the entire system. Turn on another zone first."
+                    )
+            await self._send_until_confirmed(key, enabled)
+        except asyncio.CancelledError:
+            if self._pending_commands.get("zone_active") is not current:
+                _LOGGER.debug("Zone %s command superseded by newer request", self._zone_index)
+                return
             raise
+        except HomeAssistantError:
+            raise
+        except Exception:
+            self.coordinator.clear_optimistic([key])
+            raise
+        finally:
+            if self._pending_commands.get("zone_active") is current:
+                self._pending_commands.pop("zone_active", None)
 
     async def async_turn_on(self) -> None:
-        """Turn zone on (enable, inheriting parent mode)."""
-        await self._optimistic_zone_toggle(True)
+        """Turn zone on."""
+        await self._toggle_zone(True)
 
     async def async_turn_off(self) -> None:
-        """Turn zone off (disable)."""
-        await self._optimistic_zone_toggle(False)
+        """Turn zone off."""
+        await self._toggle_zone(False)
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Turn zone on or off."""
@@ -336,10 +495,27 @@ class ActronZoneClimate(ActronClimateBase):
         temp = kwargs.get(ATTR_TEMPERATURE)
         if temp is None:
             return
-        await self._execute_command(
-            "temperature",
+        parent_mode = self._parent_ha_mode()
+        key = (
+            f"zone_{self._zone_index}_temp_heat"
+            if parent_mode == HVACMode.HEAT
+            else f"zone_{self._zone_index}_temp_cool"
+        )
+        await self._run_command(
+            "zone_temperature",
+            {key: temp},
+            f"zone[{self._zone_index}].set_temperature({temp})",
             self.coordinator.api.set_zone_temperature(
                 self._status, self._zone_index, temp
             ),
         )
-        await self.coordinator.async_request_refresh()
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        """Expose a `pending` flag when this zone has unconfirmed commands."""
+        i = self._zone_index
+        return {
+            "pending": self.coordinator.any_pending(
+                [f"zone_{i}_active", f"zone_{i}_temp_cool", f"zone_{i}_temp_heat"]
+            )
+        }

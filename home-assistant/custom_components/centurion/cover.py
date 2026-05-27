@@ -90,16 +90,16 @@ class CenturionGarageDoor(CoverEntity):
             self._available = True
 
             old_state = self._state
-            if "opening" in door_state:
+            if door_state.startswith("opening"):
                 self._state = STATE_OPENING
                 self._position = 50
-            elif "closing" in door_state:
+            elif door_state.startswith("closing"):
                 self._state = STATE_CLOSING
                 self._position = 50
-            elif "close" in door_state:
+            elif door_state.startswith("close") or door_state.startswith("closed"):
                 self._state = STATE_CLOSED
                 self._position = 0
-            elif "open" in door_state:
+            elif door_state.startswith("open"):
                 self._state = STATE_OPEN
                 self._position = 100
             elif "stopped" in door_state or "error" in door_state:
@@ -137,8 +137,9 @@ class CenturionGarageDoor(CoverEntity):
         initial_state = await self.hass.async_add_executor_job(self._get_door_state)
         _LOGGER.warning("Centurion %s command: initial door state: %s", command, initial_state)
 
-        # If already in the expected state, nothing to do
-        if any(s in initial_state for s in expected_states):
+        # If already in the expected state, nothing to do.
+        # Use startswith to avoid false matches like "open" matching "opener reset".
+        if any(initial_state.startswith(s) for s in expected_states):
             _LOGGER.warning("Centurion %s command: door already in expected state (%s)", command, initial_state)
             return initial_state
 
@@ -159,7 +160,7 @@ class CenturionGarageDoor(CoverEntity):
             elapsed += poll_interval
 
             door_state = await self.hass.async_add_executor_job(self._get_door_state)
-            if any(s in door_state for s in expected_states):
+            if any(door_state.startswith(s) for s in expected_states):
                 _LOGGER.warning(
                     "Centurion %s command: confirmed after %d attempt(s) (%.1fs), state: %s",
                     command, attempts, elapsed, door_state,

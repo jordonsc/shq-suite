@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Home Assistant WebSocket API helper.
+
+Usage:
+    haws <type> [key=value ...]
+
+Examples:
+    haws config/category_registry/list scope=automation
+    haws config/entity_registry/get entity_id=automation.study_battery_low_soc_safety
+    haws config/entity_registry/update entity_id=automation.foo categories='{"automation":"01KM..."}'
+    haws lovelace/config
+"""
+
+import asyncio
+import json
+import os
+import sys
+
+try:
+    import websockets
+except ImportError:
+    print("Error: python3 websockets package required (pip install websockets)", file=sys.stderr)
+    sys.exit(1)
+
+
+def parse_value(v: str):
+    """Parse a value string, attempting JSON decode for objects/arrays/numbers."""
+    try:
+        return json.loads(v)
+    except (json.JSONDecodeError, ValueError):
+        return v
+
+
+async def main():
+    if len(sys.argv) < 2:
+        print(__doc__.strip(), file=sys.stderr)
+        sys.exit(1)
+
+    ha_url = os.environ.get("HA_URL")
+    ha_token = os.environ.get("HA_TOKEN")
+    if not ha_url or not ha_token:
+        print("Error: HA_URL and HA_TOKEN must be set in environment", file=sys.stderr)
+        sys.exit(1)
+
+    msg_type = sys.argv[1]
+    params = {}
+    for arg in sys.argv[2:]:
+        if "=" not in arg:
+            print(f"Error: expected key=value, got: {arg}", file=sys.stderr)
+            sys.exit(1)
+        k, v = arg.split("=", 1)
+        params[k] = parse_value(v)
+
+    ws_url = ha_url.replace("http://", "ws://").replace("https://", "wss://") + "/api/websocket"
+
+    async with websockets.connect(ws_url) as ws:
+        # Wait for auth_required
+        msg = json.loads(await ws.recv())
+        if msg["type"] != "auth_required":
+            print(f"Unexpected message: {msg}", file=sys.stderr)
+            sys.exit(1)
+
+        # Authenticate
+        await ws.send(json.dumps({"type": "auth", "access_token": ha_token}))
+        msg = json.loads(await ws.recv())
+        if msg["type"] != "auth_ok":
+            print(f"Auth failed: {msg}", file=sys.stderr)
+            sys.exit(1)
+
+        # Send command
+        payload = {"id": 1, "type": msg_type, **params}
+        await ws.send(json.dumps(payload))
+        msg = json.loads(await ws.recv())
+
+        if msg.get("success"):
+            print(json.dumps(msg["result"], indent=2))
+        else:
+            print(json.dumps(msg, indent=2), file=sys.stderr)
+            sys.exit(1)
+
+
+asyncio.run(main())

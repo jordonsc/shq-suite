@@ -168,8 +168,14 @@ impl WebSocketServer {
 
         match message {
             ClientMessage::SetDisplay { state } => {
-                self.display.set_display_state(state).await?;
-                self.auto_dim.reset_dimmed_state().await;
+                if state {
+                    self.display.set_display_state(true).await?;
+                    self.auto_dim.reset_dimmed_state().await;
+                } else {
+                    // Route through sleep() so the touch device is grabbed,
+                    // matching Sleep and SetBrightness 0. Otherwise tap-to-wake fails.
+                    self.auto_dim.sleep().await?;
+                }
                 self.broadcast_metrics().await;
                 Ok(ServerMessage::Response {
                     success: true,

@@ -194,6 +194,9 @@ impl AutoDimManager {
     pub async fn reset_dimmed_state(&self) {
         *self.is_dimmed.lock().await = false;
         self.touch_monitor.reset_touch_timer().await;
+        // Without this, an API-driven wake (set_display true / set_brightness >0)
+        // leaves the device grabbed and the first tap gets consumed as a wake-trigger.
+        self.touch_monitor.set_should_block(false).await;
     }
 
     /// Wake the display (turn on and set to bright level)

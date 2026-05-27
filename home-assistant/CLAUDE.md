@@ -108,6 +108,26 @@ cfa_fire_ban:
 
 **Climate features**: HVAC modes (off/cool/heat/auto/fan_only), fan modes (low/medium/high/auto), target temperature. Zones support on/off and target temperature only.
 
+## HA Server Config
+
+The HA server runs on `redacted.host` at `/etc/hass/`. Its config is split between this repo and the live server:
+
+| Lives in repo | Lives only on server |
+|---------------|----------------------|
+| `home-assistant/custom_components/` — custom integrations | `automations.yaml`, `scripts.yaml`, `scenes.yaml` (UI-managed) |
+| `home-assistant/www/shq-icons.js` — custom icon set | `secrets.yaml` |
+| `deploy/config/ha/configuration.yaml` — main HA config (modbus, templates, integrations, sensors), gitignored | `.storage/` (config-flow integrations: Centurion, Actron, SolaX, etc.) |
+
+**Update flow** for anything in the repo:
+
+1. Edit the file locally (e.g. `deploy/config/ha/configuration.yaml` for modbus/template/integration changes).
+2. `./setup ha` — rsyncs custom components, `configuration.yaml`, and `www/` to `redacted.host:/etc/hass/`, then triggers a YAML-only reload via the HA REST API. Use `./setup ha --restart` if the change needs a full HA restart (new integration, custom component dependency change, anything that doesn't hot-reload).
+3. Verify with `./ha get /api/states/sensor.<thing>` or watch the HA logs.
+
+For automations/scripts/scenes, edit them in the HA UI directly — they live in `automations.yaml` etc. on the server and aren't tracked here.
+
+`secrets.yaml` and the `.storage/` directory are server-side only; never overwrite them via deploy.
+
 ## Home Assistant REST API
 
 A helper script `./ha` in the project root wraps the HA REST API with authentication. It uses `$HA_URL` and `$HA_TOKEN` env vars (set in `~/.bashrc`).
@@ -143,33 +163,48 @@ A helper script `./ha` in the project root wraps the HA REST API with authentica
 
 An MCP server is configured in `~/.claude.json` for basic voice-assistant-style control (turn on/off, set temperature, media, etc). Useful for quick device control but **does not** support listing entities, reading automations, or managing config — use the REST API for those.
 
-## Victron Cerbo GX — Network Battery (Modbus TCP)
+## Victron Cerbo GX — Battery Backups (Modbus TCP)
 
-A Victron MultiPlus-II with battery backup for network infrastructure, monitored via a Cerbo GX at `REDACTED-IP` using Modbus TCP (port 502). The battery is connected to the MultiPlus, not the Cerbo directly — so no BMS-reported SOC; it's estimated from voltage.
+Two Victron MultiPlus-II inverters with battery backup, each fronted by a Cerbo GX polled over Modbus TCP (port 502). The two installs are architecturally identical — same registers, same slave units, same template/automation pattern — they just differ by host and entity prefix.
 
-**Modbus units**: Unit 100 = system-level, Unit 227 = VE.Bus (MultiPlus)
+| Cerbo | Host | Entity prefix | Hub name |
+|-------|------|---------------|----------|
+| Network | `REDACTED-IP` | `network_battery_` | `cerbo_gx` |
+| Study | `REDACTED-IP` | `study_battery_` | `cerbo_gx_study` |
 
-**Entities** (all prefixed `network_battery_`, configured in `configuration.yaml`):
+Each battery is wired directly to its Cerbo, so SOC comes from the BMS (slave 225) rather than being estimated from voltage.
 
-| Sensor | Register | Unit | Description |
-|--------|----------|------|-------------|
-| `voltage` | 840 | 100 | Battery voltage (V) |
-| `current` | 841 | 100 | Battery current (A, signed) |
-| `power` | 842 | 100 | Battery power (W, signed) |
-| `state` | 844 | 100 | 0=idle, 1=charging, 2=discharging |
-| `grid_power` | 820 | 100 | Grid input power (W) |
-| `ac_consumption` | 817 | 100 | AC output consumption (W) |
-| `ac_input_voltage` | 3 | 227 | Grid voltage (V) |
-| `ac_input_power` | 12 | 227 | MultiPlus AC input (W) |
-| `ac_output_power` | 23 | 227 | MultiPlus AC output (W) |
-| `soc_estimate` | — | — | Template: voltage-based SOC estimate (44V=0%, 55.2V=100%) |
-| `grid_available` | — | — | Template: binary sensor from grid_power > 0 |
+**Modbus slaves**:
+- `100` — `com.victronenergy.system` (system-level metrics)
+- `225` — battery service (BMS)
+- `227` — VE.Bus (MultiPlus inverter)
 
-**Automations**:
-- `Network Battery - Power Outage Detected` — Overwatch warn announcement + PagerDuty alert when grid drops for 10s
-- `Network Battery - Power Restored` — Overwatch notify announcement + PagerDuty resolve when grid returns
+**Sensors** (per Cerbo, swap `<prefix>` for `network_battery_` or `study_battery_`):
 
-**Config**: Modbus sensors defined in `deploy/config/ha/configuration.yaml` (gitignored). Poll interval: 10s.
+| Sensor | Register | Slave | Description |
+|--------|----------|-------|-------------|
+| `<prefix>voltage` | 840 | 100 | Battery voltage (V) |
+| `<prefix>current` | 841 | 100 | Battery current (A, signed) |
+| `<prefix>power` | 842 | 100 | Battery power (W, signed) |
+| `<prefix>soc` | 843 | 100 | System SOC (%) |
+| `<prefix>state` | 844 | 100 | 0=idle, 1=charging, 2=discharging |
+| `<prefix>grid_power` | 820 | 100 | Grid input power (W) |
+| `<prefix>ac_consumption` | 817 | 100 | AC output consumption (W) |
+| `<prefix>switch_position` | 33 | 227 | 1=charger, 2=inverter, 3=on, 4=off |
+| `<prefix>grid_lost_alarm` | 64 | 227 | 0=ok, 2=grid lost |
+| `<prefix>bms_soc` | 266 | 225 | BMS-reported SOC (%, scale 0.1) |
+| `<prefix>ac_input_voltage` | 3 | 227 | Grid voltage (V) |
+| `<prefix>ac_input_power` | 12 | 227 | MultiPlus AC input (W) |
+| `<prefix>ac_output_power` | 23 | 227 | MultiPlus AC output (W) |
+| `<prefix>state_text` | — | — | Template: human-readable state |
+| `<prefix>mode` | — | — | Template: human-readable switch position |
+| `<prefix>grid_available` | — | — | Template binary: grid_lost_alarm != 2 |
+
+**Automations** (mirrored per battery):
+- `<Battery> - Power Outage Detected` — Overwatch warn + PagerDuty trigger when grid drops for 10s
+- `<Battery> - Power Restored` — Overwatch notify + PagerDuty resolve when grid returns
+
+**Config**: Modbus hubs defined in `deploy/config/ha/configuration.yaml`. Poll interval: 10s.
 
 ## Custom Icons (`www/shq-icons.js`)
 
