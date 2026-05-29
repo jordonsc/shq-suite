@@ -58,9 +58,13 @@ st.last_known_state["RemoteZoneInfo"]          # per-zone live temp + cool/heat 
                                                              └─────────────┘
 ```
 
-- **NEO ↔ indoor unit**: RS485 electrically (Cat5e, 2 twisted pairs, AWG24, ≤200 m) but a
-  **proprietary Actron protocol**, *not* Modbus. The status event log tags command sources as
-  `GUI` (touchscreen), `Cloud`, and `IDU Interface` (the bus to the indoor board).
+- **NEO ↔ indoor unit**: RS485 (Cat5e, 2 twisted pairs, AWG24, ≤200 m). **UPDATE (sniffed):
+  this bus is actually Modbus RTU @ 9600 8N1** (func 03 reads / func 0x10 broadcast writes,
+  standard CRC-16) — the earlier "proprietary, not Modbus" claim from community docs was wrong
+  for this link. The indoor board is the **Modbus master**; wall controllers are **slaves**
+  (NEO = 0x66; 0x67/0x68 are empty controller slots). Full decode:
+  [`../actron-sniffer/FINDINGS.md`](../actron-sniffer/FINDINGS.md). The status event log still
+  tags command sources as `GUI` / `Cloud` / `IDU Interface`.
 - **NEO ↔ zone sensors**: wireless BLE (sensors report MAC + RSSI).
 - **NEO ↔ cloud**: WiFi only. The wall controller exposes **no local HTTP/LAN API** — confirmed by
   both reverse-engineered community docs (Que and Neo are cloud-only).
@@ -71,7 +75,7 @@ st.last_known_state["RemoteZoneInfo"]          # per-zone live temp + cool/heat 
 |--------|---------|
 | **ICUNO-MOD Modbus card** | ✅ Viable, confirmed compatible. Whole-house control only (no per-zone temp). |
 | ESP32 + RS485 (`awulf/Actron485`) | ❌ Targets older ESP-series controllers; does not support NEO. High risk, voids warranty. |
-| Reverse-engineer NEO RS485 protocol | ❌ Not publicly documented for this generation; high effort, uncertain. |
+| Reverse-engineer NEO RS485 protocol | ✅ **Reading solved** — bus is 9600/8N1, framing understood, per-zone setpoint + live temps decoded off the wire (incl. the per-zone data Modbus can't give). Write/control still ahead. Full writeup: [`../actron-sniffer/FINDINGS.md`](../actron-sniffer/FINDINGS.md) + [`MAPPING-PLAN.md`](../actron-sniffer/MAPPING-PLAN.md). NB `awulf/Actron485` only decoded the *classic* ESP/Ultima bus (4800 baud) — it does **not** apply to the NEO. |
 | Improve cloud resilience | ⚠️ Interim only — doesn't remove the cloud dependency. |
 
 ## ICUNO-MOD Modbus card

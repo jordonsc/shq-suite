@@ -20,6 +20,9 @@ from .api import ActronRateLimitError
 from .const import (
     DOMAIN,
     LAST_ZONE_OFF_HOLD_SECONDS,
+    MODE_CONFIRM_POLL_SECONDS,
+    MODE_CONFIRM_TIMEOUT_SECONDS,
+    MODE_RESEND_INTERVAL_SECONDS,
     ZONE_CONFIRM_POLL_SECONDS,
     ZONE_CONFIRM_TIMEOUT_SECONDS,
     ZONE_RESEND_INTERVAL_SECONDS,
@@ -190,19 +193,77 @@ class ActronClimate(ActronClimateBase):
         return SDK_TO_HA_FAN.get(sdk_fan, None)
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
-        """Set HVAC mode."""
+        """Set HVAC mode, re-sending until the controller confirms it.
+
+        Mirrors the zone toggle's resend logic (``_toggle_zone``): the cloud
+        sometimes accepts a mode change (HTTP 200) without applying it, so
+        firing once and only polling is unreliable.
+        """
         sdk_mode = HA_TO_SDK_MODE.get(hvac_mode)
         if sdk_mode is None:
             return
         overlay: dict = {"is_on": sdk_mode != "OFF"}
         if sdk_mode != "OFF":
             overlay["mode"] = sdk_mode
-        await self._run_command(
-            "mode",
-            overlay,
-            f"set_mode({sdk_mode})",
-            self.coordinator.api.set_mode(self._status, sdk_mode),
-        )
+        keys = list(overlay.keys())
+        self.coordinator.set_optimistic(overlay, f"set_mode({sdk_mode})")
+
+        pending = self._pending_commands.get("mode")
+        if pending is not None and not pending.done():
+            pending.cancel()
+        current = asyncio.current_task()
+        self._pending_commands["mode"] = current
+
+        try:
+            await self._send_mode_until_confirmed(sdk_mode, keys)
+        except asyncio.CancelledError:
+            if self._pending_commands.get("mode") is not current:
+                _LOGGER.debug("Mode command superseded by newer request")
+                return
+            raise
+        except Exception:
+            self.coordinator.clear_optimistic(keys)
+            raise
+        finally:
+            if self._pending_commands.get("mode") is current:
+                self._pending_commands.pop("mode", None)
+
+    async def _send_mode_until_confirmed(
+        self, sdk_mode: str, keys: list[str]
+    ) -> None:
+        """Re-issue ``set_mode`` until the overlay clears or the timeout elapses.
+
+        Re-sends every ``MODE_RESEND_INTERVAL_SECONDS`` while any of ``keys``
+        is still pending. Stops when the overlay is confirmed/reconciled away,
+        on rate-limit (leaving the overlay to reconcile), or after
+        ``MODE_CONFIRM_TIMEOUT_SECONDS``. Calls ``extend_burst`` each tick to
+        keep 1s polling alive so a pending overlay isn't prematurely timed out.
+        """
+        deadline = time.monotonic() + MODE_CONFIRM_TIMEOUT_SECONDS
+        while True:
+            try:
+                async with self.coordinator.command_lock:
+                    await self.coordinator.api.set_mode(self._status, sdk_mode)
+            except ActronRateLimitError:
+                _LOGGER.warning(
+                    "Mode command (%s) hit a rate limit; stopping re-sends and "
+                    "leaving the overlay to reconcile", sdk_mode,
+                )
+                return
+
+            waited = 0.0
+            while waited < MODE_RESEND_INTERVAL_SECONDS:
+                if not self.coordinator.any_pending(keys):
+                    return  # confirmed, or dropped by reconciliation
+                if time.monotonic() >= deadline:
+                    _LOGGER.warning(
+                        "Mode command (%s) not confirmed within %ss",
+                        sdk_mode, MODE_CONFIRM_TIMEOUT_SECONDS,
+                    )
+                    return
+                self.coordinator.extend_burst()
+                await asyncio.sleep(MODE_CONFIRM_POLL_SECONDS)
+                waited += MODE_CONFIRM_POLL_SECONDS
 
     async def async_set_temperature(self, **kwargs) -> None:
         """Set target temperature."""

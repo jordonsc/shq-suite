@@ -14,6 +14,13 @@ ZONE_RESEND_INTERVAL_SECONDS = 5
 ZONE_CONFIRM_TIMEOUT_SECONDS = 90
 ZONE_CONFIRM_POLL_SECONDS = 1
 
+# Main-unit mode changes (on/off/cool/heat/...) hit the same "accepted with a
+# 200 then silently dropped" cloud behaviour as zone toggles, so re-issue the
+# command on an interval until the controller confirms it rather than firing once.
+MODE_RESEND_INTERVAL_SECONDS = 5
+MODE_CONFIRM_TIMEOUT_SECONDS = 90
+MODE_CONFIRM_POLL_SECONDS = 1
+
 # Turning off the last active zone shuts the whole system down and latches it
 # off until a zone is re-enabled. When a turn-off would leave no other zone
 # active on the controller, hold it and monitor for another zone activating for

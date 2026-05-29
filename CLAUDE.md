@@ -46,6 +46,7 @@ Keep the docs concise and factual. Don't pad them out — only document what a f
 | `home-assistant/` | Python | Custom HA integrations for all the above + Centurion garage |
 | `deploy/` | Python | SSH/rsync deployment tool for all components |
 | `shelly/` | Python | CLI for discovering and configuring Shelly smart devices |
+| `actron-sniffer/` | C++ (Arduino/PlatformIO) | Experimental RS485 bus sniffer (ESP32-C6 / TinyC6) for reverse-engineering the Actron NEO↔indoor protocol |
 
 ## Reference Docs
 
