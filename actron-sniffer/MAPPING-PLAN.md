@@ -1,13 +1,14 @@
 # Actron NEO RS485 — Full Mapping Plan
 
-> **STATUS (2026-05-30): this plan is largely EXECUTED — see [`FINDINGS.md`](FINDINGS.md) §7/§9/§10
-> for the current state, which is authoritative.** Phases 0–4 (clean capture, checksum, register
-> map) are done; Phase 5 (write/control) **succeeded** — local write control works by emulating a
-> secondary controller at 0x67 and sending a **command pulse** (not the slave-emulation-with-
-> conflicting-values approach originally sketched below). The make-or-break "does the board obey
-> an un-commissioned slot" question is **answered: yes, for command pulses.** The one open item is
-> **per-zone setpoint writes** (page-2 values, freshness-gated — see FINDINGS §9). The text below
-> is the original plan, kept for historical context; trust FINDINGS where they differ.
+> **STATUS (2026-05-31): this plan is FULLY EXECUTED — see [`FINDINGS.md`](FINDINGS.md)
+> §7/§9/§10 and [`LOCAL-CONTROL-RECIPES.md`](LOCAL-CONTROL-RECIPES.md) for the current state.**
+> Phases 0–4 (clean capture, checksum, register map) done. Phase 5 (write/control) done via
+> both the 0x67 tap command-pulse path and the MITM-bridge `/pulse` + `/inject` path.
+> **Zone-setpoint INJECT mechanism fully solved 2026-05-31**: the side-channel signal is
+> reg 126.lo low nibble = active-mode bit (cool=1, heat=2). Remaining mapping work: auto-mode
+> zone setpoints (likely regs 143–150, TBD) and the **away / turbo / continuous-fan** command
+> codes. The text below is the original plan, kept for historical context; trust FINDINGS and
+> LOCAL-CONTROL-RECIPES where they differ.
 
 ---
 

@@ -39,13 +39,21 @@ def fetch(ip, path):
 
 
 def responses(text):
-    """-> (page1_list, page2_list); each a list of {reg: value(BE)} in capture order."""
+    """-> (page1_list, page2_list); each a list of {reg: value(BE)} in capture order.
+
+    Handles both log formats: the old single-bus format (lines start with seq), and the new
+    MITM dual-bus format (lines start with `A ` or `B ` source tag). In MITM mode the NEO's
+    responses appear on the B side; the A side carries the board's polls/broadcasts plus
+    echoes of our forwarded frames — we filter A out so we only analyse fresh NEO data."""
     p1, p2 = [], []
     for ln in text.splitlines():
-        m = re.match(r"\d+\s+[\d.]+\s+\+\d+us\s+(\d+):\s+([0-9A-Fa-f ]+?)\s+\|", ln)
+        m = re.match(r"(?:([AB])\s+)?\d+\s+[\d.]+\s+\+\d+us\s+(\d+):\s+([0-9A-Fa-f ]+?)\s+\|", ln)
         if not m:
             continue
-        b = bytes(int(x, 16) for x in m.group(2).split())
+        side = m.group(1) or ""  # "" = old format, "A"/"B" = new MITM format
+        if side == "A":
+            continue
+        b = bytes(int(x, 16) for x in m.group(3).split())
         if b[:1] != b"\x66" or len(b) < 5 or b[1] != 0x03:
             continue
         if modbus_crc(b[:-2]) != (b[-2] | b[-1] << 8):

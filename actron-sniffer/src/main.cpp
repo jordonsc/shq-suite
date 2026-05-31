@@ -1,30 +1,42 @@
 // Actron NEO <-> indoor-unit RS485 tool for the Unexpected Maker TinyC6 (ESP32-C6).
 //
 // The bus is Modbus RTU 9600/8N1; the indoor board is master, wall controllers are slaves at
-// 0x66 (the NEO) / 0x67 / 0x68. This captures framed hex into a RAM ring buffer over an open
-// (LAN-only) HTTP server, AND can emulate a controller to WRITE: answer the board's poll for a
-// slot and either report register overrides or fire a one-shot command pulse (e.g. reg14=4 =
-// setpoint). Local write control of mode/fan/main-setpoint is proven via a 0x67 command pulse
-// (the NEO stays live). See FINDINGS.md. Default state is disarmed/receive-only.
+// 0x66 (the NEO) / 0x67 / 0x68. Two operating modes:
+//
+//   1. Tap mode (one UART, both ends of the bus tied together in parallel) — the original
+//      sniffer. UART1 on GPIO16/17 captures Modbus traffic and can optionally emulate a
+//      secondary controller at 0x67 to send command pulses (mode/fan/main setpoint writes).
+//      See FINDINGS.md §7/§9. Default state is disarmed/receive-only.
+//
+//   2. MITM bridge mode (TWO UARTs, bus physically cut between board and NEO) — the new
+//      path. UART1 (GPIO16/17) talks to the indoor board; UART0 (GPIO0/1) talks to the NEO.
+//      Bytes received on one side are forwarded to the other, with optional inline register
+//      substitution + CRC re-stamping on the NEO->board direction (where the per-zone
+//      setpoints live — see FINDINGS §10). The 0x67 emulator is force-disarmed whenever the
+//      bridge is enabled; the two are mutually exclusive (both would drive UART1 TX).
 //
 // HTTP (port 80):
 //   GET /            help + status
-//   GET /stats       one-line status (seq_max, armed, addr, tmpl1/2, poll/tx)
-//   GET /log         recent frames; ?since=<seq> for incremental, ?n=<max>
+//   GET /stats       one-line status (seq_max, armed, addr, tmpl1/2, poll/tx, bridge mode)
+//   GET /log         recent frames (interleaved A/B); ?since=<seq>&n=<max>
 //   GET /set         ?baud=&parity=N|E|O&gap=<us>   change capture settings (use gap=5000)
-//   GET /measure     estimate baud from raw line pulse widths (~5s)
+//   GET /measure     estimate baud from raw line pulse widths on UART1 (~5s)
 //   GET /clear       reset ring + counters
-//   GET /armwrite    ?addr=&ovr=reg:val,...&pulse=reg:val&pulsen=N&turn=us   ARM emulation/write
-//   GET /disarm      back to receive-only
-//   GET /txprobe     TX self-test (inject a poll to 0x66, report if it answers)
+//   GET /armwrite    ?addr=&ovr=reg:val,...&pulse=reg:val&pulsen=N&turn=us   ARM 0x67 emulator
+//   GET /disarm      back to receive-only (also disables bridge)
+//   GET /txprobe     TX self-test on UART1 (inject a poll to 0x66, report if it answers)
+//   GET /bridge      ?mode=off|passthru|inject     set MITM bridge mode (both directions)
+//   GET /inject      ?rules=reg:val,reg:val,...    set injection rules (NEO->board direction)
+//   GET /loopback    ?n=<bytes>   send a test pattern UART1 TX -> UART0 RX + UART0 TX -> UART1
+//                                 RX, verify byte integrity (dual-UART bench test)
 //   GET /update      ?url=<bin>   HTTP-pull OTA
 //
-// Wiring: auto-direction TTL<->RS485 module (no DE/RE — it keys the driver off UART TX).
-//   module RXD/DI <- GPIO16 (board "TX")    module TXD/RO -> GPIO17 (board "RX")    + 3V3/GND
-//   A=RJ45 pin4 (blue), B=RJ45 pin5 (white/blue), GND ref=pin7 (white/brown).
-//   2-wire shared bus, so our TX reaches both NEO and board. Receive-only is enforced in firmware
-//   (never write to Bus) unless armed. (Nuance: GPIO16 may carry the ROM boot-log briefly at
-//   power-on; harmless — Modbus tolerates a stray bad frame.)
+// Wiring:
+//   UART1 (board side):  module RXD/DI <- GPIO16, module TXD/RO -> GPIO17, + 3V3/GND
+//   UART0 (NEO side):    module RXD/DI <- GPIO1,  module TXD/RO -> GPIO0,  + 3V3/GND
+//     (RX/TX inverted vs. UART1 — the C6's GPIO matrix is symmetric; chosen for wiring convenience)
+//   Auto-direction transceivers — no DE/RE pin (driver keys off UART TX activity).
+//   See WIRING.md / CLAUDE.md for the RJ45 pass-through tap and the cut-bus MITM tap.
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -33,56 +45,104 @@
 #include <ArduinoOTA.h>
 #include <HTTPUpdate.h>
 
+#include "bridge.h"
+
 // ---- WiFi (baked in — throwaway experiment, LAN only) --------------------
 static const char *WIFI_SSID = "SHQ";
 static const char *WIFI_PASS = "REDACTED-WIFI-PASS";
 static const char *HOSTNAME = "actron-sniffer";  // -> http://redacted.local/
 
 // ---- pins -----------------------------------------------------------------
-static const uint8_t PIN_RS485_RX = 17;  // module TXD/RO -> board "RX" (UART1 RX via GPIO matrix)
-static const uint8_t PIN_RS485_TX = 16;  // module RXD/DI <- board "TX" (UART1 TX); auto-direction
+// Endpoint A = indoor board side, UART1 (the existing transceiver).
+static const uint8_t PIN_A_RX = 17;  // module TXD/RO -> board "RX"
+static const uint8_t PIN_A_TX = 16;  // module RXD/DI <- board "TX"
+// Endpoint B = NEO side, UART0 (new — added for the MITM cut-bus bridge).
+// Note: GPIO0 = RX, GPIO1 = TX — the opposite of the A-endpoint's pin order, chosen post
+// bench-test to avoid a re-solder on module B (its DI was wired to GPIO1 and RO to GPIO0).
+// The C6's GPIO matrix lets either UART target any pin, so this is purely a software swap.
+static const uint8_t PIN_B_RX = 0;
+static const uint8_t PIN_B_TX = 1;
 
-HardwareSerial &Bus = Serial1;  // UART1; Serial (USB CDC) stays as a fallback console
 WebServer server(80);
-
-// ---- live-configurable capture settings ----------------------------------
-static uint32_t g_baud = 9600;
-static char g_parity = 'N';        // N | E | O
-static uint32_t g_gap_us = 3000;   // idle gap that ends a frame
-static bool g_capture = true;
-
-// ---- stats ----------------------------------------------------------------
-static uint64_t g_total_bytes = 0;
-static uint32_t g_total_frames = 0;
-static volatile uint32_t g_rx_errors = 0;
 
 // ---- frame ring buffer ----------------------------------------------------
 static const size_t FRAME_MAX = 512;  // capture whole messages (~253 B) — no 128 B splitting
 static const size_t RING = 128;
 struct FrameRec {
   uint32_t seq;     // monotonic, 1-based; 0 = empty slot
-  uint32_t t_ms;    // capture time (ms since boot)
-  uint32_t gap_us;  // idle gap before this frame
+  uint32_t t_ms;
+  uint32_t gap_us;
   uint16_t len;
-  uint8_t data[FRAME_MAX];
+  uint8_t  source;  // 0 = A (board), 1 = B (NEO)
+  uint8_t  data[FRAME_MAX];
 };
 static FrameRec g_ring[RING];
-static uint32_t g_seq = 0;  // last assigned sequence number
+static uint32_t g_seq = 0;
 
-// ---- current-frame assembly ----------------------------------------------
-static uint8_t g_frame[FRAME_MAX];
-static size_t g_flen = 0;
-static uint32_t g_first_byte_us = 0;
-static uint32_t g_last_byte_us = 0;
-static uint32_t g_prev_frame_end_us = 0;
+// ---- per-endpoint state ---------------------------------------------------
+struct BusEndpoint {
+  const char* name;
+  HardwareSerial& uart;
+  uint8_t pin_rx, pin_tx;
+  uint8_t source_tag;
 
-// ---- write-test: 0x67 controller emulation (OFF by default) ---------------
-// When ARMED, answer the indoor board's `67 03 00 02 00 7C` page-1 poll (read regs 2-125)
-// with a forged-but-valid Modbus response = the last cached 0x66 page-1 dump, with chosen
-// registers overridden. Tests whether the board honours an un-commissioned controller slot.
-// Stays receive-only until /armwrite is called; only ever answers a CRC-valid 0x67 page-1 poll.
+  // Frame assembly
+  uint8_t  frame[FRAME_MAX];
+  size_t   flen;
+  uint32_t first_byte_us;
+  uint32_t last_byte_us;
+  uint32_t prev_frame_end_us;
+
+  // Counters
+  uint64_t total_bytes;
+  uint32_t total_frames;
+  uint32_t modified_frames;
+  volatile uint32_t rx_errors;
+
+  // Bridge: substitution applied to bytes RECEIVED on this endpoint, going TO the peer.
+  bridge::StreamingBridge bridge;
+
+  BusEndpoint(const char* n, HardwareSerial& u, uint8_t rx, uint8_t tx, uint8_t tag)
+    : name(n), uart(u), pin_rx(rx), pin_tx(tx), source_tag(tag),
+      flen(0), first_byte_us(0), last_byte_us(0), prev_frame_end_us(0),
+      total_bytes(0), total_frames(0), modified_frames(0), rx_errors(0) {}
+};
+
+static BusEndpoint g_a("A", Serial1, PIN_A_RX, PIN_A_TX, 0);
+static BusEndpoint g_b("B", Serial0, PIN_B_RX, PIN_B_TX, 1);
+
+// ---- live-configurable capture settings ----------------------------------
+static uint32_t g_baud = 9600;
+static char g_parity = 'N';        // N | E | O
+static uint32_t g_gap_us = 5000;   // idle gap that ends a frame (>= Modbus t3.5 @9600 ~= 3.65ms)
+static bool g_capture = true;
+
+// ---- Per-frame "scramble" of one register on B->A (NEO->board) ----------
+// Tests the hypothesis that the board's commit gate for page-2 zone setpoints is "the NEO's
+// reg 248 differs from the last value I saw" rather than a deterministic hash. When enabled,
+// on every NEW B page-2 frame we increment a nonce and upsert a rule for g_scramble_reg into
+// the bridge so the rewritten frame carries a fresh value at that register. The hop step
+// (0x9E37 ≈ golden-ratio fractional × 2^16) spreads the nonce evenly across 16 bits.
+static uint16_t g_scramble_reg = 0;             // 0 = disabled
+static uint16_t g_scramble_nonce = 0xACE0;      // seed
+
+// ---- MITM bridge mode (overall) ------------------------------------------
+// OFF: tap-style capture only (the original behaviour; the 0x67 emulator can run).
+//      DANGER if the bus is physically cut — the NEO and indoor board are then isolated.
+// PASSTHRU (DEFAULT): both endpoints forward received bytes to the peer's TX, no rewrites.
+//      This is the safe boot state for the MITM/cut-bus deployment. In tap-mode wiring
+//      (single transceiver, no peer to forward to) PASSTHRU is harmless — UART0 just has
+//      nothing to receive — but you'll need to /bridge?mode=off before /armwrite.
+// INJECT: same as PASSTHRU plus the rules apply to the NEO->board direction. This is the
+//      explicit "armed" state for mutating the 0x66 response in-flight.
+static bridge::StreamingBridge::Mode g_bridge_mode = bridge::StreamingBridge::PASSTHRU;
+
+// ---- 0x67 controller emulation (tap mode only) ---------------------------
+// When ARMED, answer the indoor board's `addr 03 00 02 00 7C` page-1 poll with a forged but
+// CRC-valid response built from the cached 0x66 template, with overrides + optional one-shot
+// command pulse. Mutually exclusive with bridge mode != OFF (both would drive UART1 TX).
 static bool g_write_armed = false;
-static uint8_t g_emul_addr = 0x67; // which controller slot we emulate (0x66/0x67/0x68)
+static uint8_t g_emul_addr = 0x67;
 static uint8_t g_page1[248];     // regs 2..125   from the last good 66 03 F8 response
 static uint8_t g_page2[244];     // regs 126..247 from the last good 66 03 F4 response
 static bool g_page1_valid = false;
@@ -91,30 +151,33 @@ static const int OVR_MAX = 8;
 static uint16_t g_ovr_reg[OVR_MAX];
 static uint16_t g_ovr_val[OVR_MAX];
 static int g_ovr_n = 0;
-static uint32_t g_poll67 = 0;    // polls (to g_emul_addr) seen while armed
-static uint32_t g_tx67 = 0;      // responses transmitted
-static uint32_t g_turn_us = 5000; // turnaround before our reply (must exceed Modbus t3.5 ~3.65ms @9600)
-static uint16_t g_pulse_reg = 0;  // transient command pulse (e.g. reg14=4): applied to the next
-static uint16_t g_pulse_val = 0;  // g_pulse_n page-1 responses only, then reverts to the template
-static int g_pulse_n = 0;         // remaining page-1 responses to apply the pulse
+static uint32_t g_poll67 = 0;
+static uint32_t g_tx67 = 0;
+static uint32_t g_turn_us = 5000;
+static uint16_t g_pulse_reg = 0;
+static uint16_t g_pulse_val = 0;
+static int g_pulse_n = 0;
 
-static uint16_t modbusCrc(const uint8_t *d, size_t n) {
-  uint16_t c = 0xFFFF;
-  for (size_t i = 0; i < n; i++) {
-    c ^= d[i];
-    for (int k = 0; k < 8; k++) c = (c & 1) ? ((c >> 1) ^ 0xA001) : (c >> 1);
-  }
-  return c;  // appended to the wire low byte first
-}
+// Pure-replay cache (separate from the 0x67 emulator templates above — these include the 2
+// trailing CRC bytes so the bridge can byte-for-byte forward a recorded NEO response with its
+// original CRC). Updated whenever a CRC-valid 0x66 response is captured.
+static uint8_t g_replay_p1[bridge::StreamingBridge::kReplayPage1Bytes];  // 248 data + 2 CRC
+static uint8_t g_replay_p2[bridge::StreamingBridge::kReplayPage2Bytes];  // 244 data + 2 CRC
+static bool g_replay_p1_valid = false;
+static bool g_replay_p2_valid = false;
 
-// Cache the latest complete, CRC-valid 0x66 responses as our response templates.
-// page1 = 66 03 F8 (248 data, 253 total); page2 = 66 03 F4 (244 data, 249 total).
+static uint16_t modbusCrc(const uint8_t *d, size_t n) { return bridge::crc16(d, n); }
+
+// Cache the latest complete, CRC-valid 0x66 response as our forged-response template (used by
+// the 0x67 emulator). Page 1 = 66 03 F8 (253 B); page 2 = 66 03 F4 (249 B).
 static void maybeCacheTemplates(const uint8_t *f, size_t len) {
   if (f[0] != 0x66 || f[1] != 0x03) return;
   if (len == 253 && f[2] == 0xF8 && modbusCrc(f, 251) == (uint16_t)(f[251] | (f[252] << 8))) {
     memcpy(g_page1, f + 3, 248); g_page1_valid = true;
+    memcpy(g_replay_p1, f + 3, 250); g_replay_p1_valid = true;   // data + CRC for pure replay
   } else if (len == 249 && f[2] == 0xF4 && modbusCrc(f, 247) == (uint16_t)(f[247] | (f[248] << 8))) {
     memcpy(g_page2, f + 3, 244); g_page2_valid = true;
+    memcpy(g_replay_p2, f + 3, 246); g_replay_p2_valid = true;
   }
 }
 
@@ -126,27 +189,31 @@ static uint32_t parityConfig() {
   }
 }
 
-static void startBus() {
-  Bus.end();
-  Bus.setRxBufferSize(4096);  // tolerate HTTP-handler latency without dropping bytes
-  Bus.begin(g_baud, parityConfig(), PIN_RS485_RX, PIN_RS485_TX);
-  Bus.onReceiveError([](hardwareSerial_error_t e) {
-    if (e == UART_FRAME_ERROR || e == UART_PARITY_ERROR)
-      g_rx_errors = g_rx_errors + 1;
+static void startBusEndpoint(BusEndpoint& ep) {
+  ep.uart.end();
+  ep.uart.setRxBufferSize(4096);
+  ep.uart.begin(g_baud, parityConfig(), ep.pin_rx, ep.pin_tx);
+  ep.uart.onReceiveError([&ep](hardwareSerial_error_t e) {
+    if (e == UART_FRAME_ERROR || e == UART_PARITY_ERROR) ep.rx_errors++;
   });
+}
+
+static void startBuses() {
+  startBusEndpoint(g_a);
+  startBusEndpoint(g_b);
 }
 
 static void ledActivity() {
 #ifdef RGB_BUILTIN
   static bool on = false;
   on = !on;
-  rgbLedWrite(RGB_BUILTIN, 0, on ? 6 : 0, 0);  // dim green wink per frame
+  rgbLedWrite(RGB_BUILTIN, 0, on ? 6 : 0, 0);
 #endif
 }
 
 static size_t formatFrame(const FrameRec &f, char *out, size_t cap) {
-  size_t n = snprintf(out, cap, "%u %.6f +%uus %u:",
-                      f.seq, f.t_ms / 1000.0, f.gap_us, f.len);
+  size_t n = snprintf(out, cap, "%c %u %.6f +%uus %u:",
+                      f.source ? 'B' : 'A', f.seq, f.t_ms / 1000.0, f.gap_us, f.len);
   for (size_t i = 0; i < f.len && n + 4 < cap; i++)
     n += snprintf(out + n, cap - n, " %02X", f.data[i]);
   if (n + 2 < cap) { out[n++] = ' '; out[n++] = '|'; }
@@ -159,31 +226,31 @@ static size_t formatFrame(const FrameRec &f, char *out, size_t cap) {
   return n;
 }
 
-static void flushFrame() {
-  if (g_flen == 0) return;
+static void flushFrame(BusEndpoint& ep, bool was_modified) {
+  if (ep.flen == 0) return;
   uint32_t s = ++g_seq;
   FrameRec &r = g_ring[(s - 1) % RING];
   r.seq = s;
-  r.t_ms = g_first_byte_us / 1000;
-  r.gap_us = g_prev_frame_end_us ? (g_first_byte_us - g_prev_frame_end_us) : 0;
-  r.len = (g_flen > FRAME_MAX) ? FRAME_MAX : g_flen;
-  memcpy(r.data, g_frame, r.len);
-  maybeCacheTemplates(r.data, r.len);
+  r.t_ms = ep.first_byte_us / 1000;
+  r.gap_us = ep.prev_frame_end_us ? (ep.first_byte_us - ep.prev_frame_end_us) : 0;
+  r.len = (ep.flen > FRAME_MAX) ? FRAME_MAX : ep.flen;
+  r.source = ep.source_tag;
+  memcpy(r.data, ep.frame, r.len);
+  if (ep.source_tag == 0) maybeCacheTemplates(r.data, r.len);
 
-  g_total_frames++;
-  g_prev_frame_end_us = g_last_byte_us;
+  ep.total_frames++;
+  if (was_modified) ep.modified_frames++;
+  ep.prev_frame_end_us = ep.last_byte_us;
 
   static char line[2300];
   formatFrame(r, line, sizeof(line));
-  Serial.print(line);  // also echo to USB if anyone is watching
+  Serial.print(line);
 
-  g_flen = 0;
+  ep.flen = 0;
   ledActivity();
 }
 
-// Build + transmit a forged controller response for g_emul_addr. Values big-endian (high,low),
-// matching the real 0x66 response. page2=false -> regs 2..125 (66 03 F8); true -> 126..247 (66 03 F4).
-// Called the instant a CRC-valid poll to g_emul_addr is seen (while armed).
+// 0x67 emulator response (tap mode). page2=false -> regs 2..125 (66 03 F8); true -> 126..247.
 static void emitResponse(bool page2) {
   if (!g_write_armed) return;
   const uint8_t *tmpl;
@@ -205,73 +272,199 @@ static void emitResponse(bool page2) {
     resp[off]     = (uint8_t)(g_ovr_val[i] >> 8);
     resp[off + 1] = (uint8_t)(g_ovr_val[i] & 0xFF);
   }
-  // one-shot command pulse (page-1 only; reverts to template once g_pulse_n hits 0)
   if (!page2 && g_pulse_n > 0 && g_pulse_reg >= firstReg && g_pulse_reg <= lastReg) {
     size_t off = 3 + (size_t)(g_pulse_reg - firstReg) * 2;
     resp[off]     = (uint8_t)(g_pulse_val >> 8);
     resp[off + 1] = (uint8_t)(g_pulse_val & 0xFF);
     g_pulse_n--;
   }
-  size_t total = 3 + ndata;             // bytes before CRC
+  size_t total = 3 + ndata;
   uint16_t c = modbusCrc(resp, total);
   resp[total]     = (uint8_t)(c & 0xFF);
   resp[total + 1] = (uint8_t)(c >> 8);
-  delayMicroseconds(g_turn_us);         // turnaround after the master's poll (must exceed t3.5)
-  Bus.write(resp, total + 2);
-  Bus.flush();                          // block until fully shifted out
+  delayMicroseconds(g_turn_us);
+  g_a.uart.write(resp, total + 2);
+  g_a.uart.flush();
   g_tx67++;
-  // We deliberately do NOT drain our own echo — it logs as a `<addr> 03 F8/F4` frame = TX proof.
 }
 
-static void pumpCapture() {
-  uint32_t now = micros();
-  if (g_flen > 0 && (now - g_last_byte_us) > g_gap_us) flushFrame();
+static void emitFromTemplate(uint8_t bytecount, const uint8_t* tmpl, size_t tmpl_len);
 
-  while (Bus.available()) {
-    int b = Bus.read();
+// Pump RX from one endpoint: capture frames, forward bytes to peer (when bridge != OFF),
+// fire 0x67 emulator on a poll match (only when bridge == OFF on UART1).
+static void pumpEndpoint(BusEndpoint& ep, BusEndpoint& peer) {
+  const bool bridging = (g_bridge_mode != bridge::StreamingBridge::OFF);
+  const bool respond_mode = (g_bridge_mode == bridge::StreamingBridge::RESPOND);
+
+  uint32_t now = micros();
+  if (ep.flen > 0 && (now - ep.last_byte_us) > g_gap_us) {
+    bool was_mod = bridging && ep.bridge.modified();
+    flushFrame(ep, was_mod);
+    if (bridging) ep.bridge.onGap();
+  }
+
+  while (ep.uart.available()) {
+    int b = ep.uart.read();
     if (b < 0) break;
     now = micros();
-    if (g_flen > 0 && (now - g_last_byte_us) > g_gap_us) flushFrame();
-    if (g_flen == 0) g_first_byte_us = now;
-    if (g_flen < FRAME_MAX) g_frame[g_flen++] = (uint8_t)b;
-    g_last_byte_us = now;
-    g_total_bytes++;
-    // Forge a reply the instant a CRC-valid poll to g_emul_addr completes (armed only).
-    // page1 poll = `addr 03 00 02 00 7C`; page2 poll = `addr 03 00 7E 00 7A`.
-    if (g_write_armed && g_flen == 8 &&
-        g_frame[0] == g_emul_addr && g_frame[1] == 0x03 &&
-        g_frame[2] == 0x00 && g_frame[4] == 0x00 &&
-        modbusCrc(g_frame, 6) == (uint16_t)(g_frame[6] | (g_frame[7] << 8))) {
-      bool p1 = (g_frame[3] == 0x02 && g_frame[5] == 0x7C);
-      bool p2 = (g_frame[3] == 0x7E && g_frame[5] == 0x7A);
+    if (ep.flen > 0 && (now - ep.last_byte_us) > g_gap_us) {
+      bool was_mod = bridging && ep.bridge.modified();
+      flushFrame(ep, was_mod);
+      // Avoid resetting the bridge mid-frame on a false-positive idle (a short "gap" can be
+      // caused by our own main-loop latency — HTTP handling, TX-FIFO backpressure — not a real
+      // wire gap). If we reset mid-frame the rest of the response gets treated as a new
+      // unrecognised frame, losing the CRC re-stamp and putting a broken frame on the wire.
+      // Strategy: skip the bridge reset if it's currently inside a recognised frame; but ALSO
+      // force a reset on any truly long idle (>30 ms) so we don't permanently desync on a real
+      // bus error. The bridge auto-resets internally on clean frame completion either way.
+      if (bridging && (!ep.bridge.isMidFrame() || (now - ep.last_byte_us) > 30000)) {
+        ep.bridge.onGap();
+      }
+    }
+    if (ep.flen == 0) {
+      ep.first_byte_us = now;
+      // New frame starting on the NEO side — refresh the scramble nonce (if armed) so the
+      // rewritten frame carries a fresh value at g_scramble_reg.
+      if (bridging && &ep == &g_b && g_scramble_reg != 0) {
+        g_scramble_nonce = (uint16_t)(g_scramble_nonce + 0x9E37);
+        g_b.bridge.setOrAddRule(g_scramble_reg, g_scramble_nonce);
+      }
+    }
+    if (ep.flen < FRAME_MAX) ep.frame[ep.flen++] = (uint8_t)b;
+    ep.last_byte_us = now;
+    ep.total_bytes++;
+
+    // MITM forward: rewrite (if INJECT) and emit to the peer's TX. Skipped in RESPOND mode —
+    // the NEO is fully isolated and the firmware impersonates 0x66 to the board.
+    if (bridging && !respond_mode) {
+      uint8_t out = ep.bridge.processByte((uint8_t)b);
+      peer.uart.write(out);
+    }
+
+    // 0x67 emulator: only when bridging is OFF, only on the board-side UART (A).
+    if (!bridging && &ep == &g_a && g_write_armed && ep.flen == 8 &&
+        ep.frame[0] == g_emul_addr && ep.frame[1] == 0x03 &&
+        ep.frame[2] == 0x00 && ep.frame[4] == 0x00 &&
+        modbusCrc(ep.frame, 6) == (uint16_t)(ep.frame[6] | (ep.frame[7] << 8))) {
+      bool p1 = (ep.frame[3] == 0x02 && ep.frame[5] == 0x7C);
+      bool p2 = (ep.frame[3] == 0x7E && ep.frame[5] == 0x7A);
       if (p1 || p2) {
         g_poll67++;
-        flushFrame();        // log the poll, reset assembly
-        emitResponse(p2);    // forge + transmit
+        flushFrame(ep, false);
+        emitResponse(p2);
         continue;
       }
     }
-    if (g_flen == FRAME_MAX) flushFrame();
+
+    // RESPOND mode: impersonate 0x66 to the board using the loaded replay templates.
+    // Triggered when the board's page-1 (00 02 / 00 7C) or page-2 (00 7E / 00 7A) read poll
+    // arrives on UART1 and CRC validates. Templates already contain the original NEO CRC, so
+    // we forward bytes 3..end verbatim with a fresh 3-byte header prepended.
+    if (respond_mode && &ep == &g_a && ep.flen == 8 &&
+        ep.frame[0] == 0x66 && ep.frame[1] == 0x03 &&
+        ep.frame[2] == 0x00 && ep.frame[4] == 0x00 &&
+        modbusCrc(ep.frame, 6) == (uint16_t)(ep.frame[6] | (ep.frame[7] << 8))) {
+      bool p1 = (ep.frame[3] == 0x02 && ep.frame[5] == 0x7C);
+      bool p2 = (ep.frame[3] == 0x7E && ep.frame[5] == 0x7A);
+      flushFrame(ep, false);
+      if (p1 && g_replay_p1_valid) {
+        emitFromTemplate(0xF8, g_replay_p1, bridge::StreamingBridge::kReplayPage1Bytes);
+      } else if (p2 && g_replay_p2_valid) {
+        emitFromTemplate(0xF4, g_replay_p2, bridge::StreamingBridge::kReplayPage2Bytes);
+      }
+      if (p1 || p2) continue;
+    }
+
+    if (ep.flen == FRAME_MAX) {
+      bool was_mod = bridging && ep.bridge.modified();
+      flushFrame(ep, was_mod);
+      // Avoid resetting the bridge mid-frame on a false-positive idle (a short "gap" can be
+      // caused by our own main-loop latency — HTTP handling, TX-FIFO backpressure — not a real
+      // wire gap). If we reset mid-frame the rest of the response gets treated as a new
+      // unrecognised frame, losing the CRC re-stamp and putting a broken frame on the wire.
+      // Strategy: skip the bridge reset if it's currently inside a recognised frame; but ALSO
+      // force a reset on any truly long idle (>30 ms) so we don't permanently desync on a real
+      // bus error. The bridge auto-resets internally on clean frame completion either way.
+      if (bridging && (!ep.bridge.isMidFrame() || (now - ep.last_byte_us) > 30000)) {
+        ep.bridge.onGap();
+      }
+    }
   }
+}
+
+static void pumpCapture() {
+  pumpEndpoint(g_a, g_b);
+  pumpEndpoint(g_b, g_a);
+}
+
+// Dedicated FreeRTOS task for byte forwarding. Runs at a priority above the Arduino main loop
+// (which does HTTP / OTA / mDNS / console) so a slow HTTP request can't stall the bridge mid-
+// frame and insert a >t3.5 gap on the destination wire — which the indoor board would treat as
+// premature frame-end, rejecting the NEO's response on CRC. The pump busy-loops while either
+// UART has data pending (so a Modbus burst gets forwarded without preemption), and only yields
+// during the genuine idle window between bursts (Modbus master pacing leaves >6 ms here, which
+// is plenty of room for HTTP / OTA work).
+static TaskHandle_t g_bridge_task = nullptr;
+static void bridgeTask(void* /*arg*/) {
+  for (;;) {
+    if (g_capture) pumpCapture();
+    if (!g_a.uart.available() && !g_b.uart.available()) {
+      vTaskDelay(1);  // bus idle: let lower-priority main loop run
+    }
+  }
+}
+
+static const char* bridgeModeStr(bridge::StreamingBridge::Mode m) {
+  switch (m) {
+    case bridge::StreamingBridge::OFF: return "off";
+    case bridge::StreamingBridge::PASSTHRU: return "passthru";
+    case bridge::StreamingBridge::INJECT: return "inject";
+    case bridge::StreamingBridge::RESPOND: return "respond";
+  }
+  return "?";
+}
+
+// Forge a 0x66 func-03 response from a replay template (data + trailing CRC, byte-for-byte).
+// Used only in RESPOND mode — the firmware impersonates 0x66 to the board while the NEO is
+// fully isolated (no forwarding either direction). The template's original CRC is valid
+// because the prepended header bytes (0x66 0x03 <bytecount>) are identical to whatever was
+// on the wire when the capture was taken.
+static uint32_t g_respond_tx = 0;
+static void emitFromTemplate(uint8_t bytecount, const uint8_t* tmpl, size_t tmpl_len) {
+  static uint8_t buf[256];
+  buf[0] = 0x66;
+  buf[1] = 0x03;
+  buf[2] = bytecount;
+  memcpy(buf + 3, tmpl, tmpl_len);
+  delayMicroseconds(g_turn_us);
+  g_a.uart.write(buf, 3 + tmpl_len);
+  g_a.uart.flush();
+  g_respond_tx++;
 }
 
 static size_t statusLine(char *out, size_t cap) {
   return snprintf(out, cap,
     "# seq_max=%u baud=%u parity=8%c1 gap=%uus capture=%s "
-    "bytes=%llu frames=%u rx_err=%u rssi=%d ip=%s "
-    "armed=%d addr=0x%02X tmpl1=%d tmpl2=%d poll=%u tx=%u fw=\"%s\"",
+    "A.bytes=%llu A.frames=%u A.mod=%u A.rxerr=%u "
+    "B.bytes=%llu B.frames=%u B.mod=%u B.rxerr=%u "
+    "rssi=%d ip=%s "
+    "armed=%d addr=0x%02X tmpl1=%d tmpl2=%d poll=%u tx=%u "
+    "bridge=%s rules=%u pulse_rules=%u pulse_remaining=%u "
+    "scramble=%u nonce=0x%04X fw=\"%s\"",
     g_seq, g_baud, g_parity, g_gap_us, g_capture ? "on" : "off",
-    (unsigned long long)g_total_bytes, g_total_frames, g_rx_errors,
+    (unsigned long long)g_a.total_bytes, g_a.total_frames, g_a.modified_frames, g_a.rx_errors,
+    (unsigned long long)g_b.total_bytes, g_b.total_frames, g_b.modified_frames, g_b.rx_errors,
     WiFi.isConnected() ? WiFi.RSSI() : 0,
     WiFi.localIP().toString().c_str(),
     g_write_armed ? 1 : 0, g_emul_addr, g_page1_valid ? 1 : 0, g_page2_valid ? 1 : 0,
     g_poll67, g_tx67,
+    bridgeModeStr(g_bridge_mode), (unsigned)g_b.bridge.ruleCount(),
+    (unsigned)g_b.bridge.pulseRuleCount(), (unsigned)g_b.bridge.pulseRemaining(),
+    g_scramble_reg, g_scramble_nonce,
     __DATE__ " " __TIME__);
 }
 
-// ---- pulse-width baud estimator ------------------------------------------
-// Times raw line edges; shortest pulse ~= one bit, so baud ~= 1e6 / min_us.
-// Bus must be ACTIVE during the ~5s window (trigger a change in the Neo app).
+// ---- pulse-width baud estimator (UART1 / board side only) -----------------
 static const size_t EDGE_CAP = 4096;
 static volatile uint32_t g_edges[EDGE_CAP];
 static volatile size_t g_edge_n = 0;
@@ -293,27 +486,27 @@ static uint32_t nearestStandardBaud(uint32_t b) {
 }
 
 static String measureBaud() {
-  Bus.end();
-  pinMode(PIN_RS485_RX, INPUT);
+  g_a.uart.end();
+  pinMode(g_a.pin_rx, INPUT);
   g_edge_n = 0;
-  attachInterrupt(digitalPinToInterrupt(PIN_RS485_RX), edgeISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(g_a.pin_rx), edgeISR, CHANGE);
   uint32_t deadline = millis() + 5000;
   while (millis() < deadline && g_edge_n < EDGE_CAP) delay(1);
-  detachInterrupt(digitalPinToInterrupt(PIN_RS485_RX));
+  detachInterrupt(digitalPinToInterrupt(g_a.pin_rx));
 
   size_t n = g_edge_n;
   String out;
   if (n < 8) {
     out = "# only " + String((unsigned)n) +
-          " edges — idle/no traffic. Trigger a change and retry.\n";
-    startBus();
+          " edges — idle/no traffic on UART1. Trigger a change and retry.\n";
+    startBuses();
     return out;
   }
 
   uint32_t mins[5] = {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
   for (size_t i = 1; i < n; i++) {
     uint32_t d = g_edges[i] - g_edges[i - 1];
-    if (d < 3) continue;  // ignore glitches
+    if (d < 3) continue;
     for (int k = 0; k < 5; k++) {
       if (d < mins[k]) {
         for (int j = 4; j > k; j--) mins[j] = mins[j - 1];
@@ -329,28 +522,41 @@ static String measureBaud() {
     if (mins[k] != UINT32_MAX) out += String(mins[k]) + " ";
   out += "\n# bit=" + String(bit_us) + "us -> ~" + String(baud) +
          " baud (nearest standard: " + String(nearestStandardBaud(baud)) + ")\n";
-  startBus();
+  startBuses();
   return out;
 }
 
 // ---- HTTP handlers --------------------------------------------------------
 static void handleRoot() {
-  char st[300];
+  char st[600];
   statusLine(st, sizeof(st));
-  String b = "Actron RS485 sniffer (listen-only)\n";
+  String b = "Actron RS485 sniffer + MITM bridge\n";
   b += String(st) + "\n\n";
   b += "GET /stats              status line\n";
-  b += "GET /log?since=<seq>&n=<max>   frames (incremental)\n";
+  b += "GET /log?since=<seq>&n=<max>   frames (interleaved A/B, incremental)\n";
   b += "GET /set?baud=&parity=N|E|O&gap=<us>\n";
-  b += "GET /measure            estimate baud from line pulses (~5s)\n";
+  b += "GET /measure            estimate baud from UART1 line pulses (~5s)\n";
   b += "GET /clear              reset ring + counters\n";
-  b += "GET /armwrite?ovr=reg:val,...   ARM 0x67 write test (e.g. ovr=11:0x5903)\n";
-  b += "GET /disarm             stop writing (receive-only)\n";
+  b += "GET /armwrite?ovr=reg:val,...   ARM 0x67 emulator (tap mode, requires bridge=off)\n";
+  b += "GET /disarm             stop mutations: 0x67 emulator off, INJECT->PASSTHRU\n";
+  b += "GET /txprobe            TX self-test on UART1 (requires bridge=off)\n";
+  b += "GET /bridge?mode=off|passthru|inject|respond   MITM bridge mode (default: passthru)\n";
+  b += "                                        respond = block NEO, impersonate 0x66 to board from loaded templates\n";
+  b += "GET /inject?rules=reg:val,...          NEO->board substitution rules (persistent)\n";
+  b += "GET /pulse?rules=reg:val,...&n=<N>     transient rules for next N recognised B frames\n";
+  b += "GET /snapshot                          freeze the last 0x66 page1+page2 (with CRC) as replay templates\n";
+  b += "GET /replay?on=0|1                     byte-for-byte playback of snapshot (no CRC recompute)\n";
+  b += "GET /loadtemplate?page=1|2&hex=<bytes> load saved payload into replay template (data + CRC, no header)\n";
+  b += "GET /scramble?reg=<n>&on=0|1           per-frame nonce rewrite on reg (commit-gate test)\n";
+  b += "GET /loopback?n=<bytes>                dual-UART bench: 256/1024-byte pattern + verify\n";
+  b += "GET /uartcheck                         1-byte per-direction probe (diagnostic)\n";
+  b += "GET /blink                             6x 50-byte bursts each UART, watch the LEDs\n";
+  b += "GET /update?url=<bin>                  HTTP-pull OTA\n";
   server.send(200, "text/plain", b);
 }
 
 static void handleStats() {
-  char st[300];
+  char st[600];
   statusLine(st, sizeof(st));
   server.send(200, "text/plain", String(st) + "\n");
 }
@@ -363,25 +569,25 @@ static void handleLog() {
 
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/plain", "");
-  char st[300];
+  char st[600];
   statusLine(st, sizeof(st));
   server.sendContent(String(st) + "\n");
 
   uint32_t maxseq = g_seq;
   uint32_t oldest = (maxseq > RING) ? (maxseq - RING + 1) : 1;
   uint32_t start = since + 1;
-  if (start < oldest) start = oldest;  // caller fell behind the ring — resync
+  if (start < oldest) start = oldest;
 
   static char line[2300];
   uint32_t sent = 0;
   for (uint32_t s = start; s <= maxseq && sent < limit; s++) {
     FrameRec &r = g_ring[(s - 1) % RING];
-    if (r.seq != s) continue;  // overwritten since
+    if (r.seq != s) continue;
     formatFrame(r, line, sizeof(line));
     server.sendContent(line);
     sent++;
   }
-  server.sendContent("");  // terminate chunked response
+  server.sendContent("");
 }
 
 static void handleSet() {
@@ -397,8 +603,8 @@ static void handleSet() {
     uint32_t v = strtoul(server.arg("gap").c_str(), nullptr, 10);
     if (v > 0) g_gap_us = v;
   }
-  startBus();
-  char st[300];
+  startBuses();
+  char st[600];
   statusLine(st, sizeof(st));
   server.send(200, "text/plain", String(st) + "\n");
 }
@@ -407,16 +613,19 @@ static void handleMeasure() { server.send(200, "text/plain", measureBaud()); }
 
 static void handleClear() {
   g_seq = 0;
-  g_total_bytes = 0;
-  g_total_frames = 0;
-  g_rx_errors = 0;
+  g_a.total_bytes = g_a.total_frames = g_a.modified_frames = g_a.rx_errors = 0;
+  g_b.total_bytes = g_b.total_frames = g_b.modified_frames = g_b.rx_errors = 0;
   memset(g_ring, 0, sizeof(g_ring));
   server.send(200, "text/plain", "# cleared\n");
 }
 
-// Arm the 0x67 write test. ?ovr=reg:val,reg:val (val decimal or 0x..). e.g. ovr=11:0x5903
-// (fan->high), or ovr=12:235,56:235 (main setpoint->23.5 in heat). Big-endian register values.
 static void handleArm() {
+  if (g_bridge_mode != bridge::StreamingBridge::OFF) {
+    server.send(409, "text/plain",
+      "# REJECTED: bridge is active (mode != off). /armwrite is mutually exclusive with the "
+      "MITM bridge — both would drive UART1 TX. Run /bridge?mode=off first.\n");
+    return;
+  }
   g_ovr_n = 0;
   if (server.hasArg("ovr")) {
     String s = server.arg("ovr");
@@ -443,7 +652,7 @@ static void handleArm() {
     if (a == 0x66 || a == 0x67 || a == 0x68) g_emul_addr = a;
   }
   g_pulse_n = 0;
-  if (server.hasArg("pulse")) {       // ?pulse=reg:val (&pulsen=N, default 1): fire a one-shot
+  if (server.hasArg("pulse")) {
     String p = server.arg("pulse"); int c = p.indexOf(':');
     if (c > 0) {
       g_pulse_reg = (uint16_t)strtoul(p.substring(0, c).c_str(), nullptr, 0);
@@ -463,39 +672,50 @@ static void handleArm() {
   if (g_pulse_n > 0)
     b += "#   PULSE reg " + String(g_pulse_reg) + " <- 0x" + String(g_pulse_val, HEX) +
          " for next " + String(g_pulse_n) + " page-1 response(s)\n";
-  b += "# will answer 67 03 00 02 00 7C polls; GET /disarm to stop.\n";
+  b += "# will answer polls; GET /disarm to stop.\n";
   server.send(200, "text/plain", b);
 }
 
+// /disarm — stop all *mutation*: 0x67 emulator off, INJECT bridge drops to PASSTHRU.
+// The relay itself (PASSTHRU) stays up so a cut bus keeps working. OFF stays OFF (tap mode).
 static void handleDisarm() {
   g_write_armed = false;
-  server.send(200, "text/plain", "# write DISARMED (receive-only)\n");
+  if (g_bridge_mode == bridge::StreamingBridge::INJECT) {
+    g_bridge_mode = bridge::StreamingBridge::PASSTHRU;
+    g_a.bridge.setMode(g_bridge_mode);
+    g_b.bridge.setMode(g_bridge_mode);
+  }
+  String r = "# DISARMED: 0x67 emulator off, bridge mode -> ";
+  r += bridgeModeStr(g_bridge_mode);
+  r += "\n";
+  server.send(200, "text/plain", r);
 }
 
-// Definitive TX self-test: briefly act as master — wait for an idle gap, inject one read-poll
-// to 0x66, then listen for its reply. If 0x66 answers, our transmit path physically works.
 static void handleTxProbe() {
+  if (g_bridge_mode != bridge::StreamingBridge::OFF) {
+    server.send(409, "text/plain", "# REJECTED: bridge active. Run /bridge?mode=off first.\n");
+    return;
+  }
   uint32_t idleStart = micros();
   uint32_t t0 = millis();
-  while (millis() - t0 < 2000) {           // wait for >=50 ms of bus silence
-    if (Bus.available()) { Bus.read(); idleStart = micros(); }
+  while (millis() - t0 < 2000) {
+    if (g_a.uart.available()) { g_a.uart.read(); idleStart = micros(); }
     else if (micros() - idleStart > 50000) break;
   }
   uint8_t probe[8] = {0x66, 0x03, 0x00, 0x02, 0x00, 0x7C, 0, 0};
   uint16_t c = modbusCrc(probe, 6);
   probe[6] = (uint8_t)(c & 0xFF);
   probe[7] = (uint8_t)(c >> 8);
-  while (Bus.available()) Bus.read();      // clear RX
+  while (g_a.uart.available()) g_a.uart.read();
   delayMicroseconds(500);
-  Bus.write(probe, 8);
-  Bus.flush();
-  // listen ~60 ms for a 66 03 F8 response (the real master is idle, so it's ours)
+  g_a.uart.write(probe, 8);
+  g_a.uart.flush();
   uint8_t last3[3] = {0, 0, 0};
   bool got = false;
   uint32_t deadline = millis() + 60;
   while (millis() < deadline) {
-    while (Bus.available()) {
-      uint8_t b = Bus.read();
+    while (g_a.uart.available()) {
+      uint8_t b = g_a.uart.read();
       last3[0] = last3[1]; last3[1] = last3[2]; last3[2] = b;
       if (last3[0] == 0x66 && last3[1] == 0x03 && last3[2] == 0xF8) got = true;
     }
@@ -506,8 +726,419 @@ static void handleTxProbe() {
   server.send(200, "text/plain", r);
 }
 
-// HTTP-pull OTA: device downloads firmware from a URL it can reach (e.g. the little server on
-// atlas) and self-flashes. Avoids ArduinoOTA's connect-back, which WSL's NAT can't satisfy.
+// /bridge?mode=off|passthru|inject — set MITM bridge mode for both endpoints.
+// Forces the 0x67 emulator OFF when switching to a non-OFF mode (mutex on UART1 TX).
+static void handleBridge() {
+  if (!server.hasArg("mode")) {
+    server.send(400, "text/plain", "# need ?mode=off|passthru|inject\n");
+    return;
+  }
+  String m = server.arg("mode");
+  m.toLowerCase();
+  bridge::StreamingBridge::Mode new_mode;
+  if      (m == "off")      new_mode = bridge::StreamingBridge::OFF;
+  else if (m == "passthru") new_mode = bridge::StreamingBridge::PASSTHRU;
+  else if (m == "inject")   new_mode = bridge::StreamingBridge::INJECT;
+  else if (m == "respond")  new_mode = bridge::StreamingBridge::RESPOND;
+  else { server.send(400, "text/plain", "# bad mode\n"); return; }
+
+  if (new_mode != bridge::StreamingBridge::OFF && g_write_armed) {
+    g_write_armed = false;  // mutex: only one can drive UART1 TX at a time
+  }
+  g_bridge_mode = new_mode;
+  g_a.bridge.setMode(new_mode);
+  g_b.bridge.setMode(new_mode);
+
+  String b = "# bridge mode -> " + String(bridgeModeStr(new_mode)) + "\n";
+  b += "# rules (B->A direction): " + String((unsigned)g_b.bridge.ruleCount()) + "\n";
+  if (new_mode != bridge::StreamingBridge::OFF)
+    b += "# 0x67 emulator force-disarmed (mutually exclusive with bridge).\n";
+  server.send(200, "text/plain", b);
+}
+
+// /inject?rules=reg:val,reg:val,... — set substitution rules for the NEO->board direction.
+// Endpoint B is the NEO side; its bridge instance is the one that rewrites NEO -> board.
+static void handleInject() {
+  bridge::Rule rules[bridge::StreamingBridge::MAX_RULES];
+  size_t n = 0;
+  if (server.hasArg("rules")) {
+    String s = server.arg("rules");
+    int start = 0;
+    while (start < (int)s.length() && n < bridge::StreamingBridge::MAX_RULES) {
+      int comma = s.indexOf(',', start);
+      String pair = (comma < 0) ? s.substring(start) : s.substring(start, comma);
+      int colon = pair.indexOf(':');
+      if (colon > 0) {
+        rules[n].reg   = (uint16_t)strtoul(pair.substring(0, colon).c_str(), nullptr, 0);
+        rules[n].value = (uint16_t)strtoul(pair.substring(colon + 1).c_str(), nullptr, 0);
+        n++;
+      }
+      if (comma < 0) break;
+      start = comma + 1;
+    }
+  }
+  g_b.bridge.setRules(rules, n);   // bytes received on B (NEO) -> rewrite -> peer A (board)
+  String b = "# " + String((unsigned)n) + " rule(s) set on B->A (NEO->board) direction\n";
+  for (size_t i = 0; i < n; i++)
+    b += "#   reg " + String(rules[i].reg) + " <- " + String(rules[i].value) +
+         " (0x" + String(rules[i].value, HEX) + ")\n";
+  if (g_bridge_mode != bridge::StreamingBridge::INJECT)
+    b += "# NOTE: bridge mode is currently " + String(bridgeModeStr(g_bridge_mode)) +
+         "; rules only take effect once you GET /bridge?mode=inject\n";
+  server.send(200, "text/plain", b);
+}
+
+// /loadtemplate?page=1|2&hex=<bytes> — load a specific byte sequence (data + 2-byte CRC, no
+// header) into the replay template buffer. Accepts hex with or without whitespace. Used to
+// inject a *saved* NEO response (from disk) into the firmware so RESPOND mode can replay it.
+// page=1 expects 250 bytes (248 data + 2 CRC); page=2 expects 246 bytes (244 data + 2 CRC).
+static void handleLoadTemplate() {
+  if (!server.hasArg("page") || !server.hasArg("hex")) {
+    server.send(400, "text/plain", "# need ?page=1|2&hex=<bytes>\n");
+    return;
+  }
+  int page = server.arg("page").toInt();
+  if (page != 1 && page != 2) {
+    server.send(400, "text/plain", "# page must be 1 or 2\n");
+    return;
+  }
+  size_t expected = (page == 1) ? bridge::StreamingBridge::kReplayPage1Bytes
+                                : bridge::StreamingBridge::kReplayPage2Bytes;
+  String hex = server.arg("hex");
+  auto hv = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+  };
+  uint8_t buf[256];
+  size_t n = 0;
+  size_t i = 0;
+  while (i < (size_t)hex.length() && n < expected) {
+    while (i < (size_t)hex.length() &&
+           (hex[i] == ' ' || hex[i] == '\n' || hex[i] == '\r' || hex[i] == '\t')) i++;
+    if (i + 1 >= (size_t)hex.length()) break;
+    int h1 = hv(hex[i]); int h2 = hv(hex[i + 1]);
+    if (h1 < 0 || h2 < 0) {
+      server.send(400, "text/plain",
+        String("# bad hex char at position ") + String((int)i) + "\n");
+      return;
+    }
+    buf[n++] = (uint8_t)((h1 << 4) | h2);
+    i += 2;
+  }
+  if (n != expected) {
+    server.send(400, "text/plain",
+      String("# need exactly ") + String((unsigned)expected) +
+      " bytes, parsed " + String((unsigned)n) + "\n");
+    return;
+  }
+  if (page == 1) {
+    memcpy(g_replay_p1, buf, bridge::StreamingBridge::kReplayPage1Bytes);
+    g_replay_p1_valid = true;
+    g_b.bridge.setReplayPage1Data(g_replay_p1);
+  } else {
+    memcpy(g_replay_p2, buf, bridge::StreamingBridge::kReplayPage2Bytes);
+    g_replay_p2_valid = true;
+    g_b.bridge.setReplayPage2Data(g_replay_p2);
+  }
+  server.send(200, "text/plain",
+    String("# loaded ") + String((unsigned)n) + " bytes into replay page " + String(page) + "\n");
+}
+
+// /snapshot — freeze the last CRC-valid page-1 and page-2 NEO responses into the bridge's
+// replay buffers. The cache (g_replay_p1, g_replay_p2) is continually updated from live
+// captures; snapshot just hands the current contents to the bridge as its replay templates.
+static void handleSnapshot() {
+  String b = "# snapshot taken: ";
+  if (g_replay_p1_valid) { g_b.bridge.setReplayPage1Data(g_replay_p1); b += "page1=loaded "; }
+  else                   { b += "page1=MISSING "; }
+  if (g_replay_p2_valid) { g_b.bridge.setReplayPage2Data(g_replay_p2); b += "page2=loaded "; }
+  else                   { b += "page2=MISSING "; }
+  b += "\n# (templates include the original CRC trailer — replay will forward the bytes unchanged)\n";
+  server.send(200, "text/plain", b);
+}
+
+// /replay?on=0|1 — enable/disable byte-for-byte playback of the snapshotted templates over
+// the NEO->board direction. Requires bridge mode=inject to actually take effect.
+static void handleReplay() {
+  bool on = !server.hasArg("on") || server.arg("on") != "0";
+  g_b.bridge.setReplayEnabled(on);
+  String r = "# replay ";
+  r += on ? "ENABLED" : "disabled";
+  r += " (p1=";
+  r += g_b.bridge.replayPage1Loaded() ? "loaded" : "MISSING";
+  r += " p2=";
+  r += g_b.bridge.replayPage2Loaded() ? "loaded" : "MISSING";
+  r += ")\n";
+  if (on && g_bridge_mode != bridge::StreamingBridge::INJECT)
+    r += "# NOTE: bridge mode is " + String(bridgeModeStr(g_bridge_mode)) +
+         "; replay only takes effect once you GET /bridge?mode=inject\n";
+  server.send(200, "text/plain", r);
+}
+
+// /pulse?rules=reg:val,reg:val,...&n=<frames> — arm a transient set of substitution rules
+// that fire for the next N recognised B frames (NEO func-03 responses) on the NEO->board
+// direction, then auto-expire. Pulse rules take precedence over persistent /inject rules.
+// Used to test the page-2 commit-signal hypothesis: zone setpoints commit when a "high-byte-
+// to-zero" pulse fires on reg 243 (page-2) + reg 65, 67 (page-1) for one cycle.
+//
+// Example: pulse all three commit markers for 1 cycle =
+//   /pulse?rules=65:0x0032,67:0x0023,243:0x0028&n=1
+static void handlePulse() {
+  if (g_bridge_mode != bridge::StreamingBridge::INJECT) {
+    server.send(409, "text/plain",
+      "# REJECTED: bridge mode must be INJECT for /pulse to take effect. Run /bridge?mode=inject first.\n");
+    return;
+  }
+  bridge::Rule rules[bridge::StreamingBridge::MAX_RULES];
+  size_t n = 0;
+  if (server.hasArg("rules")) {
+    String s = server.arg("rules");
+    int start = 0;
+    while (start < (int)s.length() && n < bridge::StreamingBridge::MAX_RULES) {
+      int comma = s.indexOf(',', start);
+      String pair = (comma < 0) ? s.substring(start) : s.substring(start, comma);
+      int colon = pair.indexOf(':');
+      if (colon > 0) {
+        rules[n].reg   = (uint16_t)strtoul(pair.substring(0, colon).c_str(), nullptr, 0);
+        rules[n].value = (uint16_t)strtoul(pair.substring(colon + 1).c_str(), nullptr, 0);
+        n++;
+      }
+      if (comma < 0) break;
+      start = comma + 1;
+    }
+  }
+  size_t n_frames = server.hasArg("n") ? strtoul(server.arg("n").c_str(), nullptr, 0) : 1;
+  if (n_frames == 0) n_frames = 1;
+  if (n_frames > 100) n_frames = 100;
+
+  g_b.bridge.setPulse(rules, n, n_frames);
+
+  String b = "# pulse ARMED: " + String((unsigned)n) + " rule(s) for next " +
+             String((unsigned)n_frames) + " recognised B frame(s)\n";
+  for (size_t i = 0; i < n; i++)
+    b += "#   reg " + String(rules[i].reg) + " <- 0x" + String(rules[i].value, HEX) +
+         " (" + String(rules[i].value) + ")\n";
+  server.send(200, "text/plain", b);
+}
+
+// /scramble?reg=<n>&on=0|1 — arm/disarm per-frame rule update on the NEO->board direction.
+// When armed (reg != 0), every new B frame increments g_scramble_nonce and upserts a rule
+// `reg -> nonce` into g_b.bridge. Tests whether the board's commit gate for page-2 values
+// is "must differ from last cycle" rather than a deterministic hash.
+static void handleScramble() {
+  bool on = !server.hasArg("on") || server.arg("on") != "0";
+  if (!on) {
+    g_scramble_reg = 0;
+    server.send(200, "text/plain", "# scramble disabled\n");
+    return;
+  }
+  if (!server.hasArg("reg")) {
+    server.send(400, "text/plain", "# need ?reg=<register> (and optional &on=0 to disable)\n");
+    return;
+  }
+  uint16_t r = (uint16_t)strtoul(server.arg("reg").c_str(), nullptr, 0);
+  if (r == 0) {
+    server.send(400, "text/plain", "# reg=0 means disabled — use ?on=0 to disable explicitly\n");
+    return;
+  }
+  g_scramble_reg = r;
+  String b = "# scramble armed: reg " + String(r) +
+             " will be rewritten with a fresh nonce on every new B (NEO->board) frame\n";
+  b += "# nonce seed=0x" + String(g_scramble_nonce, HEX) + " step=0x9E37\n";
+  if (g_bridge_mode != bridge::StreamingBridge::INJECT)
+    b += "# NOTE: bridge mode is " + String(bridgeModeStr(g_bridge_mode)) +
+         "; scramble only takes effect once you GET /bridge?mode=inject\n";
+  server.send(200, "text/plain", b);
+}
+
+// /loopback?n=<bytes> — bench test for two-UART operation. Two supported wiring layouts:
+//   (a) Pure UART: jumpers GPIO16<->GPIO1 and GPIO17<->GPIO0 (no transceivers).
+//   (b) Through transceivers on a shared bus: both modules' A<->A, B<->B. This exercises the
+//       full TTL<->RS485<->TTL path. NOTE: auto-direction transceivers echo each sender's TX
+//       back to its OWN RX (the transmitter's RO follows the bus, which it's driving) — so
+//       we explicitly drain the sender's RX after each phase and don't compare it.
+// Sends a deterministic pattern in BOTH directions, sequentially (the shared bus is
+// half-duplex), and reports byte integrity on the RECEIVING UART for each direction.
+static void handleLoopback() {
+  if (g_bridge_mode != bridge::StreamingBridge::OFF || g_write_armed) {
+    server.send(409, "text/plain",
+      "# REJECTED: bridge or 0x67 emulator is active. /disarm first.\n");
+    return;
+  }
+  size_t n = server.hasArg("n") ? strtoul(server.arg("n").c_str(), nullptr, 10) : 256;
+  if (n == 0 || n > 1024) n = 256;
+
+  g_capture = false;   // stop the pumpCapture loop reading from either UART
+  delay(50);
+  auto drain = [](BusEndpoint& ep) {
+    uint32_t until = millis() + 20;
+    while (millis() < until) { while (ep.uart.available()) ep.uart.read(); delay(1); }
+  };
+  drain(g_a);
+  drain(g_b);
+
+  uint8_t pattern[1024];
+  for (size_t i = 0; i < n; i++) pattern[i] = (uint8_t)(i ^ 0x5A);
+
+  // Phase 1: A -> B. Receiver = UART0 (g_b). Drain g_a's RX afterwards (it contains echo).
+  g_a.uart.write(pattern, n);
+  g_a.uart.flush();
+  uint32_t deadline = millis() + 1000;
+  std::vector<uint8_t> recv_b; recv_b.reserve(n);
+  while (millis() < deadline && recv_b.size() < n) {
+    while (g_b.uart.available() && recv_b.size() < n) recv_b.push_back((uint8_t)g_b.uart.read());
+  }
+  size_t miss_b = (recv_b.size() != n) ? (n - recv_b.size()) : 0;
+  size_t err_b = 0;
+  for (size_t i = 0; i < recv_b.size(); i++) if (recv_b[i] != pattern[i]) err_b++;
+  drain(g_a);  // discard the transmit echo on the sender's own RX
+  drain(g_b);  // and any stragglers on the receiver
+
+  // Phase 2: B -> A. Receiver = UART1 (g_a).
+  g_b.uart.write(pattern, n);
+  g_b.uart.flush();
+  deadline = millis() + 1000;
+  std::vector<uint8_t> recv_a; recv_a.reserve(n);
+  while (millis() < deadline && recv_a.size() < n) {
+    while (g_a.uart.available() && recv_a.size() < n) recv_a.push_back((uint8_t)g_a.uart.read());
+  }
+  size_t miss_a = (recv_a.size() != n) ? (n - recv_a.size()) : 0;
+  size_t err_a = 0;
+  for (size_t i = 0; i < recv_a.size(); i++) if (recv_a[i] != pattern[i]) err_a++;
+  drain(g_a);
+  drain(g_b);
+
+  g_capture = true;
+
+  String b = "# loopback n=" + String((unsigned)n) + "\n";
+  b += "# A->B: received=" + String((unsigned)recv_b.size()) + " missing=" + String((unsigned)miss_b) +
+       " mismatched=" + String((unsigned)err_b) + "\n";
+  b += "# B->A: received=" + String((unsigned)recv_a.size()) + " missing=" + String((unsigned)miss_a) +
+       " mismatched=" + String((unsigned)err_a) + "\n";
+  bool ok = (miss_a == 0 && err_a == 0 && miss_b == 0 && err_b == 0);
+  b += String("# verdict: ") + (ok ? "PASS" : "FAIL") + "\n";
+  server.send(200, "text/plain", b);
+}
+
+// /uartcheck — isolated diagnostic for the dual-UART path. Writes a single calibration byte
+// (0x55, alternating bits) first on UART1 alone, then on UART0 alone, and reports per-step
+// what each UART's RX FIFO saw. Lets us tell apart:
+//   - UART0 not initialised at all (no echo on its own RX)
+//   - Transceiver B unpowered / miswired (UART0 echoes but UART1 RX sees nothing)
+//   - A/B polarity swapped (transmits happen but the other side decodes garbage)
+static void handleUartCheck() {
+  if (g_bridge_mode != bridge::StreamingBridge::OFF || g_write_armed) {
+    server.send(409, "text/plain", "# REJECTED: bridge or 0x67 emulator active. /disarm first.\n");
+    return;
+  }
+  g_capture = false;
+  delay(50);
+  auto drain = [](BusEndpoint& ep) {
+    uint32_t until = millis() + 20;
+    while (millis() < until) { while (ep.uart.available()) ep.uart.read(); delay(1); }
+  };
+  auto collect = [](BusEndpoint& ep, uint32_t ms) {
+    std::vector<uint8_t> v;
+    uint32_t until = millis() + ms;
+    while (millis() < until) {
+      while (ep.uart.available()) v.push_back((uint8_t)ep.uart.read());
+      delay(1);
+    }
+    return v;
+  };
+  auto hex = [](const std::vector<uint8_t>& v) {
+    String s;
+    for (auto b : v) { char buf[4]; snprintf(buf, sizeof(buf), "%02X ", b); s += buf; }
+    return s;
+  };
+
+  drain(g_a); drain(g_b);
+
+  // Step 1: TX one byte on UART1 only.
+  uint8_t probe = 0x55;
+  g_a.uart.write(&probe, 1);
+  g_a.uart.flush();
+  auto a_after_tx_a = collect(g_a, 30);   // UART1 own-RX echo (transceiver A self-loop)
+  auto b_after_tx_a = collect(g_b, 30);   // UART0 RX from bus (transceiver A -> bus -> B)
+  drain(g_a); drain(g_b);
+
+  // Step 2: TX one byte on UART0 only.
+  g_b.uart.write(&probe, 1);
+  g_b.uart.flush();
+  auto b_after_tx_b = collect(g_b, 30);   // UART0 own-RX echo (transceiver B self-loop)
+  auto a_after_tx_b = collect(g_a, 30);   // UART1 RX from bus (transceiver B -> bus -> A)
+  drain(g_a); drain(g_b);
+
+  g_capture = true;
+
+  String r = "# uartcheck (1-byte probe = 0x55)\n";
+  r += "# TX on UART1 (g_a, GPIO16):\n";
+  r += "#   UART1 RX (own echo via transceiver A) -> n=" + String((unsigned)a_after_tx_a.size()) +
+       " bytes: " + hex(a_after_tx_a) + "\n";
+  r += "#   UART0 RX (via bus to transceiver B)   -> n=" + String((unsigned)b_after_tx_a.size()) +
+       " bytes: " + hex(b_after_tx_a) + "\n";
+  r += "# TX on UART0 (g_b, GPIO1):\n";
+  r += "#   UART0 RX (own echo via transceiver B) -> n=" + String((unsigned)b_after_tx_b.size()) +
+       " bytes: " + hex(b_after_tx_b) + "\n";
+  r += "#   UART1 RX (via bus to transceiver A)   -> n=" + String((unsigned)a_after_tx_b.size()) +
+       " bytes: " + hex(a_after_tx_b) + "\n";
+  r += "#\n";
+  r += "# Interpretation:\n";
+  r += "#   own echoes both non-empty -> both UART + transceiver TX paths live.\n";
+  r += "#   own echoes ok, cross both empty -> A/B polarity swap or open bus.\n";
+  r += "#   only UART1 own echo -> UART0 not initialised or transceiver B unpowered.\n";
+  server.send(200, "text/plain", r);
+}
+
+// /blink — visual UART diagnostic for staring at the transceivers' TX/RX LEDs. Pulses each
+// UART in turn (6 bursts of ~50ms TX activity at 500ms intervals = 3s per UART, 6s total).
+// Reports the TX byte count we drove out of each UART; the operator confirms which TX/RX
+// LEDs lit on the physical modules.
+static void handleBlink() {
+  if (g_bridge_mode != bridge::StreamingBridge::OFF || g_write_armed) {
+    server.send(409, "text/plain", "# REJECTED: bridge or 0x67 emulator active. /disarm first.\n");
+    return;
+  }
+  g_capture = false;
+  delay(50);
+
+  // 50 bytes @ 9600 baud = ~52 ms of continuous TX activity (LED on); then 450 ms idle.
+  uint8_t pulse[50];
+  for (size_t i = 0; i < sizeof(pulse); i++) pulse[i] = 0x55;
+
+  auto pulse_uart = [&](BusEndpoint& ep) {
+    size_t tx_bytes = 0;
+    for (int i = 0; i < 6; i++) {
+      ep.uart.write(pulse, sizeof(pulse));
+      ep.uart.flush();
+      tx_bytes += sizeof(pulse);
+      // discard whatever arrives during the gap (own echo, peer's bus output)
+      uint32_t until = millis() + 450;
+      while (millis() < until) {
+        while (g_a.uart.available()) g_a.uart.read();
+        while (g_b.uart.available()) g_b.uart.read();
+        delay(1);
+      }
+    }
+    return tx_bytes;
+  };
+
+  size_t tx_a = pulse_uart(g_a);
+  size_t tx_b = pulse_uart(g_b);
+
+  while (g_a.uart.available()) g_a.uart.read();
+  while (g_b.uart.available()) g_b.uart.read();
+  g_capture = true;
+
+  String r = "# blink complete\n";
+  r += "# UART1 (g_a, GPIO16 TX): 6 x 50 bytes = " + String((unsigned)tx_a) + " bytes pulsed\n";
+  r += "# UART0 (g_b, GPIO1 TX):  6 x 50 bytes = " + String((unsigned)tx_b) + " bytes pulsed\n";
+  r += "# Operator: check the transceiver modules' TX/RX LEDs during each 3s window.\n";
+  server.send(200, "text/plain", r);
+}
+
 static void handleUpdate() {
   if (!server.hasArg("url")) {
     server.send(400, "text/plain", "# need ?url=http://host:port/firmware.bin\n");
@@ -516,15 +1147,14 @@ static void handleUpdate() {
   String url = server.arg("url");
   server.send(200, "text/plain", "# pulling firmware: " + url + "\n");
   Serial.printf("# OTA: pulling %s\n", url.c_str());
-  g_capture = false;  // stop touching the bus while flashing
+  g_capture = false;
   WiFiClient client;
   httpUpdate.rebootOnUpdate(true);
   t_httpUpdate_return r = httpUpdate.update(client, url);
   Serial.printf("# OTA failed (%d): %s\n", (int)r, httpUpdate.getLastErrorString().c_str());
-  g_capture = true;  // only reached on failure — success reboots into the new image
+  g_capture = true;
 }
 
-// ---- USB console (fallback) ----------------------------------------------
 static void pumpConsole() {
   static char buf[32];
   static size_t len = 0;
@@ -533,7 +1163,7 @@ static void pumpConsole() {
     if (c == '\r') continue;
     if (c == '\n') {
       buf[len] = '\0';
-      char st[300];
+      char st[600];
       switch (buf[0]) {
         case 'm': Serial.print(measureBaud()); break;
         case 's': statusLine(st, sizeof(st)); Serial.println(st); break;
@@ -563,7 +1193,7 @@ static void connectWifi() {
                   WiFi.localIP().toString().c_str(), HOSTNAME);
     if (MDNS.begin(HOSTNAME)) MDNS.addService("http", "tcp", 80);
     ArduinoOTA.setHostname(HOSTNAME);
-    ArduinoOTA.begin();  // wireless reflash from here on
+    ArduinoOTA.begin();
   } else {
     Serial.println("# WiFi failed — capture still runs, HTTP unavailable. Check creds.");
   }
@@ -577,11 +1207,15 @@ void setup() {
   digitalWrite(RGB_PWR, HIGH);
 #endif
 
-  startBus();
+  startBuses();
+  // Propagate the boot-default bridge mode to both endpoints' bridge instances. Default is
+  // PASSTHRU so the cut-bus MITM relays bytes immediately on power-up without an HTTP poke.
+  g_a.bridge.setMode(g_bridge_mode);
+  g_b.bridge.setMode(g_bridge_mode);
 
   uint32_t t0 = millis();
   while (!Serial && millis() - t0 < 1500) delay(10);
-  Serial.println("\n# Actron RS485 sniffer (listen-only)");
+  Serial.println("\n# Actron RS485 tool (sniffer + MITM bridge)");
 
   connectWifi();
 
@@ -595,16 +1229,31 @@ void setup() {
   server.on("/armwrite", handleArm);
   server.on("/disarm", handleDisarm);
   server.on("/txprobe", handleTxProbe);
+  server.on("/bridge", handleBridge);
+  server.on("/inject", handleInject);
+  server.on("/loopback", handleLoopback);
+  server.on("/uartcheck", handleUartCheck);
+  server.on("/blink", handleBlink);
+  server.on("/scramble", handleScramble);
+  server.on("/pulse", handlePulse);
+  server.on("/snapshot", handleSnapshot);
+  server.on("/replay", handleReplay);
+  server.on("/loadtemplate", handleLoadTemplate);
   server.begin();
 
-  char st[300];
+  char st[600];
   statusLine(st, sizeof(st));
   Serial.println(st);
+
+  // Spawn the byte-forwarding task. Priority 5 sits above the Arduino loopTask (priority 1)
+  // but well below the WiFi/lwIP stack tasks (~18-23), so WiFi keeps working and our pump
+  // preempts only the user-space main loop (HTTP / OTA / console).
+  xTaskCreate(bridgeTask, "bridge", 8192, nullptr, 5, &g_bridge_task);
 }
 
 void loop() {
   ArduinoOTA.handle();
   server.handleClient();
   pumpConsole();
-  if (g_capture) pumpCapture();
+  // pumpCapture() now runs on its own FreeRTOS task — see bridgeTask().
 }

@@ -8,16 +8,50 @@ eventually **control** of the Actron A/C — escaping the unreliable `nimbus` cl
 > (§7); values are **big-endian** Modbus. Hardware: auto-direction transceiver + OTA +
 > `FRAME_MAX=512`; TX is firmware-gated (no wiring change needed to write).
 >
-> **✅ LOCAL WRITE CONTROL ACHIEVED, non-invasively** (§9): emulate a secondary controller at
-> **0x67**, answer its page-1 poll, and fire a **command pulse** — the board adopts & commits it
-> while the real NEO stays live. The control model: **the board owns authoritative state and
-> ignores merely-*reported* values; it acts on command *pulses* (reg 14).** Proven & mapped:
-> **mode (reg 14=1), fan (=2), main setpoint (=4)** — value in the matching register.
+> **✅ LOCAL WRITE CONTROL — FULLY PROVEN via TWO independent paths.**
 >
-> **Open items:** (a) **zone setpoints** — page-2 values, *no* command pulse; the board reads
-> them from C1 only (freshness-gated) so a 0x67 slot can't set them — needs the 0x66/MITM path or
-> the freshness-counter test (§9). (b) command codes for **on/off, zone-enable, away/turbo/
-> continuous-fan** still to map (quick, page-1). (c) build the emulator + HA integration.
+> Path A (tap mode, FINDINGS §9): emulate a secondary controller at **0x67**, answer its page-1
+> poll, fire a **command pulse** — the board adopts & commits. Non-invasive, NEO stays live at
+> 0x66. Page-1 commands only.
+>
+> Path B (MITM bridge inject, **2026-05-31**): cut the bus, rewrite the real NEO's 0x66 page-1
+> and/or page-2 response in flight using the bridge's `/inject` + `/pulse` endpoints. Same
+> command-pulse mechanism works — the board doesn't care which slot the pulse comes from.
+> **All commands proven via this path:** mode change, zone enable mask, fan/setpoint by
+> analogy, and **zone setpoints (cool array confirmed; heat array predicted)** via a new
+> side-channel finding (§9): the board requires **reg 126.lo low nibble** to carry the active
+> mode's low bit (cool=1, heat=2) before it re-reads zone setpoint registers. Without that
+> byte set, persistent INJECT of the setpoint alone is silently ignored. With it set, the
+> board commits within ~3 s.
+>
+> Path C (MITM **RESPOND** — block NEO + replay a saved response, **2026-05-31**): a stricter
+> variant of Path B. `/bridge?mode=respond` drops both directions of forwarding entirely (NEO
+> is isolated), and the firmware emits a saved page-1/page-2 byte-for-byte (data + original
+> CRC) in reply to the board's 0x66 polls. Templates loaded via `/loadtemplate?page=1|2&hex=…`.
+> Direct confirmation that **the board accepts any CRC-valid 0x66 response as authoritative for
+> value-only registers** — replaying a captured response with `reg 135 = 0x00DC` got the board
+> to broadcast 22.0 °C within ~3 s, while reg 10 / 12 / 85 (pulse-gated commands) in the same
+> payload were correctly ignored because the saved capture had `reg 14 = 0` (no pulse). On
+> exit, the NEO resynced to the board's broadcast on its next poll cycle.
+>
+> The control model: **the board owns authoritative state and ignores merely-*reported* values;
+> it acts on command *pulses* (reg 14).** Command codes mapped: **mode = 0x01, fan = 0x02,
+> main setpoint = 0x04, zone enable = 0x40.** Zone setpoints are value-only (no pulse).
+>
+> **Bridge timing was the load-bearing fix** (§9): earlier MITM attempts failed because the
+> bridge pump shared the Arduino main loop with HTTP/WiFi/OTA and inserted **>t3.5 mid-frame
+> gaps** on the destination wire when stalled — board rejected frames on CRC. Fix: pump on a
+> dedicated FreeRTOS task at priority 5 — see `src/main.cpp` `bridgeTask`. Both PASSTHRU and
+> INJECT now byte-clean.
+>
+> **Commit-to-broadcast latency is significant.** The board accepts a pulse immediately, but its
+> own broadcast can take **20–30 s** to publish the new state (mode-off observed); shorter
+> changes (zone enable) ~3–6 s. HA reconcile logic must tolerate this — don't declare a command
+> failed for at least 5+ broadcast cycles (~15 s).
+>
+> **Open items:** (a) command codes for **away / turbo / continuous-fan** still to map (page-1,
+> quick via `findpulse.py`). (b) build the emulator + HA integration — local-first writes via
+> MITM inject (covers everything) OR 0x67 tap (page-1 only); cloud demoted to telemetry.
 > A new agent can continue from "§10 Next steps" using the live device + `tools/decode.py` +
 > `tools/findpulse.py`.
 
@@ -299,50 +333,99 @@ user action; the new value rides in the relevant register(s). Mapped via `tools/
 (clear → one NEO change → decode the 0x66 *responses*, find the pulse). Codes confirmed
 **mode-independent** (setpoint pulse = 4 in both heat and cool):
 
-| Command | reg 14 pulse | value register(s) | issuable from 0x67 (page-1)? |
-|---------|:---:|-------------------|:---:|
-| HVAC mode | **1** | reg 10 low nibble (0=off,1=cool,2=heat,3=fan,4=auto) | ✅ |
-| Fan speed | **2** | reg 11 low byte (1=low,2=med,3=high,4=auto) | ✅ |
-| Main setpoint | **4** | reg 12 (active) **+** active-mode store (reg 55 cool / 56 heat) | ✅ **proven** |
-| **Zone setpoint** | **none seen** | **page-2** array: regs 127–134 (cool) / **135–142 (heat)** | ⚠️ see below |
+| Command | reg 14 pulse | value register(s) | proven path(s) |
+|---------|:---:|-------------------|:---|
+| HVAC mode | **0x01** (bit 0) | reg 10 low nibble (0=off, 1=cool, 2=heat, 3=fan, 4=auto) | ✅ 0x67 tap; ✅ MITM 0x66 inject (2026-05-31 — heat→cool→off all committed) |
+| Fan speed | **0x02** (bit 1) | reg 11 low byte (1=low, 2=med, 3=high, 4=auto) | ✅ 0x67 tap |
+| Main setpoint | **0x04** (bit 2) | reg 12 (active) **+** active-mode store (reg 55 cool / 56 heat) | ✅ 0x67 tap |
+| **Zone enable** | **0x40** (bit 6) | reg 85 (bitmask, bit-N = zone-N) | ✅ MITM 0x66 inject (2026-05-31 — Living+Entry → Jordon-only committed); fires on enable AND disable |
+| **Zone setpoint** | **none — value-only**, but requires **reg 126.lo low nibble** = mode bit (cool=`0x01`, heat=`0x02`) as a side-channel commit signal | page-2 array: regs 127–134 (cool) / **135–142 (heat)** | ✅ MITM 0x66 inject (2026-05-31 — Gym COOL 21.0 → 22.0 → 22.5 → 21.0 committed via persistent `/inject?rules=130:val,126:0x0001`). Real-NEO press also works (NEO naturally sets reg 126 low nibble when reporting a change). |
 
-- Codes 1/2/4 look like a **bitfield** (bit0/1/2). reg 24 also steps on each command (board-set
+- Codes 0x01 / 0x02 / 0x04 / 0x40 are a **bitfield** (bits 0/1/2/6). Bits 3/4/5/7 are
+  candidates for **away, turbo, continuous-fan** — to be mapped via the same
+  `clear → change → findpulse.py` loop. reg 24 also steps on each command (board-set
   command counter/flag — we don't send it).
+
+### Zone-setpoint side-channel — **reg 126.lo low nibble** (2026-05-31)
+
+The page-2 status byte at **reg 126** carries which **setpoint array** (cool vs heat) the
+controller is actively writing, in its **low nibble**. Captured patterns:
+
+- Living-HEAT change (master mode = heat): reg 126 = `0x0062` → low nibble `0x2` (heat-array)
+- Entry-HEAT change (master mode = heat):  reg 126 = `0x0002` → low nibble `0x2`
+- Gym-COOL change   (master mode = cool):  reg 126 = `0x0021` → low nibble `0x1` (cool-array)
+- Gym-COOL change   (master mode = **auto**): reg 126 = `0x0001` → low nibble `0x1` (cool-array — confirms it's array-indexed, not master-mode-indexed)
+- Random idle (any mode): reg 126 = `0x0000`, `0x0020`, `0x0060` — **low nibble `0x0`**
+
+The board uses this nibble as a "controller has a real change to commit on this array"
+indicator. The recipe is `0x01` for cool-array writes (regs 127–134) and `0x02` for
+heat-array writes (regs 135–142), regardless of master mode. Auto mode uses both arrays
+(both setpoints are visible per zone). Inject recipe (see `LOCAL-CONTROL-RECIPES.md` §4):
+
+```
+GET /inject?rules=<setpoint_reg>:<value>,126:0x000X    # X = 1 cool-array, 2 heat-array
+```
+
+Both array recipes proven via direct INJECT this session — Gym COOL across multiple values,
+Gym HEAT 24.0 → 23.5. Without the reg 126 component, the same rule left for 90+ seconds
+was ignored.
 - **Per-mode arrays exist for zone setpoints too:** like the main cool/heat stores (reg 55/56),
   zones have a **cool array (127–134)** and a **heat array (135–142)**, indexed 0=Living … 7=Z8.
-- **⚠️ Zone setpoints — UNSOLVED commit mechanism.** Changing one on the NEO showed **no reg 14
-  pulse** (confirmed clean at gap=5 ms, 0 split frames) — only the page-2 value moved (reg 127
-  cool / 135 heat). **But impersonating 0x66 and overriding that page-2 value was NOT adopted**
-  (tried both a cold jump and a clean 230→210 edge while connected — broadcast kept the board's
-  committed value). So the board neither shows a zone command nor accepts a reported zone value
-  from us. Reconciling this with "board ignores values, acts on commands": there must be a zone
-  signal we haven't found, **or** the board gates value-reads on a **freshness counter** (regs
-  22/28/35/37 advance every cycle on the real NEO; our static impersonation freezes them, so the
-  board may treat our reports as stale duplicates and never re-read them — while reg-14 command
-  *edges* are processed regardless, which is why commands work and values don't).
-  - **Ruled out:** regs **143–150** (an 8-wide per-zone page-2 block) are **live drift**, not a
-    zone-control/ownership field — across a zone-setpoint jump (reg 127 +20) they only continued
-    their slow ±1–3 downward creep (likely per-zone temp/humidity in a finer scale). And reg 24
-    (command flag) does **not** move for a zone change (stayed 4097) — confirms zones aren't a
-    command. So the "hidden zone signal" idea is dead; the asymmetry is value-read vs the board's
-    freshness gating, not a missing command.
-  - **Next-session test:** advance regs 22/28/35/37 each response in the 0x66 impersonation, then
-    retry the page-2 zone override — if values then take, the freshness-counter theory holds (and
-    may also let *any* value be set without a pulse). Needs firmware (the override only sets fixed
-    values; we need to *increment*) + NEO online to cache templates + one more NEO unplug.
-  - **Robust path for zones regardless:** **MITM** — pass through normally but rewrite the genuine
-    NEO's page-2 response (reg 127–134/135–142) in-flight; it carries the NEO's real identity +
-    advancing counters, so the board commits it. 0x67 commands still cover everything else.
+- **✅ Zone setpoints — SOLVED via MITM bridge (2026-05-30 evening).** No special command
+  pulse exists; the NEO's *own* page-2 response (reg 127–134 cool / 135–142 heat) IS the commit
+  signal. The board reads the value from the NEO's response, accepts it, and broadcasts back.
+  **The earlier "0x66 impersonation rejected" + "real NEO press snaps back through the bridge"
+  symptoms were a single root cause: bridge pump latency.** The pump shared the Arduino main
+  loop with HTTP / WiFi / OTA / mDNS work; any stall of >~3 ms during a 253-byte forwarded
+  response inserted a >t3.5 idle gap on the destination wire (the peer's TX FIFO drains to
+  empty in ~1 ms at 9600 baud, so even short stalls leak through). The board treats >t3.5 as
+  premature frame-end → drops the NEO's response on CRC. Visible in the capture as split
+  frames with 6 ms+ inter-byte gaps (e.g. `B 27` 16-byte fragment + `B 28` 237-byte fragment).
+  - **Fix:** `bridgeTask()` in `src/main.cpp` — pumpCapture() on a dedicated FreeRTOS task at
+    priority 5 (above the Arduino loopTask at 1, below WiFi/lwIP at 18+). Busy-loops while the
+    bus is active, vTaskDelay(1)s only when both UARTs are idle. After the fix: zero split
+    frames over a 30 s window; physical NEO presses commit and persist (board + NEO agree at
+    the new value within one broadcast cycle).
+  - **Implication for impersonation:** the prior "0x66 impersonation rejected" result is
+    actually about the same latency bug — the impersonation responses were sent from the
+    Arduino loop in tap mode too. Worth re-testing the freshness-counter theory cleanly now,
+    but for the deployed use-case it's moot: MITM passthru + inject covers zones, 0x67
+    pulse covers system controls.
+  - **Implication for INJECT mode:** the same fix applies — INJECT just adds register
+    substitution + CRC re-stamp to PASSTHRU. With the pump task pinned, INJECT timing should
+    now be solid too.
 - **Capture tip:** the pulse is a single frame — set **`gap=5000`** (`/set?gap=5000`) so a
   >3 ms mid-response pause doesn't split the frame and drop the pulse (genuine inter-message gaps
   are ≥6 ms). At gap=3000 we missed ~half the pulses to split frames.
 
-**Still to map:** on/off (off = reg 10 nibble 0 — is it a mode pulse=1?), zone enable (reg 85),
-away/turbo/continuous-fan. Then build the emulator + HA integration (local-first writes via 0x67,
-cloud demoted to fallback/telemetry).
+**Still to map:** away / turbo / continuous-fan. Then build the emulator + HA integration
+(local-first writes via MITM inject — covers all commands and is now the recommended path; 0x67
+tap is a fallback for page-1 commands when the bus isn't physically cut).
+
+### ⚠️ Commit-to-broadcast latency (2026-05-31) — **load-bearing for test methodology**
+
+**A command pulse is accepted by the board within one polling cycle, but the board's own
+broadcast can take 20–30 seconds (sometimes longer) to publish the resulting state change.**
+Observed during MITM inject tests:
+- Mode change heat → cool: board broadcast updated ~100 s after the pulse (slowest)
+- Mode change cool → off: ~30 s latency; board broadcast went `cool` → `cool+standby (bit 5)` → `off`
+- Zone enable mask change: ~6 s (one or two broadcast cycles, fastest observed)
+
+**Implication for testing**: a single rapid check after a pulse will MISS the change. Wait at
+least 5 broadcast cycles (~15 s, ideally 30+ s) before declaring a command failed. This very
+likely contaminated several of the "didn't work" observations from earlier this session — for
+example, the initial "test 1 mode change didn't commit" reading was actually just impatience;
+the same state did commit a minute later. Re-examine other "negative" results through this lens
+before treating them as protocol findings.
+
+**Implication for HA reconciliation**: don't retry / declare-failed based on a single
+post-command broadcast. The MITM bridge can confirm the pulse was emitted (B.mod++ on a
+recognised page-1) — that's a more reliable success signal than waiting for the broadcast to
+catch up. Use the broadcast only for steady-state cross-check.
 
 > Earlier pessimistic notes in git history (commissioning required / go MITM) are **superseded**
-> by this result. MITM remains a fallback but isn't needed.
+> by this result. **MITM inject is now the recommended primary path** — it covers all commands
+> including zone setpoints, with the same pulse mechanism as 0x67 tap mode for page-1 things.
 
 ## 10. Next steps (summary)
 
@@ -353,12 +436,21 @@ cloud demoted to fallback/telemetry).
    bits.
 3. ~~Make-or-break test~~ — **✅ DONE, SUCCESS** (§9): local write control via a 0x67 command pulse;
    board adopts, commits, broadcasts; NEO stays live.
-4. ~~Map command vocabulary~~ — **mostly DONE** (§9 table): mode=reg14:1, fan=2, main setpoint=4
-   (mode-independent). **Remaining (quick, page-1, NEO live):** the command codes for **on/off,
-   zone-enable, away/turbo/continuous-fan** — same clear→change→`findpulse.py` loop.
-5. **Zone-setpoint write (the hard open item):** run the **freshness-counter test** — firmware to
-   *increment* regs 22/28/35/37 each response in the 0x66 impersonation, then retry the page-2
-   zone override; if values then take, that's the unlock (else use MITM).
-6. **Build the emulator + HA integration:** firmware holds a steady 0x67 presence and fires
-   command pulses on demand (HTTP/MQTT from HA); HA writes go **local-first** via 0x67, cloud
-   demoted to fallback/telemetry. Reconcile against the broadcast. Zones via 0x66/MITM per (5).
+4. ~~Map command vocabulary~~ — **mostly DONE** (§9 table): mode=0x01 (incl. on/off via nibble 0),
+   fan=0x02, main setpoint=0x04, zone enable=0x40 — all mode-independent, all proven.
+   **Remaining (quick, page-1, NEO live):** away / turbo / continuous-fan — same
+   clear→change→`findpulse.py` loop. Codes likely fall on bits 3 / 4 / 5 / 7 (bitfield gap).
+5. ~~Zone-setpoint write~~ — **✅ DONE** (§9): MITM bridge in PASSTHRU mode with the pump on a
+   dedicated FreeRTOS task forwards NEO presses cleanly; the board accepts the value from the
+   NEO's normal page-2 response. INJECT mode (register substitution + CRC re-stamp) shares the
+   same forwarding path and works equivalently for HA-driven writes without a physical press.
+6. ~~All page-1 commands via MITM inject~~ — **✅ DONE 2026-05-31**: mode change (heat→cool→off)
+   and zone-enable mask change both verified via `/bridge?mode=inject` + `/pulse?rules=...`.
+   Same command pulse codes as 0x67 tap; the board doesn't care which slot the pulse comes from.
+   See `captures/` for the saved transition payloads.
+7. **Build the emulator + HA integration:** firmware exposes HTTP endpoints that HA hits
+   for each write. Recommended primary path: **MITM bridge inject** — `/bridge?mode=inject` +
+   `/pulse` covers all command types (mode, fan, setpoint, zone enable, zone setpoints) from
+   a single API. 0x67 tap mode is a fallback when the bus isn't physically cut. HA writes go
+   **local-first** with cloud demoted to telemetry. Reconcile against the broadcast, but
+   tolerate 20–30 s commit latency (see §9 latency note).
