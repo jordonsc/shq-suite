@@ -9,9 +9,9 @@ Six custom integrations for Home Assistant.
 | `shq_display` | WebSocket | 8765 | YAML | Nyx kiosk display control |
 | `overwatch` | gRPC | 50051 | YAML | Voice TTS and alarm control |
 | `dosa` | WebSocket | 8766 | YAML | Door controller (CNC-driven) |
+| `actron_mitm_controller` | WebSocket | 8767 | Config Flow | Actron A/C via local MITM bridge (actron-sniffer ESP32) |
 | `centurion` | HTTP REST | — | Config Flow | Centurion garage door |
 | `cfa_fire_ban` | HTTP (RSS) | — | YAML | CFA fire ban & danger ratings |
-| `actron_shq` | Cloud API | — | Config Flow | Actron air conditioning control |
 
 ## shq_display (Nyx Kiosk Control)
 
@@ -94,19 +94,28 @@ cfa_fire_ban:
 
 **Key files**: `const.py` (districts), `coordinator.py` (RSS fetch/parse), `binary_sensor.py`, `sensor.py`
 
-## actron_shq (Actron Air Conditioning)
+## actron_mitm_controller (Actron via local RS485 bridge)
 
-**Entities**: Climate (main unit + per-zone), Sensors (outdoor temp, humidity)
+**Entities**: Climate (master unit + 8 zones — zone slots 0..7; rename via the HA UI since zone names aren't on the RS485 bus).
 
-**Config**: UI config flow — OAuth2 device-code authentication
+**Config**: UI config flow — host + port (default 8767).
 
-**Communication**: Cloud API via `actron-neo-api` SDK, polled every 60s
+**Communication**: WebSocket to the `actron-sniffer` ESP32 (`ws://<host>:8767`). Push-only — server emits a full `state` snapshot on every change plus a 10 s heartbeat. Commands ack/error by client-supplied `id` with 10 s timeout.
 
-**Architecture**: `DataUpdateCoordinator` with fault-tolerant API wrapper (exponential backoff, auth retry, 60s timeout). Config stores only `refresh_token`.
+**Architecture**: `DataUpdateCoordinator` driven entirely by push (no polling). Availability flips to unavailable after 30 s without a state message.
 
-**Key files**: `api.py` (fault-tolerant wrapper), `coordinator.py` (polling), `config_flow.py` (device-code OAuth2), `climate.py` (main + zone entities), `sensor.py` (outdoor temp, humidity)
+**Reconnect logic — three layered detectors** (all needed for ESP32 OTA reboots):
+1. **WS-level keepalive** (`ping_interval=20, ping_timeout=20` in `client.connect()`). Detects silent connection death within ~40 s. **Load-bearing**: when the ESP32 reboots it doesn't send a TCP FIN, so without WS pings the client-side socket would linger open indefinitely. The server's 10 s state-push heartbeat is server→client only and doesn't help the client detect a dead server.
+2. **Connect timeout** (`CONNECT_TIMEOUT_S = 5`). Wraps `websockets.connect()` in `asyncio.wait_for` so a dead host can't hang a reconnect attempt.
+3. **Availability monitor force-reconnect**: when `_monitor_availability` sees `is_available()` go False, it calls `_schedule_reconnect(delay=0)` regardless of whether the disconnect callback fired. Belt-and-braces against keepalive missing a network blip.
 
-**Climate features**: HVAC modes (off/cool/heat/auto/fan_only), fan modes (low/medium/high/auto), target temperature. Zones support on/off and target temperature only.
+`RECONNECT_DELAY_S = 30` between attempts. `_connecting` flag in the coordinator prevents parallel connect tasks (the availability monitor and a `_reconnect_after`-driven connect could otherwise race during the 5 s connect window).
+
+**Key design point — deliberately NO optimistic state or retry loops on writes.** The firmware publishes `<field>_transitioning` values while a write is in flight; the climate entities surface `ws_transitioning if not None else ws_value` per the spec. The firmware's bridge has a 60 s `GRACE_PERIOD` for transitions to commit. (Earlier iterations used a cloud-API integration with heavy optimistic/retry machinery — see git history for `actron_shq` — that approach is no longer needed now the local control surface exists.)
+
+**Key files**: `client.py` (WebSocket + ack correlation + keepalive), `coordinator.py` (connection + dispatch + availability + reconnect), `config_flow.py` (IP+port form), `climate.py` (master + zone entities), `const.py` (timeouts).
+
+**Out of scope for this integration**: away / turbo / continuous-fan / quiet-mode toggles — these are page-1 command codes still to be mapped on the RS485 bus (see `actron-sniffer/FINDINGS.md` §7).
 
 ## HA Server Config
 
@@ -127,6 +136,12 @@ The HA server runs on `redacted.host` at `/etc/hass/`. Its config is split betwe
 For automations/scripts/scenes, edit them in the HA UI directly — they live in `automations.yaml` etc. on the server and aren't tracked here.
 
 `secrets.yaml` and the `.storage/` directory are server-side only; never overwrite them via deploy.
+
+**Deploy gotcha — orphan components**: `./setup ha` uses `rsync` without `--delete`, so removing a custom component from the repo doesn't remove it from `/etc/hass/custom_components/` on atlas. The orphan dir keeps existing `.pyc` files and `home-assistant.loader` will continue to discover the integration on each restart (just won't load it without a config entry). To fully remove a component you must (a) `sudo rm -rf /etc/hass/custom_components/<name>` on atlas, plus (b) delete the HA config entry, plus (c) clean up any orphan entities the entity registry restored. Future fix: switch `ha_deployer.py` to `rsync --delete-after` for `custom_components/`.
+
+**Deploy gotcha — HA config files owned by root**: `/etc/hass/automations.yaml`, `configuration.yaml`, etc. are owned by `root:root`, not the SSH user. Direct in-place edits via SSH need `sudo` (passwordless sudo is configured for the deploy user on atlas).
+
+**Deploy gotcha — HA REST API is partial**: `/api/config/automation/config` and `/api/config/entity_registry/*` are NOT exposed over REST. For programmatic edits to those you have to drive the WebSocket API at `/api/websocket` (auth handshake + JSON commands). Examples in this session: removed an orphan entity via `config/entity_registry/remove`, could equally update automations via `config/automation/config/{id}`.
 
 ## Home Assistant REST API
 

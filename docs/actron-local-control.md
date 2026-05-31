@@ -1,9 +1,20 @@
 # Actron A/C — Hardware & Local Control Reference
 
-Investigation into controlling the SHQ Actron air conditioner **locally**, to escape the
-unreliable cloud (`nimbus.actronair.com.au`) that the `actron_shq` HA integration depends on.
+> **Status update (2026-05-31): local control achieved by a different path.** This document
+> originally explored ICUNO-MOD Modbus as the only viable local approach. Since then we
+> reverse-engineered the NEO↔indoor RS485 bus directly (Modbus RTU 9600/8N1, proprietary
+> register layout) and built a cut-bus MITM bridge with rewrite-in-flight + CRC re-stamping.
+> See `actron-sniffer/` for the firmware, `actron-sniffer/FINDINGS.md` for the protocol
+> findings, `actron-sniffer/LOCAL-CONTROL-RECIPES.md` for the per-command write recipes,
+> and `home-assistant/custom_components/actron_mitm_controller/` for the HA integration.
+> The cloud `actron_shq` HA component has been removed (the local path covers mode, fan,
+> master setpoint, per-zone setpoints, and zone enable — only away/turbo/continuous-fan
+> remain unmapped). Most of what follows is historical context from before the breakthrough.
 
-## TL;DR
+Investigation into controlling the SHQ Actron air conditioner **locally**, to escape the
+unreliable cloud (`nimbus.actronair.com.au`).
+
+## TL;DR (historical, pre-breakthrough)
 
 - **Local whole-house control is possible** via the official **ICUNO-MOD** Modbus RS485 BMS card,
   confirmed compatible with our outdoor unit (`CRV240T`). It coexists with the NEO wall controller.
@@ -12,6 +23,7 @@ unreliable cloud (`nimbus.actronair.com.au`) that the `actron_shq` HA integratio
   that feature.
 - The NEO wall controller has **no local API** (cloud-only), and the NEO↔unit bus is RS485 running a
   **proprietary** protocol that is not reverse-engineered for this controller generation.
+  *(This last point was solved 2026-05-30/31 — see status update above.)*
 
 ## Hardware identity
 
