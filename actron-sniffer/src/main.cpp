@@ -46,6 +46,8 @@
 #include <HTTPUpdate.h>
 
 #include "bridge.h"
+#include "state.h"
+#include "ws_api.h"
 
 // ---- WiFi (baked in — throwaway experiment, LAN only) --------------------
 static const char *WIFI_SSID = "SHQ";
@@ -129,13 +131,19 @@ static uint16_t g_scramble_nonce = 0xACE0;      // seed
 // ---- MITM bridge mode (overall) ------------------------------------------
 // OFF: tap-style capture only (the original behaviour; the 0x67 emulator can run).
 //      DANGER if the bus is physically cut — the NEO and indoor board are then isolated.
-// PASSTHRU (DEFAULT): both endpoints forward received bytes to the peer's TX, no rewrites.
-//      This is the safe boot state for the MITM/cut-bus deployment. In tap-mode wiring
-//      (single transceiver, no peer to forward to) PASSTHRU is harmless — UART0 just has
-//      nothing to receive — but you'll need to /bridge?mode=off before /armwrite.
-// INJECT: same as PASSTHRU plus the rules apply to the NEO->board direction. This is the
-//      explicit "armed" state for mutating the 0x66 response in-flight.
-static bridge::StreamingBridge::Mode g_bridge_mode = bridge::StreamingBridge::PASSTHRU;
+// PASSTHRU: both endpoints forward received bytes to the peer's TX, no rewrites. Safe
+//      boot state for tap-mode operators not running the WS controller API.
+// INJECT (DEFAULT): same as PASSTHRU plus the rules apply to the NEO->board direction.
+//      Boot default for the cut-bus MITM deployment so the WS API can issue writes
+//      without an HTTP poke first. With zero rules INJECT adds ~166 ns/byte on top of
+//      PASSTHRU vs. a 1.04 ms byte window at 9600 baud — invisible in practice.
+// RESPOND: NEO is blocked entirely; firmware impersonates 0x66 to the board from loaded
+//      replay templates. Operator-driven, exits on next /bridge?mode=.
+static bridge::StreamingBridge::Mode g_bridge_mode = bridge::StreamingBridge::INJECT;
+
+// State decoded from the NEO frames the bridge has seen — published to WS clients on
+// change. Kept on the main loop's side and copied into ws_api via publishStateIfChanged.
+static state::ControllerState g_ctrl_state;
 
 // ---- 0x67 controller emulation (tap mode only) ---------------------------
 // When ARMED, answer the indoor board's `addr 03 00 02 00 7C` page-1 poll with a forged but
@@ -167,6 +175,15 @@ static bool g_replay_p1_valid = false;
 static bool g_replay_p2_valid = false;
 
 static uint16_t modbusCrc(const uint8_t *d, size_t n) { return bridge::crc16(d, n); }
+
+// Setter callback for ws_api.h — flips both endpoints' bridge instances in lock-step with
+// the global mode variable. Also force-disarms the 0x67 emulator (mutex on UART1 TX).
+static void setBridgeMode(bridge::StreamingBridge::Mode m) {
+  g_bridge_mode = m;
+  g_a.bridge.setMode(m);
+  g_b.bridge.setMode(m);
+  if (m != bridge::StreamingBridge::OFF) g_write_armed = false;
+}
 
 // Cache the latest complete, CRC-valid 0x66 response as our forged-response template (used by
 // the 0x67 emulator). Page 1 = 66 03 F8 (253 B); page 2 = 66 03 F4 (249 B).
@@ -237,6 +254,16 @@ static void flushFrame(BusEndpoint& ep, bool was_modified) {
   r.source = ep.source_tag;
   memcpy(r.data, ep.frame, r.len);
   if (ep.source_tag == 0) maybeCacheTemplates(r.data, r.len);
+
+  // State decode runs on the B (NEO) side — those are the ORIGINAL NEO bytes pre-bridge-
+  // modification, so our own pending INJECT writes don't get fed back as "the board has
+  // committed". The NEO syncs to the board's broadcast each polling cycle, so its responses
+  // here accurately reflect committed state with ~1-cycle lag.
+  if (ep.source_tag == 1) {
+    if (state::feedNeoFrame(g_ctrl_state, r.data, r.len)) {
+      ws_api::publishStateIfChanged(g_ctrl_state);
+    }
+  }
 
   ep.total_frames++;
   if (was_modified) ep.modified_frames++;
@@ -407,9 +434,17 @@ static void pumpCapture() {
 static TaskHandle_t g_bridge_task = nullptr;
 static void bridgeTask(void* /*arg*/) {
   for (;;) {
-    if (g_capture) pumpCapture();
-    if (!g_a.uart.available() && !g_b.uart.available()) {
-      vTaskDelay(1);  // bus idle: let lower-priority main loop run
+    if (g_capture) {
+      pumpCapture();
+      if (!g_a.uart.available() && !g_b.uart.available()) {
+        vTaskDelay(1);  // bus idle: let lower-priority main loop run
+      }
+    } else {
+      // Capture disabled (e.g. OTA, loopback test). pumpCapture is the only thing that
+      // drains UART RX buffers, so without it `available()` is sticky-true once any byte
+      // arrives — the previous "yield only on idle" branch would never fire and starve
+      // the priority-1 main loop. Always yield when capture is off.
+      vTaskDelay(1);
     }
   }
 }
@@ -681,9 +716,7 @@ static void handleArm() {
 static void handleDisarm() {
   g_write_armed = false;
   if (g_bridge_mode == bridge::StreamingBridge::INJECT) {
-    g_bridge_mode = bridge::StreamingBridge::PASSTHRU;
-    g_a.bridge.setMode(g_bridge_mode);
-    g_b.bridge.setMode(g_bridge_mode);
+    setBridgeMode(bridge::StreamingBridge::PASSTHRU);
   }
   String r = "# DISARMED: 0x67 emulator off, bridge mode -> ";
   r += bridgeModeStr(g_bridge_mode);
@@ -742,12 +775,7 @@ static void handleBridge() {
   else if (m == "respond")  new_mode = bridge::StreamingBridge::RESPOND;
   else { server.send(400, "text/plain", "# bad mode\n"); return; }
 
-  if (new_mode != bridge::StreamingBridge::OFF && g_write_armed) {
-    g_write_armed = false;  // mutex: only one can drive UART1 TX at a time
-  }
-  g_bridge_mode = new_mode;
-  g_a.bridge.setMode(new_mode);
-  g_b.bridge.setMode(new_mode);
+  setBridgeMode(new_mode);  // also handles 0x67 mutex
 
   String b = "# bridge mode -> " + String(bridgeModeStr(new_mode)) + "\n";
   b += "# rules (B->A direction): " + String((unsigned)g_b.bridge.ruleCount()) + "\n";
@@ -1147,11 +1175,30 @@ static void handleUpdate() {
   String url = server.arg("url");
   server.send(200, "text/plain", "# pulling firmware: " + url + "\n");
   Serial.printf("# OTA: pulling %s\n", url.c_str());
+
+  // Free the priority-1 main loop entirely for the OTA download. The bridge task at
+  // priority 5 would otherwise preempt httpUpdate on every byte arriving on either UART
+  // (more so since the boot default is INJECT now, which adds per-byte CRC work). Even
+  // with g_capture=false the task busy-spins when UART buffers fill up. Suspend it
+  // outright — the device reboots on success so no resume is needed.
   g_capture = false;
+  if (g_bridge_task != nullptr) vTaskSuspend(g_bridge_task);
+  // Drain whatever was already in the UART FIFOs so the transceivers don't sit holding
+  // a half-frame the board will reject after we come back up.
+  while (g_a.uart.available()) g_a.uart.read();
+  while (g_b.uart.available()) g_b.uart.read();
+  // Force bridge mode to OFF so any code path that runs before the reboot can't try to
+  // drive UART1 TX. Matches the long-standing CLAUDE.md recommendation for OTA reliability.
+  setBridgeMode(bridge::StreamingBridge::OFF);
+
   WiFiClient client;
   httpUpdate.rebootOnUpdate(true);
   t_httpUpdate_return r = httpUpdate.update(client, url);
+
+  // Only reached on failure — successful update reboots from inside httpUpdate.
   Serial.printf("# OTA failed (%d): %s\n", (int)r, httpUpdate.getLastErrorString().c_str());
+  setBridgeMode(bridge::StreamingBridge::INJECT);
+  if (g_bridge_task != nullptr) vTaskResume(g_bridge_task);
   g_capture = true;
 }
 
@@ -1208,14 +1255,17 @@ void setup() {
 #endif
 
   startBuses();
-  // Propagate the boot-default bridge mode to both endpoints' bridge instances. Default is
-  // PASSTHRU so the cut-bus MITM relays bytes immediately on power-up without an HTTP poke.
+  // Propagate the boot-default bridge mode to both endpoints' bridge instances. Default
+  // is INJECT so the cut-bus MITM relays bytes immediately on power-up AND the WS
+  // controller API can issue writes without an HTTP poke first. INJECT with zero rules
+  // is functionally equivalent to PASSTHRU (CRC-tracking overhead is ~166 ns/byte at
+  // 9600 baud where each byte takes 1.04 ms — invisible).
   g_a.bridge.setMode(g_bridge_mode);
   g_b.bridge.setMode(g_bridge_mode);
 
   uint32_t t0 = millis();
   while (!Serial && millis() - t0 < 1500) delay(10);
-  Serial.println("\n# Actron RS485 tool (sniffer + MITM bridge)");
+  Serial.println("\n# Actron RS485 tool (sniffer + MITM bridge + WS controller API)");
 
   connectWifi();
 
@@ -1241,6 +1291,14 @@ void setup() {
   server.on("/loadtemplate", handleLoadTemplate);
   server.begin();
 
+  // Controller WS API (Home Assistant client) — separate port from the RE HTTP API so the
+  // two surfaces don't share state machines. Spec: ACTRON-MITM-API.md.
+  ws_api::Hooks hooks{};
+  hooks.injector = &g_b.bridge;          // NEO->board direction owns the INJECT rules
+  hooks.mode_var = &g_bridge_mode;
+  hooks.set_mode = setBridgeMode;
+  ws_api::begin(8767, hooks);
+
   char st[600];
   statusLine(st, sizeof(st));
   Serial.println(st);
@@ -1254,6 +1312,7 @@ void setup() {
 void loop() {
   ArduinoOTA.handle();
   server.handleClient();
+  ws_api::loop();
   pumpConsole();
   // pumpCapture() now runs on its own FreeRTOS task — see bridgeTask().
 }

@@ -55,9 +55,10 @@ cut RS485 bus. Bytes are forwarded transparently in `passthru` mode; in `inject`
 firmware streams NEO-response bytes through `bridge::StreamingBridge`, substituting target
 register values inline and re-stamping the Modbus CRC on the fly so the indoor board sees a
 valid frame. This is the path for **per-zone setpoint writes** that 0x67/pulse can't reach.
-The streaming-CRC injector is unit-tested on the host (`pio test -e native`, 21 cases). Bridge
-and 0x67 emulator are **mutually exclusive** (both would drive UART1 TX) — switching to
-non-OFF bridge auto-disarms `/armwrite`.
+The streaming-CRC injector and the state decoder are unit-tested on the host
+(`pio test -e native`, 31 cases — 21 bridge + 10 state). Bridge and 0x67 emulator are
+**mutually exclusive** (both would drive UART1 TX) — switching to non-OFF bridge
+auto-disarms `/armwrite`.
 
 **Critical:** the byte-forwarding pump runs on a **dedicated FreeRTOS task** (`bridgeTask` in
 `src/main.cpp`, priority 5) — not the Arduino main loop. Without this, HTTP / WiFi / OTA /
@@ -69,13 +70,12 @@ task busy-loops while either UART has bytes available (forwarding without preemp
 a full Modbus burst, max ~250 ms) and only yields via `vTaskDelay(1)` during the genuine
 idle window between bursts. Don't move pumpCapture back to `loop()`.
 
-**Open:** (a) command codes for **away / turbo / continuous-fan** still to map (page-1, quick
-`findpulse.py` loop — likely on bits 3/4/5/7 of reg 14 by the bitfield pattern); (b) HA
-integration — single endpoint per command using MITM `/bridge?mode=inject` + `/pulse`,
-cloud demoted to telemetry. Firmware is receive-only unless `/armwrite` is called OR
-`/bridge?mode=` is set to a non-OFF value (TX is firmware-gated). ~~hardware bench-test of
-dual UART~~ done. ~~cut-bus tap + passthru~~ done. ~~zone-setpoint write~~ done. ~~mode / on-off /
-zone-enable via MITM~~ done.
+**Open:** command codes for **away / turbo / continuous-fan** still to map (page-1, quick
+`findpulse.py` loop — likely on bits 3/4/5/7 of reg 14 by the bitfield pattern). Firmware
+is receive-only unless `/armwrite` is called OR `/bridge?mode=` is set to a non-OFF value
+(TX is firmware-gated). ~~hardware bench-test of dual UART~~ done. ~~cut-bus tap + passthru~~ done.
+~~zone-setpoint write~~ done. ~~mode / on-off / zone-enable via MITM~~ done.
+~~HA integration~~ done — see "Controller API" below.
 
 **Saved transition payloads in `captures/`:** four `neo_response_*.md` files each containing
 the verified-first-transition page-1 + page-2 from a known user action (Living HEAT change,
@@ -94,11 +94,30 @@ holds: replayed value-only registers commit; replayed values for pulse-gated com
 don't, because the saved payload has reg 14 = 0 (no pulse). After exiting RESPOND, the NEO
 resynced to the board's broadcast on the next polling cycle.
 
-The historic OTA hangs that triggered ESP-IDF anti-brick rollback turned out to be
-transient — not reproducible after USB-flash + immediate reboot. Likely network race during
-the OTA download. If it happens again, force `g_bridge_mode = OFF` at the top of
-`handleUpdate` before calling `httpUpdate.update()` so the UARTs go fully idle during the
-flash window.
+**OTA hardening (2026-05-31)** — root cause of the historic OTA hangs identified and
+fixed. `bridgeTask` runs at priority 5; the priority-1 main loop is where `httpUpdate`
+lives. Two related bugs combined to starve the download whenever the RS485 bus was
+active:
+
+1. `bridgeTask` only called `vTaskDelay(1)` when BOTH UARTs were idle. With
+   `g_capture=false` (set by `handleUpdate`), `pumpCapture()` was skipped — but
+   `pumpCapture` is the only thing that drains the UART RX FIFOs. So as soon as one byte
+   arrived, `available()` stayed sticky-true and the task busy-spun without yielding,
+   starving the main loop entirely.
+2. `handleUpdate` set `g_capture=false` but didn't suspend the bridge task, so the
+   busy-spin above kicked in immediately.
+
+Fix in `bridgeTask`: unconditionally `vTaskDelay(1)` when `g_capture=false`. Fix in
+`handleUpdate`: `vTaskSuspend(g_bridge_task)` + drain UART FIFOs + force bridge mode
+OFF before calling `httpUpdate.update()`. This was previously masked because PASSTHRU's
+per-byte cost was tiny; flipping the boot default to INJECT (CRC tracking work per byte)
+made the starvation reproducible. Validated end-to-end: OTA under heavy bus traffic
+(B.frames=100 in flight) completed cleanly with a fresh `fw=` timestamp post-flash.
+
+Build cache gotcha: PlatformIO uses content-hash caching for `__DATE__`/`__TIME__`
+embedding. `touch src/main.cpp` is NOT enough to bump the `fw=` string in `/stats` —
+you have to change the file's content (even a comment) before a rebuild will refresh
+those macros.
 
 ## Hardware
 
@@ -196,7 +215,7 @@ ESP32-C6 needs the **pioarduino** platform fork (pinned in `platformio.ini`; bum
 | `GET /armwrite?addr=&ovr=reg:val,...&pulse=reg:val&pulsen=N&turn=<us>` | **ARM controller emulation (tap mode).** `addr` = slot to emulate (0x66/0x67/**0x68**; default 0x67; 0x66 needs the real NEO unplugged). `ovr` = persistent register overrides on the cached 0x66 template (big-endian). `pulse=reg:val` = one-shot command pulse applied to the next `pulsen` page-1 responses then reverts (e.g. `pulse=14:4` = setpoint command edge). `turn` = reply turnaround µs (default 5000, > t3.5 ≈3.65 ms). **Setpoint write:** `addr=0x67&ovr=12:220,56:220&pulse=14:4`. **Rejected (409) while `/bridge` mode != off**. |
 | `GET /disarm` | stop **mutations**: 0x67 emulator off, INJECT bridge drops to PASSTHRU. The relay itself keeps running so a cut bus stays alive. OFF stays OFF (tap-mode case). |
 | `GET /txprobe` | TX self-test on UART1: inject a poll to 0x66 and report whether it answers (rejected while bridge != off) |
-| `GET /bridge?mode=off\|passthru\|inject` | **MITM bridge mode. Default on boot: PASSTHRU** (so a cut-bus deployment relays from the moment power is applied). OFF = capture only — DANGER if the bus is physically cut. PASSTHRU = forward both ways unchanged. INJECT = forward + apply `/inject` rules to the NEO→board direction. Switching to non-OFF force-disarms `/armwrite`. |
+| `GET /bridge?mode=off\|passthru\|inject` | **MITM bridge mode. Default on boot: INJECT** — so the WS Controller API can issue writes without an HTTP poke first. With zero rules INJECT is functionally equivalent to PASSTHRU (CRC tracking adds ~166 ns/byte vs. a 1.04 ms byte window at 9600 baud — invisible). OFF = capture only — DANGER if the bus is physically cut. PASSTHRU = forward both ways unchanged. Switching to non-OFF force-disarms `/armwrite`. |
 | `GET /inject?rules=reg:val,reg:val,...` | Set the substitution rules applied to NEO→board responses (`reg` = absolute Modbus register, `val` = big-endian 16-bit value). Up to 16 rules. Only effective when bridge mode is `inject`. |
 | `GET /loopback?n=<bytes>` | **Dual-UART bench test.** Sends a deterministic pattern UART1→UART0 and UART0→UART1, reports byte integrity. With both transceivers wired in series via A↔A B↔B, expect 0 missing / 0 mismatched both ways at any n up to 1024. |
 | `GET /uartcheck` | One-byte-per-direction probe for isolating "is UART0 alive at all?" — reports own-echo and cross-bus capture for each phase. Some auto-direction modules tri-state RO during DE, so 0-byte own-echo is not necessarily a fault; trust the cross-bus column. |
@@ -208,6 +227,53 @@ Frame line: `<seq> <t_s> +<gap>us <len>: HEX...  |ascii|`
 then poll `/log?since=<seq_max>` repeatedly — each response carries the new high-water mark.
 The ring holds the most recent 128 frames (whole messages, `FRAME_MAX`=512); if a poller falls
 behind it auto-resyncs to the oldest retained frame.
+
+## Controller API (WebSockets, port 8767)
+
+Push-based client API consumed by the `actron_mitm_controller` Home Assistant integration.
+The HTTP API above is for reverse-engineering / operator control; this is the runtime
+surface for HA. See `src/ws_api.cpp` for the implementation.
+
+Connect to `ws://REDACTED-IP:8767/` — every client is auto-subscribed on connect; a full
+`state` snapshot is sent immediately, then on every state change, plus a 10 s heartbeat.
+
+Outgoing messages:
+- `{"type":"state","data":{...}}` — full snapshot (mode/fan/master_setpoint/zones[8] each
+  with current_temp + target_temp + enabled). For every controllable field there's a
+  sibling `<field>_transitioning` that holds the pending target value while a write is in
+  flight (cleared on board adoption or after `GRACE_PERIOD_MS` = 60 s).
+- `{"type":"ack","id":"<cmd_id>","status":"accepted"}` / `{"type":"error","id":"<cmd_id>",
+  "message":"..."}` — replies to a command, correlated by the client-supplied `id`.
+
+Incoming commands (all with optional `id` for ack matching):
+- `set_mode` — `value` in `off`/`cool`/`heat`/`auto`/`fan`
+- `set_fan` — `value` in `low`/`med`/`high`/`auto`
+- `set_master_setpoint` — `value` in °C (10..35, 0.1 step)
+- `set_zone_enabled` — `zone` 0..7, `value` bool
+- `set_zone_setpoint` — `zone` 0..7, `value` in °C
+
+The server keeps the bridge in INJECT mode permanently. Writes use the recipes from
+`LOCAL-CONTROL-RECIPES.md`. Pulse-style writes (mode/fan/master setpoint/zone enable)
+arm a 2-frame pulse in `StreamingBridge::setPulse` and auto-expire. Zone setpoint writes
+arm persistent INJECT rules including the reg 126 commit-signal nibble; ws_api clears
+them on board adoption or grace timeout. In AUTO master mode, zone setpoints commit in
+two phases (cool array first then heat array) so both stores stay in sync.
+
+**Concurrent-change semantics: latest-wins.** When two commands arrive on the same field
+within the transition window, the second overwrites the first (target value, deadline,
+and bridge rules all replace). One subtle bug to remember: `cmdSetZoneEnabled` builds
+the new mask by layering on top of `ze_t_.target_raw` if a transition is already active,
+NOT `current_state_.zone_enable_mask`. Without that, rapid consecutive enable commands
+silently drop the earlier bit changes (each command bases its mask on the stale bus
+state which hasn't yet seen the first commit). All other commands are naturally
+latest-wins because they replace a single target value rather than layering.
+
+**Important: the indoor board silently rejects writes to unconfigured zone slots** (e.g.
+zones 6/7 in a 6-zone system). The bridge dutifully injects the write — `B.mod` even
+increments — but the board's broadcast never reflects the change. Use real zones for
+write tests, or expose this as an error in a future revision.
+
+The HTTP API stays usable for RE work — it doesn't affect bridge state or the WS layer.
 
 ## Remote reflash (OTA)
 
@@ -245,10 +311,13 @@ push directly: `pio run -e um_tinyc6_ota -t upload`.
 
 | File | Purpose |
 |------|---------|
-| `platformio.ini` | pioarduino platform (C6), board `um_tinyc6`, USB-CDC console. Also defines `[env:native]` — host-only test runner (no board needed) for the bridge unit tests. |
-| `src/main.cpp` | capture loop (dual-UART), ring buffer (interleaved A/B with source tag), 0x67 emulator, MITM bridge pump, WiFi + HTTP server, pulse-width baud estimator |
+| `platformio.ini` | pioarduino platform (C6), board `um_tinyc6`, USB-CDC console; lib_deps for `Links2004/WebSockets` (Controller WS API) and `bblanchon/ArduinoJson` (command/state serialisation). Also defines `[env:native]` — host-only test runner for the bridge + state decoder. |
+| `src/main.cpp` | capture loop (dual-UART), ring buffer (interleaved A/B with source tag), 0x67 emulator, MITM bridge pump, WiFi + HTTP server, pulse-width baud estimator. Wires `state::feedNeoFrame` into the B-side frame-complete path and `ws_api::loop()` into the Arduino main loop. |
 | `src/bridge.h` / `src/bridge.cpp` | Pure C++ (no Arduino deps) streaming MITM bridge — frame-aware byte forwarder with inline register substitution and on-the-fly CRC re-stamping. Unit-tested on the host. |
-| `test/test_bridge/test_bridge.cpp` | Unity host-side tests for the bridge logic. 13 cases covering passthrough, injection, CRC re-stamping, multi-rule, boundary registers, mid-frame gap reset. Run with `pio test -e native`. |
+| `src/state.h` / `src/state.cpp` | Pure C++ NEO frame decoder — parses page-1/page-2 func-03 responses into a `ControllerState` struct (mode/fan/setpoints/zones/temps) per FINDINGS §7. Used by ws_api to publish state and tick transitions. Host-testable. |
+| `src/ws_api.h` / `src/ws_api.cpp` | WebSockets server on port 8767 — JSON command/state schema, transition table with per-field `*_transitioning` values, write orchestration mapping each command to the LOCAL-CONTROL-RECIPES recipes. Bridge stays in INJECT permanently; pulse rules auto-expire, persistent rules (zone setpoints) are cleared on board adoption or `GRACE_PERIOD_MS` timeout. |
+| `test/test_bridge/test_bridge.cpp` | Unity host-side tests for the bridge logic. 21 cases covering passthrough, injection, CRC re-stamping, multi-rule, boundary registers, mid-frame gap reset, pulse expiry, replay templates. Run with `pio test -e native`. |
+| `test/test_state/test_state.cpp` | Unity host-side tests for the NEO state decoder. 10 cases covering frame validation (CRC / addr / func / bytecount), page-1 + page-2 field decode, zone enable mask change, active-array setpoint helper, mode/fan name roundtrip. Run with `pio test -e native`. |
 | `WIRING.md` | step-by-step T568B pass-through tap wiring guide (tap-mode, single transceiver). The cut-bus MITM tap layout is documented in the FINDINGS / root project CLAUDE.md until it earns its own diagram. |
 | `FINDINGS.md` | **all research findings** — bus params, protocol structure, decoded fields, hardware topology; start here |
 | `MAPPING-PLAN.md` | structured plan to map the full Actron functionality + path to control |
