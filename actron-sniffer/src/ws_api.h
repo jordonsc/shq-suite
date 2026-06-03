@@ -16,10 +16,21 @@
 
 namespace ws_api {
 
-// Maximum seconds we hold a `*_transitioning` value waiting for the board to publish the
-// requested change. After this we drop the transition value and continue reporting the
-// actual board state — per the spec's GRACE_PERIOD convention.
-constexpr uint32_t GRACE_PERIOD_MS = 60000;
+// Zone-setpoint give-up deadline, applied PER COMMIT PHASE. Zone setpoints are persistent
+// INJECT rules held on every NEO response frame until the board adopts them — the continuous
+// hold IS the retry, so there's no re-fire loop here; we just wait one grace window per phase
+// before giving up. In AUTO the two phases (cool then heat) each get a fresh window, so an
+// AUTO zone setpoint can legitimately take up to 2x this before bailing.
+constexpr uint32_t ZONE_SETPOINT_GRACE_MS = 60000;
+
+// Pulse commands (mode / fan / master setpoint / zone enable) are momentary 2-frame edges —
+// if the pulse is missed the bus is left clean, so the remedy is to re-fire. When a pulse
+// lands the board re-broadcasts within ~3-6 s; a transition still unadopted after the retry
+// interval means that attempt was dropped. We re-fire every PULSE_RETRY_INTERVAL_MS up to
+// PULSE_MAX_FIRES total attempts (initial fire + retries), then give up. 6 fires x 10 s gives
+// an effective 60 s give-up window with far better odds than a single shot.
+constexpr uint32_t PULSE_RETRY_INTERVAL_MS = 10000;
+constexpr uint8_t PULSE_MAX_FIRES = 6;
 
 // Heartbeat interval — clients can use this to detect a dead connection.
 constexpr uint32_t HEARTBEAT_INTERVAL_MS = 10000;

@@ -241,7 +241,7 @@ Outgoing messages:
 - `{"type":"state","data":{...}}` — full snapshot (mode/fan/master_setpoint/zones[8] each
   with current_temp + target_temp + enabled). For every controllable field there's a
   sibling `<field>_transitioning` that holds the pending target value while a write is in
-  flight (cleared on board adoption or after `GRACE_PERIOD_MS` = 60 s).
+  flight (cleared on board adoption, or on give-up — see the write-reliability note below).
 - `{"type":"ack","id":"<cmd_id>","status":"accepted"}` / `{"type":"error","id":"<cmd_id>",
   "message":"..."}` — replies to a command, correlated by the client-supplied `id`.
 
@@ -258,6 +258,18 @@ arm a 2-frame pulse in `StreamingBridge::setPulse` and auto-expire. Zone setpoin
 arm persistent INJECT rules including the reg 126 commit-signal nibble; ws_api clears
 them on board adoption or grace timeout. In AUTO master mode, zone setpoints commit in
 two phases (cool array first then heat array) so both stores stay in sync.
+
+**Write reliability — retry vs. hold (FINDINGS-driven, see HA history analysis).** A landed
+pulse is adopted + re-broadcast by the board within ~3–6 s, consistently; a transition still
+unadopted after ~10 s means that 2-frame pulse was *dropped* (transient bus error), not slow.
+The two write classes are therefore handled differently in `tickTransitions`:
+- **Pulse commands** (mode/fan/master setpoint/zone enable): `armPulse` stores the rules and
+  fires; `tickPulse` re-fires every `PULSE_RETRY_INTERVAL_MS` (10 s) up to `PULSE_MAX_FIRES`
+  (6 total attempts) until adopted, then gives up (~60 s effective window). Re-firing is
+  idempotent (same target value/command code).
+- **Zone setpoints** (persistent INJECT): NOT retried — the rule is already held on *every*
+  response frame until adoption, so the continuous hold *is* the retry. They just wait one
+  `ZONE_SETPOINT_GRACE_MS` (60 s) window **per commit phase** before bailing (AUTO = up to 2×).
 
 **Concurrent-change semantics: latest-wins.** When two commands arrive on the same field
 within the transition window, the second overwrites the first (target value, deadline,

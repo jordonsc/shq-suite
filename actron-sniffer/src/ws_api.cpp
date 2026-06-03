@@ -61,10 +61,17 @@ uint32_t last_heartbeat_ms_ = 0;
 // they live in zsp_t_ and the rule set is recomputed each tick. In AUTO mode the
 // transition runs two phases: write cool array first, then heat array.
 
+// Max rules a single pulse needs: master setpoint in AUTO writes active SP + cool store +
+// heat store + command code = 4. Everything else uses 2.
+constexpr size_t PULSE_MAX_RULES = 4;
+
 struct PulseTransition {
   bool active = false;
   uint16_t target_raw = 0;          // mode word / fan word / setpoint raw / mask
-  uint32_t deadline_ms = 0;
+  uint32_t last_fire_ms = 0;        // when we last (re-)fired the pulse
+  uint8_t attempts = 0;             // fires so far (initial + retries), capped at PULSE_MAX_FIRES
+  bridge::Rule rules[PULSE_MAX_RULES];  // stored so tickTransitions can re-fire on a miss
+  size_t n_rules = 0;
 };
 
 struct ZoneSetpointTransition {
@@ -84,6 +91,19 @@ ZoneSetpointTransition zsp_t_[state::NUM_ZONES];
 // ---- Helpers ------------------------------------------------------------
 
 uint32_t now_ms() { return millis(); }
+
+// Arm (or replace) a pulse transition: store the rules so we can re-fire on a miss, fire the
+// first pulse now, and start the retry/attempt accounting. Latest-wins — calling this again
+// for the same field replaces the target, rules, and attempt count.
+void armPulse(PulseTransition& tr, uint16_t target_raw, const bridge::Rule* rules, size_t n) {
+  tr.active = true;
+  tr.target_raw = target_raw;
+  tr.n_rules = (n > PULSE_MAX_RULES) ? PULSE_MAX_RULES : n;
+  for (size_t i = 0; i < tr.n_rules; i++) tr.rules[i] = rules[i];
+  tr.attempts = 1;
+  tr.last_fire_ms = now_ms();
+  if (hooks_.injector != nullptr) hooks_.injector->setPulse(tr.rules, tr.n_rules, COMMAND_PULSE_FRAMES);
+}
 
 // Ensure the bridge is in INJECT mode before issuing a write. Plan §"Bridge mode" — we
 // keep it permanently in INJECT; this is a safety guard in case an operator flipped it
@@ -267,11 +287,7 @@ bool cmdSetMode(const JsonObject& cmd, const char** error_out) {
 
   uint16_t word = buildModeWord(m);
   bridge::Rule rules[2] = {{REG_MODE_WORD, word}, {REG_COMMAND_CODE, CMD_MODE}};
-  hooks_.injector->setPulse(rules, 2, COMMAND_PULSE_FRAMES);
-
-  mode_t_.active = true;
-  mode_t_.target_raw = word;
-  mode_t_.deadline_ms = now_ms() + GRACE_PERIOD_MS;
+  armPulse(mode_t_, word, rules, 2);
   return true;
 }
 
@@ -283,11 +299,7 @@ bool cmdSetFan(const JsonObject& cmd, const char** error_out) {
 
   uint16_t word = buildFanWord(f);
   bridge::Rule rules[2] = {{REG_FAN_WORD, word}, {REG_COMMAND_CODE, CMD_FAN}};
-  hooks_.injector->setPulse(rules, 2, COMMAND_PULSE_FRAMES);
-
-  fan_t_.active = true;
-  fan_t_.target_raw = word;
-  fan_t_.deadline_ms = now_ms() + GRACE_PERIOD_MS;
+  armPulse(fan_t_, word, rules, 2);
   return true;
 }
 
@@ -319,11 +331,7 @@ bool cmdSetMasterSetpoint(const JsonObject& cmd, const char** error_out) {
     rules[n++] = {REG_MAIN_HEAT_STORE, raw};
   }
   rules[n++] = {REG_COMMAND_CODE, CMD_MAIN_SETPOINT};
-  hooks_.injector->setPulse(rules, n, COMMAND_PULSE_FRAMES);
-
-  msp_t_.active = true;
-  msp_t_.target_raw = raw;
-  msp_t_.deadline_ms = now_ms() + GRACE_PERIOD_MS;
+  armPulse(msp_t_, raw, rules, n);
   return true;
 }
 
@@ -344,11 +352,7 @@ bool cmdSetZoneEnabled(const JsonObject& cmd, const char** error_out) {
   else        mask = (uint8_t)(mask & ~(1u << z));
 
   bridge::Rule rules[2] = {{REG_ZONE_ENABLE_MASK, mask}, {REG_COMMAND_CODE, CMD_ZONE_ENABLE}};
-  hooks_.injector->setPulse(rules, 2, COMMAND_PULSE_FRAMES);
-
-  ze_t_.active = true;
-  ze_t_.target_raw = mask;
-  ze_t_.deadline_ms = now_ms() + GRACE_PERIOD_MS;
+  armPulse(ze_t_, mask, rules, 2);
   return true;
 }
 
@@ -377,7 +381,7 @@ bool cmdSetZoneSetpoint(const JsonObject& cmd, const char** error_out) {
   t.needs_both = (current_state_.mode == state::Mode::Auto);
   if (current_state_.mode == state::Mode::Heat) t.phase = 1;
   else                                          t.phase = 0;
-  t.deadline_ms = now_ms() + GRACE_PERIOD_MS;
+  t.deadline_ms = now_ms() + ZONE_SETPOINT_GRACE_MS;
 
   rebuildPersistentRules();
   return true;
@@ -448,30 +452,29 @@ bool didStateAdoptZeTarget() {
   return current_state_.zone_enable_mask == (uint8_t)(ze_t_.target_raw & 0xFF);
 }
 
+// Advance one pulse transition: clear it on adoption, otherwise re-fire the stored pulse once
+// per PULSE_RETRY_INTERVAL_MS until PULSE_MAX_FIRES is exhausted, then give up.
+void tickPulse(PulseTransition& tr, bool adopted, uint32_t t) {
+  if (!tr.active) return;
+  if (adopted) { tr.active = false; return; }
+  if ((int32_t)(t - tr.last_fire_ms) < (int32_t)PULSE_RETRY_INTERVAL_MS) return;
+  if (tr.attempts >= PULSE_MAX_FIRES) {
+    tr.active = false;  // exhausted all attempts and the last window elapsed — write is lost
+    return;
+  }
+  if (hooks_.injector != nullptr) hooks_.injector->setPulse(tr.rules, tr.n_rules, COMMAND_PULSE_FRAMES);
+  tr.last_fire_ms = t;
+  tr.attempts++;
+}
+
 void tickTransitions() {
   uint32_t t = now_ms();
   bool persistent_rules_dirty = false;
 
-  if (mode_t_.active) {
-    if (didStateAdoptModeTarget() || (int32_t)(t - mode_t_.deadline_ms) >= 0) {
-      mode_t_.active = false;
-    }
-  }
-  if (fan_t_.active) {
-    if (didStateAdoptFanTarget() || (int32_t)(t - fan_t_.deadline_ms) >= 0) {
-      fan_t_.active = false;
-    }
-  }
-  if (msp_t_.active) {
-    if (didStateAdoptMspTarget() || (int32_t)(t - msp_t_.deadline_ms) >= 0) {
-      msp_t_.active = false;
-    }
-  }
-  if (ze_t_.active) {
-    if (didStateAdoptZeTarget() || (int32_t)(t - ze_t_.deadline_ms) >= 0) {
-      ze_t_.active = false;
-    }
-  }
+  tickPulse(mode_t_, didStateAdoptModeTarget(), t);
+  tickPulse(fan_t_, didStateAdoptFanTarget(), t);
+  tickPulse(msp_t_, didStateAdoptMspTarget(), t);
+  tickPulse(ze_t_, didStateAdoptZeTarget(), t);
 
   for (size_t i = 0; i < state::NUM_ZONES; i++) {
     auto& tr = zsp_t_[i];
@@ -488,7 +491,7 @@ void tickTransitions() {
       if (current_state_.zones[i].cool_setpoint_raw == tr.target_raw) {
         if (tr.needs_both) {
           tr.phase = 1;
-          tr.deadline_ms = t + GRACE_PERIOD_MS;  // fresh budget for heat phase
+          tr.deadline_ms = t + ZONE_SETPOINT_GRACE_MS;  // fresh budget for heat phase
         } else {
           tr.active = false;
         }
