@@ -11,6 +11,7 @@ Six custom integrations for Home Assistant.
 | `dosa` | WebSocket | 8766 | YAML | Door controller (CNC-driven) |
 | `actron_mitm_controller` | WebSocket | 8767 | Config Flow | Actron A/C via local MITM bridge (actron-sniffer ESP32) |
 | `centurion` | HTTP REST | — | Config Flow | Centurion garage door |
+| `somfy_sdn` | WebSocket | 8767 | Config Flow | Somfy SDN blind motors via the somfy-sdn ESP32 (one `cover` per motor) |
 | `cfa_fire_ban` | HTTP (RSS) | — | YAML | CFA fire ban & danger ratings |
 
 ## shq_display (Nyx Kiosk Control)
@@ -116,6 +117,22 @@ cfa_fire_ban:
 **Key files**: `client.py` (WebSocket + ack correlation + keepalive), `coordinator.py` (connection + dispatch + availability + reconnect), `config_flow.py` (IP+port form), `climate.py` (master + zone entities), `const.py` (timeouts).
 
 **Out of scope for this integration**: away / turbo / continuous-fan / quiet-mode toggles — these are page-1 command codes still to be mapped on the RS485 bus (see `actron-sniffer/FINDINGS.md` §7).
+
+## somfy_sdn (Somfy SDN blind motors)
+
+**Entities**: one `cover.somfy_<addr>` per motor (device class *shade*; OPEN/CLOSE/STOP/SET_POSITION). Entities are created **dynamically** as motors appear in the firmware's state payload (configured / discovered / passively observed). Per-motor `available` follows the device's `online` flag, so a single dropped motor goes unavailable without taking the whole bridge down.
+
+**Position inversion**: the firmware reports **native Somfy %** (0 = open, 100 = closed); the entity maps `current_cover_position = 100 − somfy_pct` and `set_position` sends the HA position (firmware inverts). One place only — mirror of `sdn::haToSomfy` in firmware.
+
+**Entities** (platforms: cover, button, switch, number, sensor, binary_sensor — shared base in `entity.py`). A **controller device** per ESP32 (button: Rediscover motors; switch: Bus active = ACTIVE/LISTEN; diagnostic sensors: motors-online, wire-errors) and a **per-motor device** alongside each cover holding `EntityCategory.CONFIG`/`DIAGNOSTIC` calibration entities (switch: Reversed; binary_sensor: Fault; numbers: Jog duration + Bottom limit (pulses, stateful read/write); buttons: Set top/bottom limit, Identify, Reset positions, Jog up/down — Jog fires a timed CTRL_MOVE nudge that works before limits). Devices are deletable from the UI (`async_remove_config_entry_device` forgets them on the controller). Config-category = they live on the device page, not dashboards. New motors auto-create their device when they appear in state (after a rediscover).
+
+**Services** (same ops, scriptable for automations; target `entity_id`): `somfy_sdn.move_steps {direction, pulses}`, `set_top_limit`, `set_bottom_limit`, `set_direction {reversed}`, `reset`, `identify`, `set_mode {listen|active}`. Some calibration payloads are pending a Set Pro capture (see `somfy-sdn/CLAUDE.md`).
+
+**Config / comms / reconnect**: identical pattern to `actron_mitm_controller` — push-only `DataUpdateCoordinator`, the same three-layer reconnect (`client.py`/`coordinator.py` ported near-verbatim). No optimistic state: `ack` means the command was queued; motor-confirmed state arrives via the next snapshot. Firmware: `somfy-sdn/`.
+
+**Address discovery (zeroconf, self-healing)**: unlike the Actron controller (manual IP / DHCP reservation), this integration auto-discovers the device. The firmware advertises `_somfy-sdn._tcp` with TXT `id=<MAC>`; `config_flow.async_step_zeroconf` keys the config entry on that MAC and rewrites the stored host to the current IP on every re-announcement, so a reboot onto a new DHCP lease just works — no manual IP, no router reservation. Manual host+port (default 8767) is still offered as a fallback. Verified live on the LAN.
+
+**Key files**: `client.py`, `coordinator.py`, `config_flow.py`, `cover.py` (per-motor entity + entity services), `services.yaml`, `const.py`.
 
 ## HA Server Config
 

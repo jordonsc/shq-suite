@@ -16,6 +16,15 @@ Each subdirectory has its own `CLAUDE.md` with component-specific documentation.
 
 Keep the docs concise and factual. Don't pad them out — only document what a future session would actually need to know. If you add a new top-level component, create a CLAUDE.md for it following the same style as the existing ones.
 
+## Versioning
+
+**Bump the semver on every change you flash or deploy** — it's how a running device/HA reports what it is, and how you confirm an OTA/deploy actually took:
+
+- **ESP32 firmware**: the `SOMFY_FW_VERSION` (or equivalent) macro in the component's `src/version.h` (e.g. `somfy-sdn/src/version.h`). Reported in `/stats` `fw=` and the mDNS `fw` TXT. Bumping it also forces a recompile, so the appended build date refreshes (sidesteps the `__DATE__` content-hash cache gotcha).
+- **HA custom components**: the `version` field in `custom_components/<name>/manifest.json`.
+
+Use MAJOR.MINOR.PATCH: MAJOR = breaking API/protocol change, MINOR = new back-compatible feature, PATCH = bug fix. Increment fw and HA-component versions independently (they're separate artifacts).
+
 ## Architecture Overview
 
 ```
@@ -47,7 +56,7 @@ Keep the docs concise and factual. Don't pad them out — only document what a f
 | `deploy/` | Python | SSH/rsync deployment tool for all components |
 | `shelly/` | Python | CLI for discovering and configuring Shelly smart devices |
 | `actron-sniffer/` | C++ (Arduino/PlatformIO) | RS485 sniffer + MITM bridge (ESP32-C6 / TinyC6) for the Actron NEO↔indoor protocol. Dual-purpose: HTTP RE toolkit + WebSockets Controller API on port 8767 for the `actron_mitm_controller` HA integration. |
-| `somfy-sdn/` | C++ (Arduino/PlatformIO) — **spec stage** | ESP32 controller for Somfy SDN RS485 blind motors; `actron-sniffer` design twin (HTTP debug + WS + HA `cover`). Design in [`somfy-sdn/SPEC.md`](somfy-sdn/SPEC.md); ports the SDN protocol from the separate `matter-apps` repo (`common/features/app_sdn.cpp`). No implementation yet. |
+| `somfy-sdn/` | C++ (Arduino/PlatformIO) | ESP32-C6 controller for Somfy SDN RS485 blind motors; `actron-sniffer` design twin (HTTP debug + WS:8767 + HA `cover`). Normal bus participant (not a MITM); ports the SDN protocol from the separate `matter-apps` repo (`common/features/app_sdn.cpp`). Firmware + `somfy_sdn` HA component (zeroconf-discoverable) **hardware-verified** on a TinyC6 + live motor. Design in [`somfy-sdn/SPEC.md`](somfy-sdn/SPEC.md). |
 
 ## Reference Docs
 

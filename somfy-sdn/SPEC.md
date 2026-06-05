@@ -300,6 +300,12 @@ yielding discipline applies during OTA (suspend the task, drain FIFOs, force lis
   LISTEN; nothing is sent until explicitly armed.
 - `ACTIVE` — the task may transmit: services queued commands, polls positions, runs discovery.
 
+> **As-built (2026-06-05):** the boot default was changed to **ACTIVE with an auto-discovery
+> sweep** (one on boot, then retry every 30 s while the device table is empty) so HA covers work
+> autonomously after a reboot on our single-controller bus. The conservative LISTEN default above
+> remains the correct choice the moment a competing controller shares the bus. See
+> `CLAUDE.md` → "Bus mode & discovery".
+
 **Command queue:** WS/HTTP handlers enqueue a `{target_addr, msg, payload}` job and (optionally)
 wait on an ack correlated by a job id. The task serialises all bus access — no concurrent TX.
 Retry up to `SDN_RETRY_COUNT` (3) with `SDN_RETRY_DELAY_MS` (200), as today.

@@ -1,0 +1,123 @@
+move_steps:
+  name: Move by steps
+  description: >-
+    Calibration jog — move the motor a number of pulses up or down (CTRL_MOVEOF). Used to
+    position the shade before setting a limit.
+  target:
+    entity:
+      integration: somfy_sdn
+      domain: cover
+  fields:
+    direction:
+      name: Direction
+      description: Jog direction.
+      required: true
+      selector:
+        select:
+          options:
+            - up
+            - down
+    pulses:
+      name: Pulses
+      description: Number of motor pulses to move.
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 65535
+          mode: box
+
+set_top_limit:
+  name: Set top limit
+  description: >-
+    Set the up (open) limit at the motor's current position (SET_MOTOR_LIMITS). Jog to the
+    desired top position first (this establishes the 0 reference everything else is relative to).
+  target:
+    entity:
+      integration: somfy_sdn
+      domain: cover
+
+set_bottom_limit:
+  name: Set bottom limit
+  description: >-
+    Set the down (closed) limit at the motor's current position. Jog to the desired bottom
+    position first (the top limit must be set beforehand). Or use set_bottom_limit_pulses.
+  target:
+    entity:
+      integration: somfy_sdn
+      domain: cover
+
+set_bottom_limit_pulses:
+  name: Set bottom limit (pulses)
+  description: >-
+    Set the down (closed) limit to an exact pulse count from the top (0) reference
+    (SET_MOTOR_LIMITS specified_position). Does not move the motor. The top limit is always the
+    zero reference (set at the current position), so only the bottom limit takes an absolute count.
+  target:
+    entity:
+      integration: somfy_sdn
+      domain: cover
+  fields:
+    pulses:
+      name: Pulses
+      description: Down-limit position in motor pulses from the top.
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 65535
+          mode: box
+
+set_direction:
+  name: Set rotation direction
+  description: Set the motor rotation direction (SET_MOTOR_DIRECTION); reverses open/close sense.
+  target:
+    entity:
+      integration: somfy_sdn
+      domain: cover
+  fields:
+    reversed:
+      name: Reversed
+      description: Reverse the motor rotation.
+      required: true
+      selector:
+        boolean:
+
+reset:
+  name: Reset positions
+  description: >-
+    Reset the motor's limits to factory default (SET_FACTORY_DEFAULT scope=limits). DESTRUCTIVE —
+    the motor becomes uncalibrated and needs re-commissioning (jog + set limits). Does NOT change
+    the motor's address or label.
+  target:
+    entity:
+      integration: somfy_sdn
+      domain: cover
+
+identify:
+  name: Identify (wink)
+  description: Wink the motor (CTRL_WINK) — a brief jog to confirm which physical blind this is.
+  target:
+    entity:
+      integration: somfy_sdn
+      domain: cover
+
+set_mode:
+  name: Set bus mode
+  description: >-
+    Bridge-level TX gate. LISTEN = passive sniff only (safe default, never transmits); ACTIVE =
+    the controller may drive the bus (poll + command). Required before any motor command.
+  target:
+    entity:
+      integration: somfy_sdn
+      domain: cover
+  fields:
+    mode:
+      name: Mode
+      description: listen or active.
+      required: true
+      selector:
+        select:
+          options:
+            - listen
+            - active

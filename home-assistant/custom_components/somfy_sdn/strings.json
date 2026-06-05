@@ -1,0 +1,23 @@
+{
+  "config": {
+    "flow_title": "{name}",
+    "step": {
+      "user": {
+        "title": "Somfy SDN controller",
+        "description": "Enter the controller's address. Tip: leave discovery to find it automatically instead.",
+        "data": {
+          "host": "Host (IP or somfy-sdn-XXXX.local)",
+          "port": "Port"
+        }
+      },
+      "zeroconf_confirm": {
+        "title": "Somfy SDN controller",
+        "description": "Add the Somfy SDN controller {name} ({host})?"
+      }
+    },
+    "abort": {
+      "already_configured": "This controller is already configured (its address was updated).",
+      "cannot_connect": "Discovered device was missing required information."
+    }
+  }
+}
