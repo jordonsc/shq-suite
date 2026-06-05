@@ -47,6 +47,7 @@ Keep the docs concise and factual. Don't pad them out — only document what a f
 | `deploy/` | Python | SSH/rsync deployment tool for all components |
 | `shelly/` | Python | CLI for discovering and configuring Shelly smart devices |
 | `actron-sniffer/` | C++ (Arduino/PlatformIO) | RS485 sniffer + MITM bridge (ESP32-C6 / TinyC6) for the Actron NEO↔indoor protocol. Dual-purpose: HTTP RE toolkit + WebSockets Controller API on port 8767 for the `actron_mitm_controller` HA integration. |
+| `somfy-sdn/` | C++ (Arduino/PlatformIO) — **spec stage** | ESP32 controller for Somfy SDN RS485 blind motors; `actron-sniffer` design twin (HTTP debug + WS + HA `cover`). Design in [`somfy-sdn/SPEC.md`](somfy-sdn/SPEC.md); ports the SDN protocol from the separate `matter-apps` repo (`common/features/app_sdn.cpp`). No implementation yet. |
 
 ## Reference Docs
 
