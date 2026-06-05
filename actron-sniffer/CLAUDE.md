@@ -208,18 +208,18 @@ ESP32-C6 needs the **pioarduino** platform fork (pinned in `platformio.ini`; bum
 | `GET /` | help + status |
 | `GET /stats` | one-line status incl. `seq_max` |
 | `GET /log?since=<seq>&n=<max>` | frames; `since` returns only newer ones (incremental polling) |
-| `GET /set?baud=&parity=N\|E\|O&gap=<us>` | change capture settings live |
+| `POST /set?baud=&parity=N\|E\|O&gap=<us>` | change capture settings live |
 | `GET /measure` | estimate baud from raw line pulse widths (~5s; needs bus activity) |
-| `GET /clear` | reset ring + counters |
-| `GET /update?url=<bin>` | **HTTP-pull OTA** — download firmware from a URL and self-flash (see Remote reflash) |
-| `GET /armwrite?addr=&ovr=reg:val,...&pulse=reg:val&pulsen=N&turn=<us>` | **ARM controller emulation (tap mode).** `addr` = slot to emulate (0x66/0x67/**0x68**; default 0x67; 0x66 needs the real NEO unplugged). `ovr` = persistent register overrides on the cached 0x66 template (big-endian). `pulse=reg:val` = one-shot command pulse applied to the next `pulsen` page-1 responses then reverts (e.g. `pulse=14:4` = setpoint command edge). `turn` = reply turnaround µs (default 5000, > t3.5 ≈3.65 ms). **Setpoint write:** `addr=0x67&ovr=12:220,56:220&pulse=14:4`. **Rejected (409) while `/bridge` mode != off**. |
-| `GET /disarm` | stop **mutations**: 0x67 emulator off, INJECT bridge drops to PASSTHRU. The relay itself keeps running so a cut bus stays alive. OFF stays OFF (tap-mode case). |
-| `GET /txprobe` | TX self-test on UART1: inject a poll to 0x66 and report whether it answers (rejected while bridge != off) |
-| `GET /bridge?mode=off\|passthru\|inject` | **MITM bridge mode. Default on boot: INJECT** — so the WS Controller API can issue writes without an HTTP poke first. With zero rules INJECT is functionally equivalent to PASSTHRU (CRC tracking adds ~166 ns/byte vs. a 1.04 ms byte window at 9600 baud — invisible). OFF = capture only — DANGER if the bus is physically cut. PASSTHRU = forward both ways unchanged. Switching to non-OFF force-disarms `/armwrite`. |
-| `GET /inject?rules=reg:val,reg:val,...` | Set the substitution rules applied to NEO→board responses (`reg` = absolute Modbus register, `val` = big-endian 16-bit value). Up to 16 rules. Only effective when bridge mode is `inject`. |
-| `GET /loopback?n=<bytes>` | **Dual-UART bench test.** Sends a deterministic pattern UART1→UART0 and UART0→UART1, reports byte integrity. With both transceivers wired in series via A↔A B↔B, expect 0 missing / 0 mismatched both ways at any n up to 1024. |
-| `GET /uartcheck` | One-byte-per-direction probe for isolating "is UART0 alive at all?" — reports own-echo and cross-bus capture for each phase. Some auto-direction modules tri-state RO during DE, so 0-byte own-echo is not necessarily a fault; trust the cross-bus column. |
-| `GET /blink` | Visual diagnostic: 6 bursts of 50 bytes (≈52 ms TX each, 500 ms gap) first on UART1 then UART0. Operator confirms which transceiver TX/RX LEDs light. |
+| `POST /clear` | reset ring + counters |
+| `POST /update?url=<bin>` | **HTTP-pull OTA** — download firmware from a URL and self-flash (see Remote reflash) |
+| `POST /armwrite?addr=&ovr=reg:val,...&pulse=reg:val&pulsen=N&turn=<us>` | **ARM controller emulation (tap mode).** `addr` = slot to emulate (0x66/0x67/**0x68**; default 0x67; 0x66 needs the real NEO unplugged). `ovr` = persistent register overrides on the cached 0x66 template (big-endian). `pulse=reg:val` = one-shot command pulse applied to the next `pulsen` page-1 responses then reverts (e.g. `pulse=14:4` = setpoint command edge). `turn` = reply turnaround µs (default 5000, > t3.5 ≈3.65 ms). **Setpoint write:** `addr=0x67&ovr=12:220,56:220&pulse=14:4`. **Rejected (409) while `/bridge` mode != off**. |
+| `POST /disarm` | stop **mutations**: 0x67 emulator off, INJECT bridge drops to PASSTHRU. The relay itself keeps running so a cut bus stays alive. OFF stays OFF (tap-mode case). |
+| `POST /txprobe` | TX self-test on UART1: inject a poll to 0x66 and report whether it answers (rejected while bridge != off) |
+| `POST /bridge?mode=off\|passthru\|inject` | **MITM bridge mode. Default on boot: INJECT** — so the WS Controller API can issue writes without an HTTP poke first. With zero rules INJECT is functionally equivalent to PASSTHRU (CRC tracking adds ~166 ns/byte vs. a 1.04 ms byte window at 9600 baud — invisible). OFF = capture only — DANGER if the bus is physically cut. PASSTHRU = forward both ways unchanged. Switching to non-OFF force-disarms `/armwrite`. |
+| `POST /inject?rules=reg:val,reg:val,...` | Set the substitution rules applied to NEO→board responses (`reg` = absolute Modbus register, `val` = big-endian 16-bit value). Up to 16 rules. Only effective when bridge mode is `inject`. |
+| `POST /loopback?n=<bytes>` | **Dual-UART bench test.** Sends a deterministic pattern UART1→UART0 and UART0→UART1, reports byte integrity. With both transceivers wired in series via A↔A B↔B, expect 0 missing / 0 mismatched both ways at any n up to 1024. |
+| `POST /uartcheck` | One-byte-per-direction probe for isolating "is UART0 alive at all?" — reports own-echo and cross-bus capture for each phase. Some auto-direction modules tri-state RO during DE, so 0-byte own-echo is not necessarily a fault; trust the cross-bus column. |
+| `POST /blink` | Visual diagnostic: 6 bursts of 50 bytes (≈52 ms TX each, 500 ms gap) first on UART1 then UART0. Operator confirms which transceiver TX/RX LEDs light. |
 
 Frame line: `<seq> <t_s> +<gap>us <len>: HEX...  |ascii|`
 
@@ -295,7 +295,7 @@ The HTTP API stays usable for RE work — it doesn't affect bridge state or the 
 Device is in the wall (off USB). ArduinoOTA (espota) is compiled in but **can't be driven from
 the WSL dev box** — WSL's NAT means the device can't connect back to it. So we use **HTTP-pull
 OTA**: a tiny file server on **atlas** (`jordonsc@REDACTED-IP`, same LAN) hosts the firmware and
-the device downloads it via `GET /update`. Proven working end-to-end.
+the device downloads it via `POST /update`. Proven working end-to-end.
 
 Start the atlas server (`~/actron-ota/`, port 8088; survives SSH disconnect, not an atlas reboot):
 ```bash
@@ -305,17 +305,18 @@ Reflash:
 ```bash
 ~/.pio-venv/bin/pio run -e um_tinyc6                                       # build
 scp actron-sniffer/.pio/build/um_tinyc6/firmware.bin atlas:actron-ota/firmware.bin
-curl "http://REDACTED-IP/update?url=http://REDACTED-IP:8088/firmware.bin"  # device pulls + reboots (~8s)
+curl -X POST "http://REDACTED-IP/update?url=http://REDACTED-IP:8088/firmware.bin"  # device pulls + reboots (~8s)
 curl http://REDACTED-IP/stats        # confirm: the fw="<build date/time>" field changed
 ```
-`/update` is unauthenticated (LAN-only experiment). From a **non-WSL** LAN host you can instead
+`/update` (and all mutating endpoints) are **POST** — `curl -X POST` (query args still parse).
+It is unauthenticated (LAN-only experiment). From a **non-WSL** LAN host you can instead
 push directly: `pio run -e um_tinyc6_ota -t upload`.
 
 ## RE workflow
 
 1. Build the pass-through tap, meter-check 12V on pins 8/7, power the TinyC6 from USB-C.
 2. `GET /measure` while triggering bus activity (change a zone setpoint in the Neo app).
-3. `GET /set?baud=<inferred>` then try `parity=N` and `parity=E` (HVAC buses are often 8E1).
+3. `POST /set?baud=<inferred>` then try `parity=N` and `parity=E` (HVAC buses are often 8E1).
 4. Correct baud/parity ⇒ stable repeating frames + low `rx_err` in `/stats`. Garbage +
    climbing `rx_err` ⇒ wrong; keep trying.
 5. Poll `/log?since=` while performing **known actions** (toggle a specific zone, nudge one

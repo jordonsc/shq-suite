@@ -10,11 +10,11 @@ All recipes assume:
 - Hardware: TinyC6 + 3.3 V auto-direction RS485 transceivers in a cut-bus tap (see `WIRING.md`)
 - Firmware: `fw="May 31 2026 00:54:45"` or newer, byte-forwarding pump on its dedicated
   FreeRTOS task (`bridgeTask`)
-- Bridge in `inject` mode (`GET /bridge?mode=inject`)
-- Rules set via `GET /inject?rules=<reg>:<val>,<reg>:<val>` (persistent) or
-  `GET /pulse?rules=<reg>:<val>,...&n=<N>` (transient, expires after N recognised B frames)
+- Bridge in `inject` mode (`POST /bridge?mode=inject`)
+- Rules set via `POST /inject?rules=<reg>:<val>,<reg>:<val>` (persistent) or
+  `POST /pulse?rules=<reg>:<val>,...&n=<N>` (transient, expires after N recognised B frames)
 
-**Restore step is implicit at the end of every recipe**: `GET /bridge?mode=passthru` to clear
+**Restore step is implicit at the end of every recipe**: `POST /bridge?mode=passthru` to clear
 all live rewrites. Inject rules persist across mode changes but only fire while mode is
 `inject`.
 
@@ -51,8 +51,8 @@ Zone index → name: 0=Living, 1=Entry, 2=Bedroom, 3=Gym+Guest, 4=Room B, 5=Room
 
 **Recipe** (transient pulse):
 ```
-GET /bridge?mode=inject
-GET /pulse?rules=10:<word>,14:0x01&n=2
+POST /bridge?mode=inject
+POST /pulse?rules=10:<word>,14:0x01&n=2
 ```
 
 **Build `<word>`** for reg 10:
@@ -69,7 +69,7 @@ GET /pulse?rules=10:<word>,14:0x01&n=2
 
 **Recipe**:
 ```
-GET /pulse?rules=11:<word>,14:0x02&n=2
+POST /pulse?rules=11:<word>,14:0x02&n=2
 ```
 
 **Build `<word>`** for reg 11:
@@ -87,7 +87,7 @@ recipe is high-confidence even though it wasn't directly retested this session.
 
 **Recipe**:
 ```
-GET /pulse?rules=12:<val>,<active_store>:<val>,14:0x04&n=2
+POST /pulse?rules=12:<val>,<active_store>:<val>,14:0x04&n=2
 ```
 
 **Values**:
@@ -106,10 +106,10 @@ This is the recipe that took the most digging — see §9 of FINDINGS for the ti
 
 **Recipe** (persistent inject, NOT pulse):
 ```
-GET /bridge?mode=inject
-GET /inject?rules=<reg>:<val>,126:<mode_bits>
+POST /bridge?mode=inject
+POST /inject?rules=<reg>:<val>,126:<mode_bits>
 … wait 10–60 s …
-GET /bridge?mode=passthru
+POST /bridge?mode=passthru
 ```
 
 **Values**:
@@ -143,7 +143,7 @@ single reg 126 = `0x000X` rule covers all of them since they all gate on the sam
 
 **Recipe** (pulse):
 ```
-GET /pulse?rules=85:<mask>,14:0x40&n=2
+POST /pulse?rules=85:<mask>,14:0x40&n=2
 ```
 
 **Values**:

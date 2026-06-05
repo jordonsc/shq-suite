@@ -15,21 +15,21 @@
 //      setpoints live — see FINDINGS §10). The 0x67 emulator is force-disarmed whenever the
 //      bridge is enabled; the two are mutually exclusive (both would drive UART1 TX).
 //
-// HTTP (port 80):
-//   GET /            help + status
-//   GET /stats       one-line status (seq_max, armed, addr, tmpl1/2, poll/tx, bridge mode)
-//   GET /log         recent frames (interleaved A/B); ?since=<seq>&n=<max>
-//   GET /set         ?baud=&parity=N|E|O&gap=<us>   change capture settings (use gap=5000)
-//   GET /measure     estimate baud from raw line pulse widths on UART1 (~5s)
-//   GET /clear       reset ring + counters
-//   GET /armwrite    ?addr=&ovr=reg:val,...&pulse=reg:val&pulsen=N&turn=us   ARM 0x67 emulator
-//   GET /disarm      back to receive-only (also disables bridge)
-//   GET /txprobe     TX self-test on UART1 (inject a poll to 0x66, report if it answers)
-//   GET /bridge      ?mode=off|passthru|inject     set MITM bridge mode (both directions)
-//   GET /inject      ?rules=reg:val,reg:val,...    set injection rules (NEO->board direction)
-//   GET /loopback    ?n=<bytes>   send a test pattern UART1 TX -> UART0 RX + UART0 TX -> UART1
+// HTTP (port 80): read-only = GET, mutating/bus-driving/OTA = POST (query args still parsed).
+//   GET  /            help + status
+//   GET  /stats       one-line status (seq_max, armed, addr, tmpl1/2, poll/tx, bridge mode)
+//   GET  /log         recent frames (interleaved A/B); ?since=<seq>&n=<max>
+//   GET  /measure     estimate baud from raw line pulse widths on UART1 (~5s)
+//   POST /set         ?baud=&parity=N|E|O&gap=<us>   change capture settings (use gap=5000)
+//   POST /clear       reset ring + counters
+//   POST /armwrite    ?addr=&ovr=reg:val,...&pulse=reg:val&pulsen=N&turn=us   ARM 0x67 emulator
+//   POST /disarm      back to receive-only (also disables bridge)
+//   POST /txprobe     TX self-test on UART1 (inject a poll to 0x66, report if it answers)
+//   POST /bridge      ?mode=off|passthru|inject     set MITM bridge mode (both directions)
+//   POST /inject      ?rules=reg:val,reg:val,...    set injection rules (NEO->board direction)
+//   POST /loopback    ?n=<bytes>   send a test pattern UART1 TX -> UART0 RX + UART0 TX -> UART1
 //                                 RX, verify byte integrity (dual-UART bench test)
-//   GET /update      ?url=<bin>   HTTP-pull OTA
+//   POST /update      ?url=<bin>   HTTP-pull OTA
 //
 // Wiring:
 //   UART1 (board side):  module RXD/DI <- GPIO16, module TXD/RO -> GPIO17, + 3V3/GND
@@ -567,26 +567,27 @@ static void handleRoot() {
   statusLine(st, sizeof(st));
   String b = "Actron RS485 sniffer + MITM bridge\n";
   b += String(st) + "\n\n";
-  b += "GET /stats              status line\n";
-  b += "GET /log?since=<seq>&n=<max>   frames (interleaved A/B, incremental)\n";
-  b += "GET /set?baud=&parity=N|E|O&gap=<us>\n";
-  b += "GET /measure            estimate baud from UART1 line pulses (~5s)\n";
-  b += "GET /clear              reset ring + counters\n";
-  b += "GET /armwrite?ovr=reg:val,...   ARM 0x67 emulator (tap mode, requires bridge=off)\n";
-  b += "GET /disarm             stop mutations: 0x67 emulator off, INJECT->PASSTHRU\n";
-  b += "GET /txprobe            TX self-test on UART1 (requires bridge=off)\n";
-  b += "GET /bridge?mode=off|passthru|inject|respond   MITM bridge mode (default: passthru)\n";
+  b += "GET  /stats              status line\n";
+  b += "GET  /log?since=<seq>&n=<max>  frames (interleaved A/B, incremental)\n";
+  b += "GET  /measure            estimate baud from UART1 line pulses (~5s)\n";
+  b += "POST /set?baud=&parity=N|E|O&gap=<us>\n";
+  b += "POST /clear              reset ring + counters\n";
+  b += "POST /armwrite?ovr=reg:val,...  ARM 0x67 emulator (tap mode, requires bridge=off)\n";
+  b += "POST /disarm             stop mutations: 0x67 emulator off, INJECT->PASSTHRU\n";
+  b += "POST /txprobe            TX self-test on UART1 (requires bridge=off)\n";
+  b += "POST /bridge?mode=off|passthru|inject|respond  MITM bridge mode (default: passthru)\n";
   b += "                                        respond = block NEO, impersonate 0x66 to board from loaded templates\n";
-  b += "GET /inject?rules=reg:val,...          NEO->board substitution rules (persistent)\n";
-  b += "GET /pulse?rules=reg:val,...&n=<N>     transient rules for next N recognised B frames\n";
-  b += "GET /snapshot                          freeze the last 0x66 page1+page2 (with CRC) as replay templates\n";
-  b += "GET /replay?on=0|1                     byte-for-byte playback of snapshot (no CRC recompute)\n";
-  b += "GET /loadtemplate?page=1|2&hex=<bytes> load saved payload into replay template (data + CRC, no header)\n";
-  b += "GET /scramble?reg=<n>&on=0|1           per-frame nonce rewrite on reg (commit-gate test)\n";
-  b += "GET /loopback?n=<bytes>                dual-UART bench: 256/1024-byte pattern + verify\n";
-  b += "GET /uartcheck                         1-byte per-direction probe (diagnostic)\n";
-  b += "GET /blink                             6x 50-byte bursts each UART, watch the LEDs\n";
-  b += "GET /update?url=<bin>                  HTTP-pull OTA\n";
+  b += "POST /inject?rules=reg:val,...         NEO->board substitution rules (persistent)\n";
+  b += "POST /pulse?rules=reg:val,...&n=<N>    transient rules for next N recognised B frames\n";
+  b += "POST /snapshot                         freeze the last 0x66 page1+page2 (with CRC) as replay templates\n";
+  b += "POST /replay?on=0|1                    byte-for-byte playback of snapshot (no CRC recompute)\n";
+  b += "POST /loadtemplate?page=1|2&hex=<bytes> load saved payload into replay template (data + CRC, no header)\n";
+  b += "POST /scramble?reg=<n>&on=0|1          per-frame nonce rewrite on reg (commit-gate test)\n";
+  b += "POST /loopback?n=<bytes>               dual-UART bench: 256/1024-byte pattern + verify\n";
+  b += "POST /uartcheck                        1-byte per-direction probe (diagnostic)\n";
+  b += "POST /blink                            6x 50-byte bursts each UART, watch the LEDs\n";
+  b += "POST /update?url=<bin>                 HTTP-pull OTA\n";
+  b += "\n# mutating endpoints are POST; curl -X POST (query args still work)\n";
   server.send(200, "text/plain", b);
 }
 
@@ -977,7 +978,7 @@ static void handleScramble() {
   b += "# nonce seed=0x" + String(g_scramble_nonce, HEX) + " step=0x9E37\n";
   if (g_bridge_mode != bridge::StreamingBridge::INJECT)
     b += "# NOTE: bridge mode is " + String(bridgeModeStr(g_bridge_mode)) +
-         "; scramble only takes effect once you GET /bridge?mode=inject\n";
+         "; scramble only takes effect once you POST /bridge?mode=inject\n";
   server.send(200, "text/plain", b);
 }
 
@@ -1269,26 +1270,30 @@ void setup() {
 
   connectWifi();
 
-  server.on("/", handleRoot);
-  server.on("/stats", handleStats);
-  server.on("/log", handleLog);
-  server.on("/set", handleSet);
-  server.on("/measure", handleMeasure);
-  server.on("/clear", handleClear);
-  server.on("/update", handleUpdate);
-  server.on("/armwrite", handleArm);
-  server.on("/disarm", handleDisarm);
-  server.on("/txprobe", handleTxProbe);
-  server.on("/bridge", handleBridge);
-  server.on("/inject", handleInject);
-  server.on("/loopback", handleLoopback);
-  server.on("/uartcheck", handleUartCheck);
-  server.on("/blink", handleBlink);
-  server.on("/scramble", handleScramble);
-  server.on("/pulse", handlePulse);
-  server.on("/snapshot", handleSnapshot);
-  server.on("/replay", handleReplay);
-  server.on("/loadtemplate", handleLoadTemplate);
+  // Read-only endpoints: GET. Mutating / bus-driving / OTA endpoints: POST — so they can't be
+  // triggered by browser prefetch / crawlers / caching and their params don't leak into GET logs.
+  // (POST handlers still read query-string args via server.arg(), so `curl -X POST ".../x?a=b"`
+  // works unchanged.)
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/stats", HTTP_GET, handleStats);
+  server.on("/log", HTTP_GET, handleLog);
+  server.on("/measure", HTTP_GET, handleMeasure);
+  server.on("/set", HTTP_POST, handleSet);
+  server.on("/clear", HTTP_POST, handleClear);
+  server.on("/update", HTTP_POST, handleUpdate);
+  server.on("/armwrite", HTTP_POST, handleArm);
+  server.on("/disarm", HTTP_POST, handleDisarm);
+  server.on("/txprobe", HTTP_POST, handleTxProbe);
+  server.on("/bridge", HTTP_POST, handleBridge);
+  server.on("/inject", HTTP_POST, handleInject);
+  server.on("/loopback", HTTP_POST, handleLoopback);
+  server.on("/uartcheck", HTTP_POST, handleUartCheck);
+  server.on("/blink", HTTP_POST, handleBlink);
+  server.on("/scramble", HTTP_POST, handleScramble);
+  server.on("/pulse", HTTP_POST, handlePulse);
+  server.on("/snapshot", HTTP_POST, handleSnapshot);
+  server.on("/replay", HTTP_POST, handleReplay);
+  server.on("/loadtemplate", HTTP_POST, handleLoadTemplate);
   server.begin();
 
   // Controller WS API (Home Assistant client) — separate port from the RE HTTP API so the
