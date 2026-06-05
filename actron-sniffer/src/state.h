@@ -51,6 +51,8 @@ struct ControllerState {
   uint16_t mode_word_raw = 0;            // reg 10 — keep raw so writes preserve feature bits
   uint16_t fan_word_raw = 0;             // reg 11 — keep raw so writes preserve high byte
   uint16_t main_setpoint_raw = 0;        // reg 12 (active)
+  uint16_t main_temp_raw = SENTINEL_NONE; // reg 13; 0.1 °C — indoor-unit main/return-air temp
+                                          // (board-aggregated across enabled zones; mirrors reg 17)
   uint16_t cool_main_setpoint_raw = 0;   // reg 55
   uint16_t heat_main_setpoint_raw = 0;   // reg 56
   uint8_t zone_enable_mask = 0;          // reg 85 low byte

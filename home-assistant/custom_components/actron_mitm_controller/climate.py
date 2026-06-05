@@ -123,6 +123,13 @@ class ActronMitmMaster(_Base):
         return FAN_FW_TO_HA.get(fw) if fw else None
 
     @property
+    def current_temperature(self) -> float | None:
+        # Indoor-unit main/return-air reading scraped from the bus (reg 13), published by the
+        # bridge as the master's `current_temp`. Read-only — no transition counterpart.
+        data = self.coordinator.data or {}
+        return data.get("current_temp")
+
+    @property
     def target_temperature(self) -> float | None:
         data = self.coordinator.data or {}
         return _value_with_transition(data, "master_setpoint")

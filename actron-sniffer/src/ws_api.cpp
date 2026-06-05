@@ -203,6 +203,10 @@ void buildStatePayload(JsonDocument& doc, const state::ControllerState& s) {
   if (msp_t_.active) data["master_setpoint_transitioning"] = msp_t_.target_raw / 10.0;
   else               data["master_setpoint_transitioning"] = nullptr;
 
+  // Master current temp — indoor-unit main/return-air reading (reg 13). Read-only, no
+  // transition counterpart (not a controllable field).
+  addTemp(data, "current_temp", s.main_temp_raw);
+
   // Zones
   JsonArray zones = data["zones"].to<JsonArray>();
   for (size_t i = 0; i < state::NUM_ZONES; i++) {

@@ -96,7 +96,7 @@ cfa_fire_ban:
 
 ## actron_mitm_controller (Actron via local RS485 bridge)
 
-**Entities**: Climate (master unit + 8 zones — zone slots 0..7; rename via the HA UI since zone names aren't on the RS485 bus).
+**Entities**: Climate (master unit + 8 zones — zone slots 0..7; rename via the HA UI since zone names aren't on the RS485 bus). The master exposes a current temperature (indoor-unit main/return-air reading scraped from bus reg 13, published as the master's `current_temp`), so its thermostat card shows current + setpoint like the zones do.
 
 **Config**: UI config flow — host + port (default 8767).
 

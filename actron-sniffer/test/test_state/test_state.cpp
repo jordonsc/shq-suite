@@ -151,6 +151,9 @@ void test_page1_decodes_living_heat() {
   // Active main setpoint reg 12 = 0x00EB = 23.5
   TEST_ASSERT_EQUAL_HEX16(0x00EB, s.main_setpoint_raw);
 
+  // Main/return-air temp reg 13 = 0x00D7 = 21.5 (matches the lone enabled zone here)
+  TEST_ASSERT_EQUAL_HEX16(0x00D7, s.main_temp_raw);
+
   // Cool main store reg 55 = 0x00E6 (23.0); heat main store reg 56 = 0x00EB (23.5)
   TEST_ASSERT_EQUAL_HEX16(0x00E6, s.cool_main_setpoint_raw);
   TEST_ASSERT_EQUAL_HEX16(0x00EB, s.heat_main_setpoint_raw);

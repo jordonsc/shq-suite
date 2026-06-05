@@ -238,10 +238,13 @@ Connect to `ws://REDACTED-IP:8767/` — every client is auto-subscribed on conne
 `state` snapshot is sent immediately, then on every state change, plus a 10 s heartbeat.
 
 Outgoing messages:
-- `{"type":"state","data":{...}}` — full snapshot (mode/fan/master_setpoint/zones[8] each
-  with current_temp + target_temp + enabled). For every controllable field there's a
-  sibling `<field>_transitioning` that holds the pending target value while a write is in
-  flight (cleared on board adoption, or on give-up — see the write-reliability note below).
+- `{"type":"state","data":{...}}` — full snapshot (mode/fan/master_setpoint/**current_temp**
+  + zones[8] each with current_temp + target_temp + enabled). The master's `current_temp` is
+  the indoor unit's main/return-air reading (reg 13 — board-aggregated across enabled zones,
+  matches what the NEO shows as the system current temp); read-only, no transition sibling.
+  For every controllable field there's a sibling `<field>_transitioning` that holds the
+  pending target value while a write is in flight (cleared on board adoption, or on give-up —
+  see the write-reliability note below).
 - `{"type":"ack","id":"<cmd_id>","status":"accepted"}` / `{"type":"error","id":"<cmd_id>",
   "message":"..."}` — replies to a command, correlated by the client-supplied `id`.
 

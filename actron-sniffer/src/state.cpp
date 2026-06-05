@@ -59,6 +59,11 @@ bool decodePage1(ControllerState& s, const uint8_t* data) {
   uint16_t sp = readReg(data, 12, PAGE1_START);
   if (sp != s.main_setpoint_raw) { s.main_setpoint_raw = sp; changed = true; }
 
+  // reg 13 = indoor-unit main/return-air temp (board-aggregated across enabled zones). This is
+  // what the NEO shows as the system "current temp". Mirrored at reg 17; reg 13 is canonical.
+  uint16_t mt = readReg(data, 13, PAGE1_START);
+  if (mt != s.main_temp_raw) { s.main_temp_raw = mt; changed = true; }
+
   uint16_t cool = readReg(data, 55, PAGE1_START);
   if (cool != s.cool_main_setpoint_raw) { s.cool_main_setpoint_raw = cool; changed = true; }
 
