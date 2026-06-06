@@ -132,7 +132,11 @@ cfa_fire_ban:
 
 **Address discovery (zeroconf, self-healing)**: unlike the Actron controller (manual IP / DHCP reservation), this integration auto-discovers the device. The firmware advertises `_somfy-sdn._tcp` with TXT `id=<MAC>`; `config_flow.async_step_zeroconf` keys the config entry on that MAC and rewrites the stored host to the current IP on every re-announcement, so a reboot onto a new DHCP lease just works — no manual IP, no router reservation. Manual host+port (default 8767) is still offered as a fallback. Verified live on the LAN.
 
-**Key files**: `client.py`, `coordinator.py`, `config_flow.py`, `cover.py` (per-motor entity + entity services), `services.yaml`, `const.py`.
+**Controller device naming & web link**: the controller device is named `Somfy SDN (<MAC>)` — `coordinator.mac` is seeded from the entry's MAC `unique_id` and refreshed from the WS `state.mac` field, so the name is IP-independent (doesn't churn on DHCP changes; the old `Somfy SDN (<ip>)` did). `DeviceInfo.configuration_url=http://<host>/` gives a **"Visit"** link on the device page to the firmware's HTML dashboard; it follows the self-healed IP.
+
+**MAC-keyed identity (config entry v2)**: `entity.controller_id()` returns `coordinator.controller_key` = the controller MAC (bare hex, e.g. `404cca512e64`), so every entity `unique_id` and device identifier survives a DHCP IP change — was `f"{host}:{port}"` (v1), which re-keyed/orphaned everything on an IP change. `controller_key` is fixed at coordinator init from the entry's MAC `unique_id` (falls back to `host:port` for manual entries with no discovered MAC). Identifier shapes: controller = `<mac>`, motor = `<mac>:AA:BB:CC`. `async_migrate_entry` (v1→v2, `__init__.py`) rewrites existing registry unique_ids + device identifiers in place (history/customisations preserved) and renames the IP-bearing controller entity_ids to a MAC slug (`somfy_sdn_40_4c_ca_51_2e_64_*`); motor entity_ids were already addr-based. Verified live: 3 entries migrated, 0 orphans, a renamed motor ("Gym Blinds") survived. **Bump `ConfigFlow.VERSION` + extend the migration if the identifier scheme changes again.**
+
+**Key files**: `client.py`, `coordinator.py` (`controller_key`, `_mac_norm`/`_format_mac`), `config_flow.py` (`VERSION`), `__init__.py` (`async_migrate_entry`), `entity.py` (shared bases + controller `device_info`), `cover.py` (per-motor entity + entity services), `services.yaml`, `const.py`.
 
 ## HA Server Config
 

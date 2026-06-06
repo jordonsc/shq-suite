@@ -78,7 +78,7 @@ a dedicated FreeRTOS task owning UART1, and HTTP-pull OTA. New vs Actron: a **de
 | `src/ws_api.{h,cpp}` | WebSockets controller API (port 8767). Push `state` snapshots, command/`ack`/`error`, heartbeat. Broadcasts only from the main loop (dirty-flag set by the bus task). |
 | `src/http_api.{h,cpp}` | HTTP debug API (port 80). `/stats /devices /log /errors` (GET) and `/mode /send /discover /move /forget /wifi /update /clear` (POST). `/send` is the RE workhorse. |
 | `src/version.h` | `SOMFY_FW_VERSION` semver — bump on every flash (see root CLAUDE.md → Versioning). |
-| `src/wifi_prov.{h,cpp}` | NVS creds (Arduino `Preferences`), STA connect w/ retries, SoftAP captive portal, GPIO0 button (long = wipe, short = wink all), mDNS, configured-motor loading. |
+| `src/wifi_prov.{h,cpp}` | NVS creds (Arduino `Preferences`), STA connect w/ retries, SoftAP captive portal, GPIO0 button (long = wipe, short = wink all), mDNS, configured-motor loading. Hostname/SoftAP SSID = `somfy-sdn-<XXXX>` where `XXXX` is the last 2 octets of the **STA MAC** (`esp_read_mac(ESP_MAC_WIFI_STA)`), so it matches the device's label/MAC. (Do **not** use `ESP.getEfuseMac() & 0xFFFF` — that's the shared vendor OUI; every TinyC6 came out `4C40`. getEfuseMac also returns the *base* MAC, which differs from the STA MAC on the C6.) |
 | `src/main.cpp` | Boot wiring: bus task → WiFi/provisioning → HTTP+WS (when connected). |
 | `test/test_sdn`, `test/test_devices` | Unity host tests (21 cases). `pio test -e native`. |
 | `WIRING.md` | Parallel-tap wiring (single transceiver, no terminator on a mid-bus tap). |
@@ -143,7 +143,10 @@ serves, `POST /update`, confirm the new `fw=`, then kill the SSH.
 
 | Endpoint | Purpose |
 |----------|---------|
-| `GET /` / `GET /stats` | help / status line (mode, devices, counters, fw, rssi, ip) |
+| `GET /` | human-friendly **HTML dashboard** (auto-refreshes every 3 s; polls `/stats.json` + `/devices` client-side) |
+| `GET /help` | the old text endpoint listing + status line (RE/curl workflow) |
+| `GET /stats` | status line, text (mode, devices, counters, fw, rssi, ip) — consumed by the OTA flash scripts |
+| `GET /stats.json` | controller status as JSON (fw, build, mode, hostname, ip, mac, ssid, rssi, uptime, heap, counters) — drives the dashboard |
 | `GET /devices` | JSON device table |
 | `GET /log?since=&n=` | sniffed frames (incremental, like Actron) |
 | `GET /errors?n=` | error ring (newest first) |
@@ -161,7 +164,10 @@ frames that failed checksum/parse).
 
 ## WS controller API (port 8767) — consumed by the `somfy_sdn` HA component
 
-Connect `ws://<host>:8767/`. Snapshot on connect, on change, + ~10 s heartbeat. Per-device state:
+Connect `ws://<host>:8767/`. Snapshot on connect, on change, + ~10 s heartbeat. The `state.data`
+object carries controller-level fields (`mode`, `fw`, `mac`, `hostname`, `ip`, `rssi`) — the HA
+component names the controller device off `mac` (stable across DHCP, unlike the IP) — plus a
+`devices` array. Per-device state:
 `position` (**native Somfy %**, HA inverts), `pulses` (absolute encoder count — provisioning aid,
 surfaced as a cover attribute), `moving`, `fault`, `online`, `up_limit`/`down_limit`,
 `direction` (`normal`/`reversed`). Direction is static — the bus task queries it once per device

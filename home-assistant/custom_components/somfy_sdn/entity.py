@@ -21,8 +21,12 @@ from .coordinator import SomfySdnCoordinator
 
 
 def controller_id(coordinator: SomfySdnCoordinator) -> str:
-    """Stable identifier for the controller device (one per config entry / ESP32)."""
-    return f"{coordinator.host}:{coordinator.port}"
+    """Stable identifier for the controller device (one per config entry / ESP32).
+
+    The MAC (bare hex) when known, else host:port. MAC-keyed so entity unique_ids and device
+    identifiers survive a DHCP IP change (see async_migrate_entry for the v1->v2 rename).
+    """
+    return coordinator.controller_key
 
 
 class SomfySdnControllerEntity(CoordinatorEntity[SomfySdnCoordinator]):
@@ -36,11 +40,16 @@ class SomfySdnControllerEntity(CoordinatorEntity[SomfySdnCoordinator]):
 
     @property
     def device_info(self) -> DeviceInfo:
+        # Name off the MAC (stable across DHCP changes), falling back to the host until the MAC
+        # is known. `configuration_url` gives HA a "Visit" link to the device's web dashboard;
+        # it tracks the current (self-healed) IP.
+        ident = self.coordinator.mac or self.coordinator.host
         return DeviceInfo(
             identifiers={(DOMAIN, self._cid)},
-            name=f"Somfy SDN ({self.coordinator.host})",
+            name=f"Somfy SDN ({ident})",
             manufacturer="SHQ",
             model="Somfy SDN controller",
+            configuration_url=f"http://{self.coordinator.host}/",
         )
 
     @property

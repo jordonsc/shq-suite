@@ -26,6 +26,24 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 
+def _mac_norm(raw: str | None) -> Optional[str]:
+    """Normalise a MAC to bare lowercase hex ("404cca512e64"), or None if it isn't one.
+
+    Accepts the zeroconf unique_id form ("404cca512e64") or the firmware's WiFi.macAddress()
+    form ("REDACTED-MAC"); returns None for the manual-flow unique_id ("host:port").
+    """
+    h = (raw or "").replace(":", "").lower()
+    if len(h) == 12 and all(c in "0123456789abcdef" for c in h):
+        return h
+    return None
+
+
+def _format_mac(raw: str | None) -> Optional[str]:
+    """Display form REDACTED-MAC, or None if `raw` isn't a MAC."""
+    h = _mac_norm(raw)
+    return ":".join(h[i : i + 2] for i in range(0, 12, 2)).upper() if h else None
+
+
 class SomfySdnCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Manages the WS connection and surfaces server-pushed state to entities."""
 
@@ -38,6 +56,14 @@ class SomfySdnCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self.host: str = entry.data[CONF_HOST]
         self.port: int = entry.data.get(CONF_PORT, DEFAULT_PORT)
+        # Stable controller MAC for the device name (IP-independent). Seed from the entry's
+        # unique_id (the zeroconf MAC) so the name is right before the WS connects; the live
+        # `state` payload refreshes it (and supplies it for manually-added entries).
+        self.mac: Optional[str] = _format_mac(entry.unique_id)
+        # Stable key for entity unique_ids / device identifiers — the MAC (bare hex) when known,
+        # else host:port (manual entries). Fixed for the entry's life so identifiers survive a
+        # DHCP change. Migrated from the old host:port scheme by async_migrate_entry.
+        self.controller_key: str = _mac_norm(entry.unique_id) or f"{self.host}:{self.port}"
         self.client = SomfySdnClient(self.host, self.port)
         self.client.set_state_callback(self._on_state)
         self.client.set_disconnect_callback(self._on_disconnect)
@@ -106,6 +132,9 @@ class SomfySdnCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _on_state(self, data: dict[str, Any]):
         self._last_msg_time = time.time()
+        mac = _format_mac(data.get("mac"))
+        if mac:
+            self.mac = mac
         self.async_set_updated_data(data)
 
     async def _on_disconnect(self):

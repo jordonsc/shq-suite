@@ -1,6 +1,7 @@
 #include "http_api.h"
 
 #include <Arduino.h>
+#include <ArduinoJson.h>
 #include <HTTPUpdate.h>
 #include <WebServer.h>
 #include <WiFi.h>
@@ -71,10 +72,99 @@ String statusLine() {
   return String(buf);
 }
 
-void handleRoot() {
+// Human-friendly dashboard served at `/`. Static page; it polls /stats.json + /devices (JSON)
+// and renders client-side, so the firmware doesn't string-build HTML on every request.
+static const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Somfy SDN controller</title>
+<style>
+  :root{--bg:#0f1419;--card:#1a212b;--line:#2b3543;--fg:#e6edf3;--mut:#8b98a5;--ok:#3fb950;--bad:#f85149;--warn:#d29922;--accent:#58a6ff}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  header{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;padding:18px 20px;border-bottom:1px solid var(--line)}
+  header h1{font-size:18px;margin:0;font-weight:600}
+  header .host{color:var(--accent);font-family:ui-monospace,monospace}
+  header .fw{color:var(--mut);font-size:12px;margin-left:auto}
+  main{padding:20px;max-width:1000px;margin:0 auto}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(175px,1fr));gap:12px;margin-bottom:22px}
+  .cell{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px 14px}
+  .cell .k{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.05em}
+  .cell .v{font-size:18px;font-weight:600;margin-top:2px;font-family:ui-monospace,monospace;word-break:break-all}
+  .badge{display:inline-block;padding:2px 9px;border-radius:99px;font-size:12px;font-weight:600}
+  .b-ok{background:rgba(63,185,80,.15);color:var(--ok)} .b-bad{background:rgba(248,81,73,.15);color:var(--bad)}
+  .b-warn{background:rgba(210,153,34,.15);color:var(--warn)} .b-mut{background:rgba(139,152,165,.15);color:var(--mut)}
+  h2{font-size:13px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);margin:0 0 10px}
+  table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+  th,td{padding:10px 12px;text-align:left;border-bottom:1px solid var(--line);font-family:ui-monospace,monospace;font-size:13px}
+  th{color:var(--mut);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.05em;font-family:system-ui}
+  tr:last-child td{border-bottom:none}
+  .muted{color:var(--mut)} .empty{color:var(--mut);padding:18px;text-align:center}
+  footer{padding:14px 20px;color:var(--mut);font-size:12px;border-top:1px solid var(--line);text-align:center}
+  footer a{color:var(--accent);text-decoration:none}
+  .dim{opacity:.45}
+</style></head>
+<body>
+<header>
+  <h1>Somfy&nbsp;SDN <span class="host" id="host">…</span></h1>
+  <span id="mode"></span>
+  <span class="fw" id="fw"></span>
+</header>
+<main>
+  <div class="grid" id="stats"></div>
+  <h2>Motors</h2>
+  <div id="motors"><div class="empty">loading…</div></div>
+</main>
+<footer>auto-refreshing every 3&nbsp;s · <a href="/help">raw endpoints</a> · <a href="/devices">/devices</a> · <a href="/stats.json">/stats.json</a></footer>
+<script>
+const $=s=>document.querySelector(s);
+const esc=s=>String(s==null?"":s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+const cell=(k,v)=>`<div class="cell"><div class="k">${k}</div><div class="v">${v}</div></div>`;
+const move=m=>m===1?"▲ up":m===2?"▼ down":"idle";
+function pos(d){ if(d.position==null) return '<span class="muted">unknown</span>';
+  return `${d.position}% <span class="muted">(${d.position==0?"open":d.position==100?"closed":"part"})</span>`; }
+async function tick(){
+  let s={},devs=[];
+  try{ s=await (await fetch("/stats.json",{cache:"no-store"})).json();
+       devs=await (await fetch("/devices",{cache:"no-store"})).json(); }
+  catch(e){ $("#mode").innerHTML='<span class="badge b-bad">offline</span>'; return; }
+  $("#host").textContent=s.hostname||s.ip||"";
+  $("#fw").textContent=`fw ${s.fw} · ${s.build}`;
+  $("#mode").innerHTML=s.mode==="active"?'<span class="badge b-ok">ACTIVE</span>':'<span class="badge b-warn">LISTEN</span>';
+  const up=(s.uptime_s||0),hh=Math.floor(up/3600),mm=Math.floor(up%3600/60);
+  $("#stats").innerHTML=[
+    cell("IP",esc(s.ip)),cell("MAC",esc(s.mac)),
+    cell("Wi-Fi",`${esc(s.ssid||"—")} <span class="muted">${s.rssi} dBm</span>`),
+    cell("Motors",`${s.online}/${s.devices} <span class="muted">online</span>`),
+    cell("WS clients",s.ws_clients),cell("Uptime",`${hh}h ${mm}m`),
+    cell("Free heap",`${Math.round((s.heap_free||0)/1024)} kB`),
+    cell("Bus traffic",`tx ${s.tx} · rx ${s.rx} · polls ${s.polls}`),
+    cell("Wire errors",(s.err&&s.err.total)?`<span class="badge b-bad">${s.err.total}</span> <span class="muted">to ${s.err.timeout} ck ${s.err.cksum} fr ${s.err.framing} nk ${s.err.nack}</span>`:'<span class="badge b-ok">0</span>'),
+  ].join("");
+  if(!devs.length){ $("#motors").innerHTML='<div class="empty">no motors registered — bus may be LISTEN, motor offline, or needs a discovery sweep</div>'; return; }
+  const rows=devs.map(d=>{
+    const lim=d.limits_known?`${d.up_limit}–${d.down_limit}`:'<span class="muted">unset</span>';
+    return `<tr class="${d.online?'':'dim'}">
+      <td>${esc(d.addr)}${d.label?` <span class="muted">${esc(d.label)}</span>`:''}</td>
+      <td>${pos(d)}</td><td>${move(d.moving)}</td>
+      <td>${esc(d.direction)}</td><td>${lim}</td>
+      <td>${d.fault?'<span class="badge b-bad">fault</span>':'<span class="badge b-ok">ok</span>'}</td>
+      <td>${d.online?'<span class="badge b-ok">online</span>':'<span class="badge b-mut">offline</span>'}</td>
+    </tr>`; }).join("");
+  $("#motors").innerHTML=`<table><thead><tr><th>Address</th><th>Position</th><th>Motion</th><th>Direction</th><th>Limits (pulses)</th><th>Fault</th><th>Link</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+tick(); setInterval(tick,3000);
+</script>
+</body></html>)HTML";
+
+void handleRoot() { g_server->send_P(200, "text/html", INDEX_HTML); }
+
+void handleHelp() {
   String b = "Somfy SDN controller\n";
   b += statusLine() + "\n\n";
-  b += "GET  /stats                       status line\n";
+  b += "GET  /                            human-friendly status dashboard (HTML)\n";
+  b += "GET  /stats                       status line (text)\n";
+  b += "GET  /stats.json                  controller status (JSON, drives the dashboard)\n";
   b += "GET  /devices                     JSON device table\n";
   b += "GET  /log?since=<seq>&n=<max>      sniffed frames (incremental)\n";
   b += "GET  /errors?n=<max>              error ring (newest first)\n";
@@ -91,6 +181,42 @@ void handleRoot() {
 }
 
 void handleStats() { g_server->send(200, "text/plain", statusLine() + "\n"); }
+
+void handleStatsJson() {
+  devices::DeviceTable& t = bus::table();
+  const bus::Stats& st = bus::stats();
+  size_t online = 0;
+  for (size_t i = 0; i < t.count(); i++) {
+    devices::Device* d = t.at(i);
+    if (d && d->online) online++;
+  }
+  JsonDocument doc;
+  doc["fw"] = SOMFY_FW_VERSION;
+  doc["build"] = __DATE__ " " __TIME__;
+  doc["mode"] = modeStr();
+  doc["hostname"] = wifi_prov::hostname();
+  doc["ip"] = WiFi.localIP().toString();
+  doc["mac"] = WiFi.macAddress();
+  doc["ssid"] = WiFi.SSID();
+  doc["rssi"] = WiFi.isConnected() ? WiFi.RSSI() : 0;
+  doc["uptime_s"] = (uint32_t)(millis() / 1000);
+  doc["heap_free"] = (uint32_t)ESP.getFreeHeap();
+  doc["devices"] = (uint32_t)t.count();
+  doc["online"] = (uint32_t)online;
+  doc["ws_clients"] = (uint32_t)ws_api::connectedClients();
+  doc["tx"] = st.tx_frames;
+  doc["rx"] = st.rx_frames;
+  doc["polls"] = st.polls;
+  JsonObject err = doc["err"].to<JsonObject>();
+  err["cksum"] = st.err_checksum;
+  err["framing"] = st.err_framing;
+  err["timeout"] = st.err_timeout;
+  err["nack"] = st.err_nack;
+  err["total"] = (uint32_t)bus::errors().total();
+  String out;
+  serializeJson(doc, out);
+  g_server->send(200, "application/json", out);
+}
 
 void handleDevices() {
   devices::DeviceTable& t = bus::table();
@@ -362,7 +488,9 @@ void handleUpdate() {
 void begin(uint16_t port) {
   g_server = new WebServer(port);
   g_server->on("/", HTTP_GET, handleRoot);
+  g_server->on("/help", HTTP_GET, handleHelp);
   g_server->on("/stats", HTTP_GET, handleStats);
+  g_server->on("/stats.json", HTTP_GET, handleStatsJson);
   g_server->on("/devices", HTTP_GET, handleDevices);
   g_server->on("/log", HTTP_GET, handleLog);
   g_server->on("/errors", HTTP_GET, handleErrors);

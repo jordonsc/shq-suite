@@ -3,12 +3,15 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <WebSocketsServer.h>
+#include <WiFi.h>
 
 #include <cstring>
 
 #include "bus.h"
 #include "devices.h"
 #include "sdn.h"
+#include "version.h"
+#include "wifi_prov.h"
 
 namespace ws_api {
 
@@ -30,6 +33,13 @@ void buildState(JsonDocument& doc) {
   doc["type"] = "state";
   JsonObject data = doc["data"].to<JsonObject>();
   data["mode"] = (bus::mode() == bus::Mode::ACTIVE) ? "active" : "listen";
+  // Controller identity/health — the HA component names the controller device off `mac` (stable
+  // across DHCP changes, unlike the IP) and surfaces fw/ip/rssi diagnostics.
+  data["fw"] = SOMFY_FW_VERSION;
+  data["mac"] = WiFi.macAddress();
+  data["hostname"] = wifi_prov::hostname();
+  data["ip"] = WiFi.localIP().toString();
+  data["rssi"] = WiFi.isConnected() ? WiFi.RSSI() : 0;
 
   JsonArray arr = data["devices"].to<JsonArray>();
   devices::DeviceTable& t = bus::table();

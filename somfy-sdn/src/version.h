@@ -7,4 +7,4 @@
 //   MAJOR — breaking WS/HTTP API or protocol change
 //   MINOR — new feature / capability (back-compatible)
 //   PATCH — bug fix / internal change
-#define SOMFY_FW_VERSION "1.1.0"
+#define SOMFY_FW_VERSION "1.1.4"

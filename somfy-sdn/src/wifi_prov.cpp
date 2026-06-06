@@ -6,6 +6,7 @@
 #include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <esp_mac.h>
 
 #include <cstring>
 
@@ -41,8 +42,14 @@ bool g_btn_down = false;
 uint32_t g_btn_down_ms = 0;
 
 void computeHostname() {
-  uint32_t id = (uint32_t)(ESP.getEfuseMac() & 0xFFFF);
-  snprintf(g_hostname, sizeof(g_hostname), "somfy-sdn-%04X", (unsigned)id);
+  // Suffix from the last 2 octets of the WiFi STA MAC — the unique NIC-specific bytes, and the
+  // same MAC `WiFi.macAddress()`/HA report, so the hostname matches the device's label/MAC.
+  // (The earlier bug masked the low 16 bits of ESP.getEfuseMac(), which are the shared vendor
+  // OUI -> every TinyC6 resolved to "4C40". getEfuseMac() also returns the *base* MAC, which on
+  // the C6 differs from the STA MAC, so we read ESP_MAC_WIFI_STA explicitly for consistency.)
+  uint8_t mac[6] = {0};
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  snprintf(g_hostname, sizeof(g_hostname), "somfy-sdn-%02X%02X", mac[4], mac[5]);
 }
 
 bool readCreds(String& ssid, String& pass) {

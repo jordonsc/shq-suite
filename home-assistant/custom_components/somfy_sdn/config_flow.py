@@ -25,7 +25,7 @@ from .const import CONF_HOST, CONF_PORT, DEFAULT_PORT, DOMAIN
 class SomfySdnConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Manual + zeroconf config flow."""
 
-    VERSION = 1
+    VERSION = 2  # v2: entity unique_ids / device identifiers keyed on MAC (was host:port)
 
     def __init__(self) -> None:
         self._host: str | None = None
