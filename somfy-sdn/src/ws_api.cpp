@@ -236,6 +236,14 @@ void handleCommand(uint8_t client, JsonDocument& doc) {
     sendAck(client, id);
     return;
   }
+  if (strcmp(command, "reconnect_wifi") == 0) {
+    // Ack first; wifi_prov drops + re-scans from loop() once this reply has flushed. The link
+    // bounce drops this WS connection — the HA coordinator reconnects (heartbeat-reaped) and the
+    // next snapshot carries the new rssi.
+    sendAck(client, id);
+    wifi_prov::requestReconnectBestAp();
+    return;
+  }
 
   if (handleMotorCommand(command, obj, &err)) {
     sendAck(client, id);
@@ -267,6 +275,13 @@ void begin(uint16_t port) {
   g_server = new WebSocketsServer(port);
   g_server->begin();
   g_server->onEvent(onEvent);
+  // Protocol-level ping/pong with dead-client eviction. The app-level state heartbeat below is a
+  // data push, not a liveness probe — it can't detect a half-open socket. On a marginal WiFi link
+  // (e.g. a weak-signal motor) a dropped association leaves the client's TCP connection half-open
+  // with no FIN; without this the zombie lingers until lwIP's retransmit timeout (minutes), during
+  // which writes to it stall the WS service loop and new connections can't be served. Ping every
+  // 15 s, expect a pong within 5 s, disconnect after 2 consecutive misses (~30 s to reap).
+  g_server->enableHeartbeat(15000, 5000, 2);
   g_last_heartbeat_ms = millis();
 }
 

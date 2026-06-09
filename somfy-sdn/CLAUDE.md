@@ -13,7 +13,7 @@ platform), same HTTP debug + WS controller + HTTP-pull OTA ergonomics, same OTA 
 discipline, same host-test discipline for the pure-C++ core.
 
 **Status:** firmware + HA component implemented and **hardware-verified on a TinyC6 + live
-motor (2026-06-05)**. Pure-C++ core host-unit-tested (`pio test -e native`, 21 cases). Full
+motor (2026-06-05)**. Pure-C++ core host-unit-tested (`pio test -e native`, 22 cases). Full
 design rationale: [`SPEC.md`](SPEC.md).
 
 **Hardware bring-up results (bench, motor `16:5A:AB`, MAC `404cca512e64`):**
@@ -62,6 +62,13 @@ boundary (the firmware applies the inverse for `set_position`). Read motor posit
 `POST_MOTOR_POSITION data[2]` directly (the percent byte) — do **not** recompute from pulses
 (the position-reporting fix carried from the matter-apps commit).
 
+**Spurious-percent guard (fw 1.1.5):** `devices.cpp applyPosition` suppresses a percent change when
+the motor is **idle** and the encoder `pulses` count is **unchanged** — a stationary blind with a
+frozen encoder physically cannot have moved, so a changed percent byte is a glitch. This kills a
+field-observed flap where the motor momentarily reports `percent=100` (HA cover slams *closed* then
+*open* ~30 s later) while pulses stay put. It only suppresses on an exact pulse match, so a real
+move (which always advances the encoder) is never affected. Unit-tested in `test_devices`.
+
 ## Architecture / files
 
 Two surfaces like Actron: an HTTP API for RE/operator use, a WS API as the HA runtime surface,
@@ -75,12 +82,12 @@ a dedicated FreeRTOS task owning UART1, and HTTP-pull OTA. New vs Actron: a **de
 | `src/errlog.{h,cpp}` | **Pure C++.** Bounded ring buffer (128) of wire/protocol events + per-class counters. Host-tested. |
 | `src/devices.{h,cpp}` | **Pure C++.** Device table keyed by node addr — registration, position/limit application, stall + fault detection, comms-loss sweep. Host-tested. (This is the firmware's state model; there is intentionally no separate `state.cpp` — the table *is* the snapshot, serialised in `ws_api`/`http_api`.) |
 | `src/bus.{h,cpp}` | Arduino. The **only** code touching UART1. FreeRTOS task: LISTEN/ACTIVE TX gate, command queue + raw request/response, retry, polling cadence, passive sniffing → device table + sniffer ring + errlog, OTA teardown. |
-| `src/ws_api.{h,cpp}` | WebSockets controller API (port 8767). Push `state` snapshots, command/`ack`/`error`, heartbeat. Broadcasts only from the main loop (dirty-flag set by the bus task). |
-| `src/http_api.{h,cpp}` | HTTP debug API (port 80). `/stats /devices /log /errors` (GET) and `/mode /send /discover /move /forget /wifi /update /clear` (POST). `/send` is the RE workhorse. |
+| `src/ws_api.{h,cpp}` | WebSockets controller API (port 8767). Push `state` snapshots, command/`ack`/`error`, heartbeat. Broadcasts only from the main loop (dirty-flag set by the bus task). **Protocol-level ping/pong with dead-client eviction is enabled in `begin()` (`enableHeartbeat(15000,5000,2)`)** — the app-level state push is a data broadcast, not a liveness probe, so without this a half-open client left by a WiFi blip (no TCP FIN) lingers until lwIP's retransmit timeout (minutes), stalling the WS service loop and blocking new handshakes. That was the root cause of multi-minute HA `unavailable` stretches on weak-signal motors (port-80 HTTP stays responsive throughout, masking it). Fixed in fw 1.1.5. |
+| `src/http_api.{h,cpp}` | HTTP debug API (port 80). `/stats /devices /log /errors` (GET) and `/mode /send /discover /move /forget /wifi /reconnect /update /clear` (POST). `/send` is the RE workhorse. |
 | `src/version.h` | `SOMFY_FW_VERSION` semver — bump on every flash (see root CLAUDE.md → Versioning). |
-| `src/wifi_prov.{h,cpp}` | NVS creds (Arduino `Preferences`), STA connect w/ retries, SoftAP captive portal, GPIO0 button (long = wipe, short = wink all), mDNS, configured-motor loading. Hostname/SoftAP SSID = `somfy-sdn-<XXXX>` where `XXXX` is the last 2 octets of the **STA MAC** (`esp_read_mac(ESP_MAC_WIFI_STA)`), so it matches the device's label/MAC. (Do **not** use `ESP.getEfuseMac() & 0xFFFF` — that's the shared vendor OUI; every TinyC6 came out `4C40`. getEfuseMac also returns the *base* MAC, which differs from the STA MAC on the C6.) |
+| `src/wifi_prov.{h,cpp}` | NVS creds (Arduino `Preferences`), STA connect w/ retries, SoftAP captive portal, GPIO0 button (long = wipe, short = wink all), mDNS, configured-motor loading. **STA connect uses `WIFI_ALL_CHANNEL_SCAN` + `WIFI_CONNECT_AP_BY_SIGNAL`** (not the Arduino-default `WIFI_FAST_SCAN`, which joins the *first* matching BSSID — often a cached distant AP — and sticks there with no roaming), so every (re)connect joins the **strongest** AP for the SSID; a reboot/OTA now lands on the nearest AP. The stack has no live roaming once associated, so `requestReconnectBestAp()` (HTTP `POST /reconnect` / WS `reconnect_wifi` / HA button) forces an on-demand re-scan + reassociate — deferred to `loop()` so the ack flushes before the link drops. Hostname/SoftAP SSID = `somfy-sdn-<XXXX>` where `XXXX` is the last 2 octets of the **STA MAC** (`esp_read_mac(ESP_MAC_WIFI_STA)`), so it matches the device's label/MAC. (Do **not** use `ESP.getEfuseMac() & 0xFFFF` — that's the shared vendor OUI; every TinyC6 came out `4C40`. getEfuseMac also returns the *base* MAC, which differs from the STA MAC on the C6.) |
 | `src/main.cpp` | Boot wiring: bus task → WiFi/provisioning → HTTP+WS (when connected). |
-| `test/test_sdn`, `test/test_devices` | Unity host tests (21 cases). `pio test -e native`. |
+| `test/test_sdn`, `test/test_devices` | Unity host tests (22 cases). `pio test -e native`. |
 | `WIRING.md` | Parallel-tap wiring (single transceiver, no terminator on a mid-bus tap). |
 
 ### Concurrency / OTA (carried from the Actron brick fix)
@@ -156,6 +163,7 @@ serves, `POST /update`, confirm the new `fw=`, then kill the SSH.
 | `POST /move?addr=&cmd=open\|close\|stop\|pos\|jogup\|jogdown&value=` | convenience control (jog = timed CTRL_MOVE) |
 | `POST /forget?addr=` | remove a motor from the device table |
 | `POST /wifi?ssid=&password=` | set creds, reboot |
+| `POST /reconnect` | re-scan all channels + reassociate to the strongest AP (no reboot) |
 | `POST /update?url=` | HTTP-pull OTA |
 | `POST /clear` | reset ring buffers + counters |
 
@@ -177,7 +185,9 @@ surfaced as a cover attribute), `moving`, `fault`, `online`, `up_limit`/`down_li
 commissioning) `move_steps{direction,pulses}` (post-cal) `set_top_limit` `set_bottom_limit`
 `set_bottom_limit_pulses{pulses}` (absolute, specified_position) `set_direction{reversed}`
 `reset` (limits) `identify` `forget` (all carry `addr`); admin:
-`set_mode{mode}` `rediscover`. Replies: `{type:"ack",id}` / `{type:"error",id,message}`.
+`set_mode{mode}` `rediscover` `reconnect_wifi` (re-scan + reassociate to the strongest AP; bounces
+the link, so this WS connection drops and the coordinator reconnects). Replies:
+`{type:"ack",id}` / `{type:"error",id,message}`.
 `ack` = command accepted into the queue — there is **no optimistic state**; motor-confirmed
 state arrives via the next snapshot.
 
@@ -190,8 +200,9 @@ Deploy via `./setup ha` (+ `--restart`).
 
 **Entities** (platforms: `cover`, `button`, `switch`, `number`, `sensor`, `binary_sensor`; shared
 base + dynamic per-motor add in `entity.py`). Two device kinds:
-- **Controller device** (one per ESP32): `button` Rediscover motors, `switch` Bus active
-  (ACTIVE/LISTEN), diagnostic `sensor`s motors-online + wire-errors.
+- **Controller device** (one per ESP32): `button`s Rediscover motors + Reconnect WiFi (re-scan +
+  reassociate to the strongest AP), `switch` Bus active (ACTIVE/LISTEN), diagnostic `sensor`s
+  motors-online + wire-errors.
 - **Per-motor device** (one per discovered motor): `cover` (shade) + calibration entities, all
   `EntityCategory.CONFIG`/`DIAGNOSTIC` so they sit on the device page, not dashboards — `switch`
   Reversed (stateful), `binary_sensor` Fault, `number` Jog duration (RestoreNumber, stored in

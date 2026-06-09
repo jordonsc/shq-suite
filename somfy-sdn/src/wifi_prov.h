@@ -33,6 +33,12 @@ bool saveCredentials(const char* ssid, const char* password);
 // Wipe WiFi creds (+ configured motors) and reboot into the portal.
 void factoryWipe();
 
+// Request a manual WiFi reconnect: drops the STA link and re-scans all channels to reassociate to
+// the strongest AP for the SSID. Deferred to loop() so the calling HTTP/WS ack flushes first.
+// Use after an AP that was offline at boot comes back, to move off a distant fallback AP. The
+// Arduino stack has no live roaming, so this on-demand trigger is how a controller re-evaluates.
+void requestReconnectBestAp();
+
 // Load the configured motor addresses ("AA:BB:CC,...") from NVS and register them with the
 // bus device table (CONFIGURED source). Called by main after bus::begin().
 void loadConfiguredMotors();

@@ -41,6 +41,10 @@ DNSServer* g_dns = nullptr;
 bool g_btn_down = false;
 uint32_t g_btn_down_ms = 0;
 
+// Set by requestReconnectBestAp() (HTTP/WS handler context) and serviced from loop(), so the
+// HTTP/WS ack flushes before we drop the link to re-scan.
+bool g_reconnect_requested = false;
+
 void computeHostname() {
   // Suffix from the last 2 octets of the WiFi STA MAC — the unique NIC-specific bytes, and the
   // same MAC `WiFi.macAddress()`/HA report, so the hostname matches the device's label/MAC.
@@ -65,6 +69,15 @@ bool tryConnect(const String& ssid, const String& pass) {
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(g_hostname);
   WiFi.setSleep(false);
+  // Pick the STRONGEST AP for the SSID, not the first one found. The Arduino default is
+  // WIFI_FAST_SCAN, which associates to the first matching BSSID that clears the RSSI threshold
+  // (often the previously-cached AP), so a device near a strong AP but cached onto a distant one
+  // stays stuck on the distant one across reboots. All-channel scan + sort-by-signal makes every
+  // (re)connect evaluate all APs and join the strongest — so a reboot/manual reconnect actually
+  // moves to the nearest AP. The Arduino WiFi stack has no live roaming once associated; the WS
+  // `reconnect_wifi` admin command / HTTP `POST /reconnect` force a re-evaluation on demand.
+  WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+  WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
   for (uint8_t attempt = 0; attempt <= STA_RETRIES; attempt++) {
     Serial.printf("# WiFi connecting to \"%s\" (attempt %d)", ssid.c_str(), attempt + 1);
     WiFi.begin(ssid.c_str(), pass.c_str());
@@ -320,13 +333,35 @@ Status begin() {
   return g_status;
 }
 
+// Force a fresh all-channel scan and reassociate to the strongest AP. Runs from loop() (not the
+// HTTP/WS handler) so the ack has flushed first — dropping the link mid-response would lose it.
+// Reconnecting on the same L2 network keeps the DHCP lease (IP unchanged), so mDNS stays valid.
+void serviceReconnect() {
+  if (!g_reconnect_requested) return;
+  g_reconnect_requested = false;
+  if (g_status != Status::CONNECTED) return;  // only meaningful in STA mode
+  String ssid, pass;
+  if (!readCreds(ssid, pass)) return;
+  Serial.printf("# WiFi: manual reconnect requested (was rssi=%d) — re-scanning\n",
+                (int)WiFi.RSSI());
+  delay(250);  // let the in-flight HTTP/WS ack reach the wire before the link drops
+  WiFi.disconnect();
+  delay(100);
+  tryConnect(ssid, pass);  // all-channel scan + sort-by-signal -> strongest BSSID
+  Serial.printf("# WiFi: reconnected ip=%s rssi=%d\n", WiFi.localIP().toString().c_str(),
+                (int)WiFi.RSSI());
+}
+
 void loop() {
   serviceButton();
+  serviceReconnect();
   if (g_status == Status::PORTAL) {
     if (g_dns) g_dns->processNextRequest();
     if (g_portal) g_portal->handleClient();
   }
 }
+
+void requestReconnectBestAp() { g_reconnect_requested = true; }
 
 Status status() { return g_status; }
 bool isConnected() { return g_status == Status::CONNECTED && WiFi.isConnected(); }

@@ -21,7 +21,7 @@ async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
     coordinator: SomfySdnCoordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([RediscoverButton(coordinator)])
+    async_add_entities([RediscoverButton(coordinator), ReconnectWifiButton(coordinator)])
     add_motor_entities(
         coordinator,
         entry,
@@ -48,6 +48,27 @@ class RediscoverButton(SomfySdnControllerEntity, ButtonEntity):
 
     async def async_press(self) -> None:
         await self.coordinator.async_send_command("rediscover")
+
+
+class ReconnectWifiButton(SomfySdnControllerEntity, ButtonEntity):
+    """Force the controller to re-scan and reassociate to the strongest AP.
+
+    The ESP32 WiFi stack has no live roaming, so a controller can stay stuck on a distant AP it
+    fell back to at boot (e.g. its nearest AP was offline then). Pressing this bounces the link and
+    re-evaluates all APs. The bounce drops the WS connection briefly; the coordinator reconnects and
+    the next snapshot reflects the new signal.
+    """
+
+    _attr_name = "Reconnect WiFi"
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_icon = "mdi:wifi-sync"
+
+    def __init__(self, coordinator: SomfySdnCoordinator) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{self._cid}:reconnect_wifi"
+
+    async def async_press(self) -> None:
+        await self.coordinator.async_send_command("reconnect_wifi")
 
 
 class _MotorButton(SomfySdnMotorEntity, ButtonEntity):

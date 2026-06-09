@@ -83,6 +83,27 @@ void test_apply_position_change_and_completion() {
   TEST_ASSERT_EQUAL((int)sdn::MovementState::IDLE, (int)d->movement);
 }
 
+// An idle motor reporting a changed percent while its encoder pulse count is unchanged is a
+// glitch (the field-observed percent=100/pulses-frozen flap) — it must be suppressed, and a real
+// move (pulses change) must still apply.
+void test_apply_position_ignores_spurious_percent_when_idle() {
+  DeviceTable t;
+  Device* d = t.upsert(A1, Source::OBSERVED, 0);
+
+  t.applyPosition(d, pos(32, 446), 100);  // settled: 32% at 446 pulses
+  TEST_ASSERT_EQUAL_UINT8(32, d->position_pct);
+
+  // Idle + pulses unchanged but percent jumps to 100 → spurious, suppressed (no change broadcast).
+  PosResult glitch = t.applyPosition(d, pos(100, 446), 200);
+  TEST_ASSERT_FALSE(glitch.changed);
+  TEST_ASSERT_EQUAL_UINT8(32, d->position_pct);
+
+  // A genuine move (pulses advance) still applies even if idle (e.g. manual pull / external move).
+  PosResult real = t.applyPosition(d, pos(60, 800), 300);
+  TEST_ASSERT_TRUE(real.changed);
+  TEST_ASSERT_EQUAL_UINT8(60, d->position_pct);
+}
+
 void test_apply_position_fault_and_clear() {
   DeviceTable t;
   Device* d = t.upsert(A1, Source::OBSERVED, 0);
@@ -197,6 +218,7 @@ int main(int /*argc*/, char** /*argv*/) {
   RUN_TEST(test_upsert_find_and_source_priority);
   RUN_TEST(test_touch_online_transition);
   RUN_TEST(test_apply_position_change_and_completion);
+  RUN_TEST(test_apply_position_ignores_spurious_percent_when_idle);
   RUN_TEST(test_apply_position_fault_and_clear);
   RUN_TEST(test_stall_detection);
   RUN_TEST(test_apply_limits);

@@ -174,6 +174,7 @@ void handleHelp() {
   b += "POST /forget?addr=AA:BB:CC        remove a motor from the table\n";
   b += "POST /move?addr=AA:BB:CC&cmd=open|close|stop|pos|jogup|jogdown&value=<ha%|duration>\n";
   b += "POST /wifi?ssid=&password=        set creds, reboot\n";
+  b += "POST /reconnect                  re-scan + reassociate to the strongest AP\n";
   b += "POST /update?url=<bin>            HTTP-pull OTA\n";
   b += "POST /clear                      reset ring buffers + counters\n";
   b += "\n# mutating endpoints are POST; curl -X POST (query args still parse)\n";
@@ -388,6 +389,12 @@ void handleDiscover() {
   g_server->send(200, "text/plain", "# discovery sweep queued\n");
 }
 
+void handleReconnect() {
+  // Ack first; wifi_prov drops + re-scans from its loop() after this response has flushed.
+  wifi_prov::requestReconnectBestAp();
+  g_server->send(200, "text/plain", "# WiFi reconnect to strongest AP queued\n");
+}
+
 void handleMove() {
   if (!g_server->hasArg("addr") || !g_server->hasArg("cmd")) {
     g_server->send(400, "text/plain", "# need ?addr=AA:BB:CC&cmd=open|close|stop|pos[&value=<ha%>]\n");
@@ -500,6 +507,7 @@ void begin(uint16_t port) {
   g_server->on("/move", HTTP_POST, handleMove);
   g_server->on("/forget", HTTP_POST, handleForget);
   g_server->on("/wifi", HTTP_POST, handleWifi);
+  g_server->on("/reconnect", HTTP_POST, handleReconnect);
   g_server->on("/update", HTTP_POST, handleUpdate);
   g_server->on("/clear", HTTP_POST, handleClear);
   g_server->begin();

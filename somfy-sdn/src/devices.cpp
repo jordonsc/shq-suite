@@ -77,11 +77,21 @@ PosResult DeviceTable::applyPosition(Device* d, const sdn::PositionReport& pr, u
   d->status[0] = '\0';
 
   uint8_t old_pct = d->position_pct;
+  uint16_t old_pulses = d->position_pulses;
   bool first = !d->position_known;
   d->position_known = true;
   d->position_pulses = pr.pulses;
 
-  if (old_pct != pr.percent || first) {
+  // Reject a spurious percent jump. The encoder pulse count is the ground truth for "did it move";
+  // when the motor is idle and pulses are unchanged the blind physically cannot have moved, so a
+  // changed percent byte is a glitch in POST_MOTOR_POSITION (observed in the field: percent
+  // momentarily reads 100 while pulses stay put, flapping the HA cover closed→open). Keep the last
+  // percent and don't broadcast a phantom change. Only suppresses when pulses match exactly, so a
+  // real move (which always moves the encoder) is never affected.
+  bool spurious = !first && d->movement == sdn::MovementState::IDLE && pr.pulses == old_pulses &&
+                  pr.percent != old_pct;
+
+  if ((old_pct != pr.percent && !spurious) || first) {
     d->position_pct = pr.percent;
     d->stall_count = 0;
     res.changed = true;
