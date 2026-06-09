@@ -11,6 +11,7 @@ from typing import Any
 from homeassistant.components.climate import (
     ClimateEntity,
     ClimateEntityFeature,
+    HVACAction,
     HVACMode,
 )
 from homeassistant.config_entries import ConfigEntry
@@ -67,6 +68,31 @@ def _value_with_transition(data: dict, key: str) -> Any:
     return data.get(key)
 
 
+def _action_for_mode(
+    mode: HVACMode | None, current: float | None, target: float | None
+) -> HVACAction | None:
+    """Derive hvac_action from the *mode* only — we don't read compressor demand off the bus.
+
+    This is what drives the climate card's coloured "haze" (heating=amber, cooling=blue,
+    fan=blue). HEAT_COOL has no single answer, so resolve it by current-vs-target.
+    """
+    if mode is None:
+        return None
+    if mode == HVACMode.OFF:
+        return HVACAction.OFF
+    if mode == HVACMode.HEAT:
+        return HVACAction.HEATING
+    if mode == HVACMode.COOL:
+        return HVACAction.COOLING
+    if mode == HVACMode.FAN_ONLY:
+        return HVACAction.FAN
+    if mode == HVACMode.HEAT_COOL:
+        if current is not None and target is not None:
+            return HVACAction.HEATING if current < target else HVACAction.COOLING
+        return HVACAction.IDLE
+    return None
+
+
 class _Base(CoordinatorEntity[ActronMitmCoordinator], ClimateEntity):
     """Shared availability + unit setup + device grouping."""
 
@@ -115,6 +141,12 @@ class ActronMitmMaster(_Base):
         data = self.coordinator.data or {}
         fw = _value_with_transition(data, "mode")
         return HVACMode(MODES_FW_TO_HA.get(fw)) if fw in MODES_FW_TO_HA else None
+
+    @property
+    def hvac_action(self) -> HVACAction | None:
+        return _action_for_mode(
+            self.hvac_mode, self.current_temperature, self.target_temperature
+        )
 
     @property
     def fan_mode(self) -> str | None:
@@ -201,6 +233,14 @@ class ActronMitmZone(_Base):
         # Zone is enabled → mirror the master's mode (or its transition).
         master_mode_fw = _value_with_transition(self.coordinator.data or {}, "mode")
         return HVACMode(MODES_FW_TO_HA.get(master_mode_fw)) if master_mode_fw in MODES_FW_TO_HA else None
+
+    @property
+    def hvac_action(self) -> HVACAction | None:
+        mode = self.hvac_mode
+        if mode == HVACMode.OFF:
+            return HVACAction.OFF
+        # Enabled zone mirrors the master's activity; FAN_ONLY isn't a zone mode.
+        return _action_for_mode(mode, self.current_temperature, self.target_temperature)
 
     @property
     def current_temperature(self) -> float | None:

@@ -99,6 +99,8 @@ cfa_fire_ban:
 
 **Entities**: Climate (master unit + 8 zones — zone slots 0..7; rename via the HA UI since zone names aren't on the RS485 bus). The master exposes a current temperature (indoor-unit main/return-air reading scraped from bus reg 13, published as the master's `current_temp`), so its thermostat card shows current + setpoint like the zones do.
 
+**`hvac_action` (climate-card haze)**: derived from the *mode* only — we don't read compressor demand off the bus (`climate.py:_action_for_mode`). heat→`heating`, cool→`cooling`, fan_only→`fan`, off→`off`, heat_cool→resolved by current-vs-target (else `idle`). Zones mirror the master's action, or `off` when disabled. This is what drives the coloured background animation on the thermostat/tile card (amber=heating, blue=cooling/fan); without it the card stays flat.
+
 **Config**: UI config flow — host + port (default 8767).
 
 **Communication**: WebSocket to the `actron-sniffer` ESP32 (`ws://<host>:8767`). Push-only — server emits a full `state` snapshot on every change plus a 10 s heartbeat. Commands ack/error by client-supplied `id` with 10 s timeout.
