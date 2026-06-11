@@ -163,6 +163,7 @@ For automations/scripts/scenes, edit them in the HA UI directly — they live in
 **Blueprints** (`home-assistant/blueprints/automation/shq/`): version-controlled here, deployed by `./setup ha`. Current:
 
 - `exhaust_fan.yaml` — light-linked exhaust fan. Inputs: trigger lights (all must be off to stop), fan switch, auto-on toggle (default on; disabled for manually-started fans), on-delay (default 3 min), off-delay (default 5 min), max runtime (default 1 h). Includes an HA-start safety check that turns off a fan left running with all lights off (covers `for:` countdowns lost to a restart). Instances: "Powder Room Fan", "Ensuite 1 Toilet Fan", "Ensuite 1 Shower Fan" (auto-on off, 10 min off-delay).
+- `power_cycle.yaml` — power-cycle on unavailable. Inputs: watched entities (any domain, multiple), power-cycle switch, unavailable grace period (default 5 min), power-off time (default 5 s), notify action (text, empty = no notification). A template condition requires the switch itself to be available before any action — a genuine power outage (which takes the Shelly down too) never trips it. Instances: "Unavailable: Bedroom Lights", "Unavailable: Room B Lights", "Unavailable: WIR1 Light" (all dry-contact Shellys cycling Matter-over-WiFi downlights, notify to redacted_phone).
 
 `secrets.yaml` and the `.storage/` directory are server-side only; never overwrite them via deploy.
 

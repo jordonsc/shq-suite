@@ -1,0 +1,88 @@
+blueprint:
+  name: Power-cycle on unavailable
+  description: >-
+    Watch a set of entities and power-cycle them via a switch (e.g. a
+    dry-contact Shelly) when any of them has been unavailable for the grace
+    period. The cycle only runs while the switch itself is available, so a
+    genuine power outage (which takes the switch down too) never trips it.
+    Optionally sends a notification before cycling.
+  domain: automation
+  input:
+    watched:
+      name: Watched entities
+      description: Power-cycle when any of these become unavailable.
+      selector:
+        entity:
+          multiple: true
+    power_switch:
+      name: Power-cycle switch
+      description: >-
+        The switch that cuts power to the watched entities. Must itself be
+        available for any action to take place.
+      selector:
+        entity:
+          filter:
+            domain: switch
+    unavailable_time:
+      name: Unavailable grace period
+      description: How long an entity must be unavailable before cycling.
+      default:
+        hours: 0
+        minutes: 5
+        seconds: 0
+      selector:
+        duration:
+    off_time:
+      name: Power-off time
+      description: How long power is held off during the cycle.
+      default:
+        hours: 0
+        minutes: 0
+        seconds: 5
+      selector:
+        duration:
+    notify_service:
+      name: Notify action
+      description: >-
+        Notify action to call before cycling (e.g.
+        notify.mobile_app_redacted_phone). Leave empty for no notification.
+      default: ""
+      selector:
+        text:
+
+variables:
+  power_switch: !input power_switch
+  notify_service: !input notify_service
+
+triggers:
+  - trigger: state
+    entity_id: !input watched
+    to: "unavailable"
+    for: !input unavailable_time
+
+conditions:
+  - condition: template
+    value_template: "{{ states(power_switch) not in ['unavailable', 'unknown'] }}"
+    alias: Power-cycle switch is available (skip during a real power outage)
+
+actions:
+  - if:
+      - condition: template
+        value_template: "{{ notify_service != '' }}"
+    then:
+      - action: "{{ notify_service }}"
+        data:
+          title: Device Unavailable
+          message: >-
+            {{ trigger.to_state.name if trigger.to_state is defined else 'A watched device' }}
+            has become unavailable. Power-cycling via
+            {{ state_attr(power_switch, 'friendly_name') or power_switch }}.
+  - action: switch.turn_off
+    target:
+      entity_id: !input power_switch
+  - delay: !input off_time
+  - action: switch.turn_on
+    target:
+      entity_id: !input power_switch
+
+mode: single
