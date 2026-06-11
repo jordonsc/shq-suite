@@ -1,0 +1,34 @@
+blueprint:
+  name: Mutually-exclusive boolean group
+  description: >-
+    Radio-group behaviour for a set of input_booleans: when any one turns on,
+    all the others are turned off. Used for kiosk UI tab-groups, where each
+    boolean shows/hides a dashboard panel — one automation per group instead
+    of one per tab.
+  domain: automation
+  input:
+    booleans:
+      name: Group members
+      description: The input_booleans in the group. Turning any one on turns the rest off.
+      selector:
+        entity:
+          filter:
+            domain: input_boolean
+          multiple: true
+
+variables:
+  booleans: !input booleans
+
+triggers:
+  - trigger: state
+    entity_id: !input booleans
+    to: "on"
+
+conditions: []
+
+actions:
+  - action: input_boolean.turn_off
+    target:
+      entity_id: "{{ booleans | reject('eq', trigger.entity_id | default('')) | list }}"
+
+mode: restart
