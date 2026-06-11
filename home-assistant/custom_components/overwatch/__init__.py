@@ -8,6 +8,7 @@ from .const import (
     DOMAIN,
     SERVICE_SET_ALARM,
     SERVICE_VERBALISE,
+    SERVICE_PLAY_TONE,
     CONF_HOST,
     CONF_PORT,
     DEFAULT_PORT,
@@ -34,6 +35,11 @@ VERBALISE_SCHEMA = vol.Schema({
     vol.Required("text"): cv.string,
     vol.Optional("notification_tone_id"): cv.string,
     vol.Optional("voice_id"): cv.string,
+    vol.Optional("volume"): vol.All(vol.Coerce(float), vol.Range(min=0.0, max=2.0)),
+})
+
+PLAY_TONE_SCHEMA = vol.Schema({
+    vol.Required("tone_id"): cv.string,
     vol.Optional("volume"): vol.All(vol.Coerce(float), vol.Range(min=0.0, max=2.0)),
 })
 
@@ -121,6 +127,28 @@ async def async_setup(hass: HomeAssistant, config: dict):
         except Exception as e:
             _LOGGER.error(f"Error calling verbalise service: {e}")
 
+    async def handle_play_tone(call: ServiceCall):
+        """Handle the play_tone service call."""
+        tone_id = call.data["tone_id"]
+        volume = call.data.get("volume")
+
+        _LOGGER.debug(
+            f"Service call: play_tone(tone_id={tone_id}, volume={volume})"
+        )
+
+        try:
+            success, message = await hass.async_add_executor_job(
+                client.play_tone, tone_id, volume
+            )
+
+            if success:
+                _LOGGER.info(f"Played tone '{tone_id}'")
+            else:
+                _LOGGER.error(f"Failed to play tone: {message}")
+
+        except Exception as e:
+            _LOGGER.error(f"Error calling play_tone service: {e}")
+
     # Register services
     hass.services.async_register(
         DOMAIN,
@@ -136,7 +164,14 @@ async def async_setup(hass: HomeAssistant, config: dict):
         schema=VERBALISE_SCHEMA,
     )
 
-    _LOGGER.info("Overwatch services registered: set_alarm, verbalise")
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_PLAY_TONE,
+        handle_play_tone,
+        schema=PLAY_TONE_SCHEMA,
+    )
+
+    _LOGGER.info("Overwatch services registered: set_alarm, verbalise, play_tone")
 
     return True
 

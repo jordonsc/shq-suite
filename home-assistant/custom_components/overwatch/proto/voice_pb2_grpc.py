@@ -44,6 +44,11 @@ class VoiceServiceStub(object):
                 request_serializer=voice__pb2.VerbaliseRequest.SerializeToString,
                 response_deserializer=voice__pb2.VerbaliseResponse.FromString,
                 _registered_method=True)
+        self.PlayTone = channel.unary_unary(
+                '/voice.VoiceService/PlayTone',
+                request_serializer=voice__pb2.PlayToneRequest.SerializeToString,
+                response_deserializer=voice__pb2.PlayToneResponse.FromString,
+                _registered_method=True)
 
 
 class VoiceServiceServicer(object):
@@ -63,6 +68,13 @@ class VoiceServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def PlayTone(self, request, context):
+        """Play a single notification tone (no TTS)
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_VoiceServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -75,6 +87,11 @@ def add_VoiceServiceServicer_to_server(servicer, server):
                     servicer.Verbalise,
                     request_deserializer=voice__pb2.VerbaliseRequest.FromString,
                     response_serializer=voice__pb2.VerbaliseResponse.SerializeToString,
+            ),
+            'PlayTone': grpc.unary_unary_rpc_method_handler(
+                    servicer.PlayTone,
+                    request_deserializer=voice__pb2.PlayToneRequest.FromString,
+                    response_serializer=voice__pb2.PlayToneResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -131,6 +148,33 @@ class VoiceService(object):
             '/voice.VoiceService/Verbalise',
             voice__pb2.VerbaliseRequest.SerializeToString,
             voice__pb2.VerbaliseResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PlayTone(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/voice.VoiceService/PlayTone',
+            voice__pb2.PlayToneRequest.SerializeToString,
+            voice__pb2.PlayToneResponse.FromString,
             options,
             channel_credentials,
             insecure,

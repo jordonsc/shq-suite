@@ -139,6 +139,43 @@ class OverwatchClient:
             _LOGGER.error(f"Error in verbalise: {e}")
             return False, str(e)
 
+    def play_tone(
+        self,
+        tone_id: str,
+        volume: Optional[float] = None
+    ) -> tuple[bool, str]:
+        """Play a single notification tone (no TTS).
+
+        Args:
+            tone_id: ID of the tone to play (key from notification_tones config)
+            volume: Optional volume level (0.0-1.0)
+
+        Returns:
+            Tuple of (success: bool, message: str)
+        """
+        if not self._stub:
+            if not self.connect():
+                return False, "Failed to connect to voice server"
+
+        try:
+            request = voice_pb2.PlayToneRequest(tone_id=tone_id)
+
+            if volume is not None:
+                request.volume = volume
+
+            response = self._stub.PlayTone(request, timeout=10.0)
+            _LOGGER.debug(
+                f"PlayTone response: success={response.success}, message={response.message}"
+            )
+            return response.success, response.message
+
+        except grpc.RpcError as e:
+            _LOGGER.error(f"gRPC error in play_tone: {e.code()} - {e.details()}")
+            return False, f"RPC error: {e.details()}"
+        except Exception as e:
+            _LOGGER.error(f"Error in play_tone: {e}")
+            return False, str(e)
+
     def __enter__(self):
         """Context manager entry."""
         self.connect()

@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0bvoice.proto\x12\x05voice\"T\n\x0fSetAlarmRequest\x12\x10\n\x08\x61larm_id\x18\x01 \x01(\t\x12\x0f\n\x07\x65nabled\x18\x02 \x01(\x08\x12\x13\n\x06volume\x18\x03 \x01(\x02H\x00\x88\x01\x01\x42\t\n\x07_volume\"4\n\x10SetAlarmResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\"\xa0\x01\n\x10VerbaliseRequest\x12\x0c\n\x04text\x18\x01 \x01(\t\x12!\n\x14notification_tone_id\x18\x02 \x01(\tH\x00\x88\x01\x01\x12\x15\n\x08voice_id\x18\x03 \x01(\tH\x01\x88\x01\x01\x12\x13\n\x06volume\x18\x04 \x01(\x02H\x02\x88\x01\x01\x42\x17\n\x15_notification_tone_idB\x0b\n\t_voice_idB\t\n\x07_volume\"5\n\x11VerbaliseResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t2\x8b\x01\n\x0cVoiceService\x12;\n\x08SetAlarm\x12\x16.voice.SetAlarmRequest\x1a\x17.voice.SetAlarmResponse\x12>\n\tVerbalise\x12\x17.voice.VerbaliseRequest\x1a\x18.voice.VerbaliseResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0bvoice.proto\x12\x05voice\"T\n\x0fSetAlarmRequest\x12\x10\n\x08\x61larm_id\x18\x01 \x01(\t\x12\x0f\n\x07\x65nabled\x18\x02 \x01(\x08\x12\x13\n\x06volume\x18\x03 \x01(\x02H\x00\x88\x01\x01\x42\t\n\x07_volume\"4\n\x10SetAlarmResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\"\xa0\x01\n\x10VerbaliseRequest\x12\x0c\n\x04text\x18\x01 \x01(\t\x12!\n\x14notification_tone_id\x18\x02 \x01(\tH\x00\x88\x01\x01\x12\x15\n\x08voice_id\x18\x03 \x01(\tH\x01\x88\x01\x01\x12\x13\n\x06volume\x18\x04 \x01(\x02H\x02\x88\x01\x01\x42\x17\n\x15_notification_tone_idB\x0b\n\t_voice_idB\t\n\x07_volume\"5\n\x11VerbaliseResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\"B\n\x0fPlayToneRequest\x12\x0f\n\x07tone_id\x18\x01 \x01(\t\x12\x13\n\x06volume\x18\x02 \x01(\x02H\x00\x88\x01\x01\x42\t\n\x07_volume\"4\n\x10PlayToneResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t2\xc8\x01\n\x0cVoiceService\x12;\n\x08SetAlarm\x12\x16.voice.SetAlarmRequest\x1a\x17.voice.SetAlarmResponse\x12>\n\tVerbalise\x12\x17.voice.VerbaliseRequest\x1a\x18.voice.VerbaliseResponse\x12;\n\x08PlayTone\x12\x16.voice.PlayToneRequest\x1a\x17.voice.PlayToneResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -39,6 +39,10 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_VERBALISEREQUEST']._serialized_end=323
   _globals['_VERBALISERESPONSE']._serialized_start=325
   _globals['_VERBALISERESPONSE']._serialized_end=378
-  _globals['_VOICESERVICE']._serialized_start=381
-  _globals['_VOICESERVICE']._serialized_end=520
+  _globals['_PLAYTONEREQUEST']._serialized_start=380
+  _globals['_PLAYTONEREQUEST']._serialized_end=446
+  _globals['_PLAYTONERESPONSE']._serialized_start=448
+  _globals['_PLAYTONERESPONSE']._serialized_end=500
+  _globals['_VOICESERVICE']._serialized_start=503
+  _globals['_VOICESERVICE']._serialized_end=703
 # @@protoc_insertion_point(module_scope)

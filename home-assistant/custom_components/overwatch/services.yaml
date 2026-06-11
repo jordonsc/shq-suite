@@ -65,3 +65,25 @@ verbalise:
           min: 0.0
           max: 1.0
           step: 0.1
+
+play_tone:
+  name: Play Tone
+  description: Play a single notification tone (no speech)
+  fields:
+    tone_id:
+      name: Tone ID
+      description: The ID of the tone to play (key from notification_tones config)
+      required: true
+      example: "notify"
+      selector:
+        text:
+    volume:
+      name: Volume
+      description: Volume level (0.0 to 1.0)
+      required: false
+      example: 0.75
+      selector:
+        number:
+          min: 0.0
+          max: 1.0
+          step: 0.1

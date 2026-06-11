@@ -37,6 +37,8 @@ class HomeAssistantDeployer(BaseDeployer):
         self.config_file = Path(__file__).parent.parent.parent / "config" / "ha" / "configuration.yaml"
         # www/ directory for custom frontend resources (icons, etc.)
         self.www_path = Path(source_path).parent / "www"
+        # blueprints/ directory for automation blueprints
+        self.blueprints_path = Path(source_path).parent / "blueprints"
 
     def _reload_ha_config(self, verbose: bool = False) -> bool:
         """
@@ -108,6 +110,19 @@ class HomeAssistantDeployer(BaseDeployer):
                 print("FAILED")
                 return False
             if not self.run_ssh_command(hostname, f"sudo cp -a {tmp_www}/. {final_www}/ && rm -rf {tmp_www}", verbose=verbose):
+                print("FAILED")
+                return False
+            print("done", flush=True)
+
+        # Deploy blueprints/ directory if it exists (needs sudo as /etc/hass is root-owned)
+        if self.blueprints_path.exists():
+            print(f" * Deploying blueprints/.. ", end="", flush=True)
+            tmp_bp = "/tmp/ha_blueprints"
+            final_bp = str(Path(self.destination_path) / "blueprints")
+            if not self.run_rsync(str(self.blueprints_path) + "/", tmp_bp, hostname, verbose=verbose, delete=False):
+                print("FAILED")
+                return False
+            if not self.run_ssh_command(hostname, f"sudo mkdir -p {final_bp} && sudo cp -a {tmp_bp}/. {final_bp}/ && rm -rf {tmp_bp}", verbose=verbose):
                 print("FAILED")
                 return False
             print("done", flush=True)

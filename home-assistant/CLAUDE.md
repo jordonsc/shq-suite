@@ -40,6 +40,7 @@ shq_display:
 **Services**:
 - `overwatch.set_alarm` — start/stop alarm loop (`alarm_id`, `enabled`, `volume?`)
 - `overwatch.verbalise` — TTS speech (`text`, `notification_tone_id?`, `voice_id?`, `volume?`)
+- `overwatch.play_tone` — play a single tone, no TTS (`tone_id`, `volume?`); `tone_id` is a key from the server's `notification_tones` config
 
 **Config**:
 ```yaml
@@ -148,7 +149,8 @@ The HA server runs on `redacted.host` at `/etc/hass/`. Its config is split betwe
 |---------------|----------------------|
 | `home-assistant/custom_components/` — custom integrations | `automations.yaml`, `scripts.yaml`, `scenes.yaml` (UI-managed) |
 | `home-assistant/www/shq-icons.js` — custom icon set | `secrets.yaml` |
-| `deploy/config/ha/configuration.yaml` — main HA config (modbus, templates, integrations, sensors), gitignored | `.storage/` (config-flow integrations: Centurion, Actron, SolaX, etc.) |
+| `home-assistant/blueprints/` — automation blueprints (→ `/etc/hass/blueprints/`) | `.storage/` (config-flow integrations: Centurion, Actron, SolaX, etc.) |
+| `deploy/config/ha/configuration.yaml` — main HA config (modbus, templates, integrations, sensors), gitignored | |
 
 **Update flow** for anything in the repo:
 
@@ -157,6 +159,10 @@ The HA server runs on `redacted.host` at `/etc/hass/`. Its config is split betwe
 3. Verify with `./ha get /api/states/sensor.<thing>` or watch the HA logs.
 
 For automations/scripts/scenes, edit them in the HA UI directly — they live in `automations.yaml` etc. on the server and aren't tracked here.
+
+**Blueprints** (`home-assistant/blueprints/automation/shq/`): version-controlled here, deployed by `./setup ha`. Current:
+
+- `exhaust_fan.yaml` — light-linked exhaust fan. Inputs: trigger lights (all must be off to stop), fan switch, auto-on toggle (default on; disabled for manually-started fans), on-delay (default 3 min), off-delay (default 5 min), max runtime (default 1 h). Includes an HA-start safety check that turns off a fan left running with all lights off (covers `for:` countdowns lost to a restart). Instances: "Powder Room Fan", "Ensuite 1 Toilet Fan", "Ensuite 1 Shower Fan" (auto-on off, 10 min off-delay).
 
 `secrets.yaml` and the `.storage/` directory are server-side only; never overwrite them via deploy.
 

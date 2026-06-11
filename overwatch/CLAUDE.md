@@ -8,10 +8,9 @@ Rust gRPC server for text-to-speech (AWS Polly) and alarm playback. Runs on a de
 |------|---------|
 | `src/main.rs` | Entry point — loads config, starts gRPC server |
 | `src/config.rs` | YAML config parsing (AWS creds, voices, sound paths) |
-| `src/voice.rs` | gRPC service impl — SetAlarm + Verbalise handlers |
+| `src/service.rs` | gRPC service impl — SetAlarm + Verbalise + PlayTone handlers |
 | `src/tts.rs` | AWS Polly TTS — synthesises speech, caches audio |
-| `src/audio.rs` | Audio playback via rodio (ALSA backend) |
-| `src/alarm.rs` | Alarm loop — plays klaxon sounds in a loop until stopped |
+| `src/audio.rs` | Audio playback via rodio (ALSA backend); also the alarm loop (`start_alarm_inner` plays klaxons via `repeat_infinite` until stopped) |
 | `proto/voice.proto` | gRPC service definition (source of truth) |
 | `build.rs` | Compiles proto at build time via tonic-build |
 
@@ -21,6 +20,7 @@ Rust gRPC server for text-to-speech (AWS Polly) and alarm playback. Runs on a de
 service VoiceService {
   rpc SetAlarm(SetAlarmRequest) returns (SetAlarmResponse);
   rpc Verbalise(VerbaliseRequest) returns (VerbaliseResponse);
+  rpc PlayTone(PlayToneRequest) returns (PlayToneResponse);
 }
 ```
 
@@ -34,6 +34,11 @@ service VoiceService {
 - `notification_tone_id`: optional tone to play first (e.g. "notify", "warn", "error")
 - `voice_id`: optional AWS Polly voice (default "Amy")
 - `volume`: optional 0.0-1.0
+
+### PlayTone
+- `tone_id`: string key from the `notification_tones` config map (same files Verbalise plays as a prefix) — e.g. "notify", "warn", "error"
+- `volume`: optional 0.0-1.0
+- Plays a single tone and returns immediately (fire-and-forget; the rodio sink is detached). No TTS, no AWS call.
 
 ## Configuration (`config.yaml`)
 

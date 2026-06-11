@@ -10,7 +10,8 @@ pub mod voice {
 
 use voice::voice_service_server::VoiceService;
 use voice::{
-    SetAlarmRequest, SetAlarmResponse, VerbaliseRequest, VerbaliseResponse,
+    PlayToneRequest, PlayToneResponse, SetAlarmRequest, SetAlarmResponse, VerbaliseRequest,
+    VerbaliseResponse,
 };
 
 pub struct VoiceServiceImpl {
@@ -190,6 +191,49 @@ impl VoiceService for VoiceServiceImpl {
         let response = VerbaliseResponse {
             success: true,
             message: "Speech synthesised and played successfully".to_string(),
+        };
+
+        Ok(Response::new(response))
+    }
+
+    async fn play_tone(
+        &self,
+        request: Request<PlayToneRequest>,
+    ) -> Result<Response<PlayToneResponse>, Status> {
+        let req = request.into_inner();
+        let tone_id = req.tone_id;
+
+        tracing::info!("Playing tone '{}'", tone_id);
+
+        // Determine volume to use (either specified or default)
+        let volume = req.volume.unwrap_or(self.config.default_volume);
+
+        // Validate volume range (0.0 to 2.0)
+        if volume < 0.0 || volume > 2.0 {
+            return Err(Status::invalid_argument(
+                format!("Volume must be between 0.0 and 2.0, got {}", volume)
+            ));
+        }
+
+        if volume > 1.0 {
+            tracing::warn!("Volume {} exceeds 1.0, may cause audio clipping", volume);
+        }
+
+        // Reuse the notification_tones map — same files Verbalise plays as a prefix
+        let tone_path = self
+            .config
+            .get_notification_tone(&tone_id)
+            .ok_or_else(|| Status::not_found(format!("Tone '{}' not found", tone_id)))?;
+
+        // Fire-and-forget: play_file detaches the sink and returns immediately
+        self.audio_manager
+            .play_file(tone_path.clone(), volume)
+            .await
+            .map_err(|e| Status::internal(format!("Audio playback failed: {}", e)))?;
+
+        let response = PlayToneResponse {
+            success: true,
+            message: format!("Tone '{}' played", tone_id),
         };
 
         Ok(Response::new(response))

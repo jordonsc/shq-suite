@@ -61,6 +61,7 @@ config/
 |--------|------|-------------|
 | `redacted.host` | HA custom_components | `/etc/hass/custom_components` |
 | `redacted.host` | configuration.yaml | `/etc/hass/configuration.yaml` |
+| `redacted.host` | blueprints | `/etc/hass/blueprints` |
 | `kiosk02-07` | Nyx binary | `/home/shq/display/display/` |
 | `kiosk02-07` | Wallpaper, services | `~/.config/systemd/user/` |
 | `redacted.host` | Binary, sounds, config | `~/overwatch/` |

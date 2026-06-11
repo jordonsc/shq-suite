@@ -8,6 +8,9 @@ service VoiceService {
 
   // Synthesise and play a text prompt
   rpc Verbalise(VerbaliseRequest) returns (VerbaliseResponse);
+
+  // Play a single notification tone (no TTS)
+  rpc PlayTone(PlayToneRequest) returns (PlayToneResponse);
 }
 
 message SetAlarmRequest {
@@ -29,6 +32,16 @@ message VerbaliseRequest {
 }
 
 message VerbaliseResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message PlayToneRequest {
+  string tone_id = 1;         // key from notification_tones config
+  optional float volume = 2;  // Volume level 0.0-1.0
+}
+
+message PlayToneResponse {
   bool success = 1;
   string message = 2;
 }

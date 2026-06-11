@@ -1,0 +1,131 @@
+blueprint:
+  name: Light-linked exhaust fan
+  description: >-
+    Drive an exhaust fan from one or more room lights. Optionally turns the fan
+    on after the lights have been on for the on-delay, and turns it off once all
+    trigger lights have been off for the off-delay. A maximum-runtime cap turns
+    the fan off regardless, and a restart-safety check turns it off if HA starts
+    up to find the fan running with all lights off (covers countdowns lost to a
+    restart).
+  domain: automation
+  input:
+    lights:
+      name: Trigger lights
+      description: The fan follows these lights. All must be off before the fan turns off.
+      selector:
+        entity:
+          filter:
+            domain: light
+          multiple: true
+    fan:
+      name: Fan switch
+      selector:
+        entity:
+          filter:
+            domain: switch
+    auto_on:
+      name: Auto-on
+      description: Turn the fan on after the lights have been on for the on-delay. Disable for manually-started fans (e.g. shower fans).
+      default: true
+      selector:
+        boolean:
+    on_delay:
+      name: On-delay
+      description: How long the lights must be on before the fan starts.
+      default:
+        hours: 0
+        minutes: 3
+        seconds: 0
+      selector:
+        duration:
+    off_delay:
+      name: Off-delay
+      description: How long all lights must be off before the fan stops.
+      default:
+        hours: 0
+        minutes: 5
+        seconds: 0
+      selector:
+        duration:
+    max_runtime:
+      name: Maximum runtime
+      description: The fan is always turned off after running this long.
+      default:
+        hours: 1
+        minutes: 0
+        seconds: 0
+      selector:
+        duration:
+
+variables:
+  lights: !input lights
+  auto_on: !input auto_on
+
+triggers:
+  - trigger: state
+    entity_id: !input lights
+    to: "on"
+    for: !input on_delay
+    id: lights_on
+  - trigger: state
+    entity_id: !input lights
+    from: "on"
+    to: "off"
+    for: !input off_delay
+    id: lights_off
+  - trigger: state
+    entity_id: !input fan
+    to: "on"
+    for: !input max_runtime
+    id: max_runtime
+  - trigger: homeassistant
+    event: start
+    id: safety
+
+conditions: []
+
+actions:
+  - choose:
+      - conditions:
+          - condition: trigger
+            id:
+              - lights_on
+          - condition: template
+            value_template: "{{ auto_on }}"
+        sequence:
+          - action: switch.turn_on
+            target:
+              entity_id: !input fan
+      - conditions:
+          - condition: trigger
+            id:
+              - lights_off
+          - condition: template
+            value_template: "{{ expand(lights) | selectattr('state', 'eq', 'on') | list | count == 0 }}"
+        sequence:
+          - action: switch.turn_off
+            target:
+              entity_id: !input fan
+      - conditions:
+          - condition: trigger
+            id:
+              - max_runtime
+        sequence:
+          - action: switch.turn_off
+            target:
+              entity_id: !input fan
+      - conditions:
+          - condition: trigger
+            id:
+              - safety
+          - condition: state
+            entity_id: !input fan
+            state: "on"
+          - condition: template
+            value_template: "{{ expand(lights) | selectattr('state', 'eq', 'on') | list | count == 0 }}"
+        sequence:
+          - action: switch.turn_off
+            target:
+              entity_id: !input fan
+
+mode: single
