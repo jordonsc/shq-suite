@@ -252,6 +252,17 @@ Each battery is wired directly to its Cerbo, so SOC comes from the BMS (slave 22
 
 **Config**: Modbus hubs defined in `deploy/config/ha/configuration.yaml`. Poll interval: 10s.
 
+## Remote-Mouse Demo Switch (YAML-only, no custom component)
+
+`switch.remote_mouse_demo` toggles demo mode on the remote-mouse ESP32 (`../remote-mouse` firmware, device `redacted-device` at `REDACTED-IP`). All YAML in `deploy/config/ha/configuration.yaml`:
+
+- `rest:` sensor `sensor.remote_mouse_mode` — polls `http://REDACTED-IP/stats.json` every 15 s; state = `mode`, attributes incl. `engine`/`host_active`/`fw`/`rssi`.
+- `rest_command.remote_mouse_set_mode` — `POST /mode?set={{ mode }}`.
+- `input_text.remote_mouse_prev_mode` — stashes the mode active before demo was switched on.
+- Template switch `switch.remote_mouse_demo` — on = mode `demo`; **turn-off restores the stashed previous mode** (validated against `move|natural|auto`, fallback `move`) so an `auto` setup survives a demo toggle. Unavailable when the poll sensor is (device offline). Both toggle paths force a sensor refresh ~1 s after the command, so the UI confirms within a couple of seconds rather than the 15 s poll.
+
+Gotchas: the device is on a plain DHCP lease — if its IP changes the YAML needs updating (consider a reservation). The firmware's hardware demo switch (`GET /demo` → `switch_enabled`) must stay disabled, else GPIO1 is authoritative over the mode and fights HA. Adding the first top-level `rest:` section required a full HA restart (`reload_all` only reloads already-loaded integrations).
+
 ## Custom Icons (`www/shq-icons.js`)
 
 Custom SVG icon set for HA, registered as `shq:` prefix (e.g. `shq:floor-lamp`).
