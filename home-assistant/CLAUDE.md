@@ -258,10 +258,10 @@ Each battery is wired directly to its Cerbo, so SOC comes from the BMS (slave 22
 
 - `rest:` sensor `sensor.remote_mouse_mode` — polls `http://REDACTED-IP/stats.json` every 15 s; state = `mode`, attributes incl. `engine`/`host_active`/`fw`/`rssi`.
 - `rest_command.remote_mouse_set_mode` — `POST /mode?set={{ mode }}`.
-- `input_text.remote_mouse_prev_mode` — stashes the mode active before demo was switched on.
-- Template switch `switch.remote_mouse_demo` — on = mode `demo`; **turn-off restores the stashed previous mode** (validated against `move|natural|auto`, fallback `move`) so an `auto` setup survives a demo toggle. Unavailable when the poll sensor is (device offline). Both toggle paths force a sensor refresh ~1 s after the command, so the UI confirms within a couple of seconds rather than the 15 s poll.
+- `input_text.remote_mouse_prev_mode` — stashes which autonomous mode was active when switched off.
+- Template switch `switch.remote_mouse_demo` — on = an autonomous mode (`demo` or `auto`); off parks the mouse in `move` (the firmware's quiet mode — there is no literal "off"). **Turn-off stashes the active autonomous mode; turn-on restores it** (fallback `auto` if the stash is missing/unknown). Unavailable when the poll sensor is (device offline). Both toggle paths force a sensor refresh ~1 s after the command, so the UI usually confirms within a few seconds rather than the 15 s poll.
 
-Gotchas: the device is on a plain DHCP lease — if its IP changes the YAML needs updating (consider a reservation). The firmware's hardware demo switch (`GET /demo` → `switch_enabled`) must stay disabled, else GPIO1 is authoritative over the mode and fights HA. Adding the first top-level `rest:` section required a full HA restart (`reload_all` only reloads already-loaded integrations).
+Gotchas: the device IP is pinned in the router (reservation for `REDACTED-MAC`). The firmware's hardware demo switch (`GET /demo` → `switch_enabled`) must stay disabled, else GPIO1 is authoritative over the mode and fights HA. Adding the first top-level `rest:` section required a full HA restart (`reload_all` only reloads already-loaded integrations).
 
 ## Custom Icons (`www/shq-icons.js`)
 
