@@ -13,3 +13,7 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# Build artefacts (do not track compiled binaries)
+dosa/build/
+nyx/build/
