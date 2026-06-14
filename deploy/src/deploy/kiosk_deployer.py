@@ -22,7 +22,7 @@ class KioskDeployer(BaseDeployer):
         destination_path: str,
         service_name: str,
         wallpaper_path: Optional[str] = None,
-        dashboard_url: str = "http://redacted.host:8123/dashboard-kiosk/{kiosk_name}?kiosk",
+        dashboard_url: str = "http://HOST:8123/dashboard-kiosk/{kiosk_name}?kiosk",
         kiosk_service_file: str = None,
         display_service_file: str = None,
     ):
@@ -53,7 +53,7 @@ class KioskDeployer(BaseDeployer):
         Extract the kiosk name from FQDN.
 
         Args:
-            hostname: Full hostname (e.g., redacted.host)
+            hostname: Full hostname (e.g., kiosk2.example.net)
 
         Returns:
             Short kiosk name (e.g., kiosk1)

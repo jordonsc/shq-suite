@@ -17,3 +17,6 @@ Thumbs.db
 # Build artefacts (do not track compiled binaries)
 dosa/build/
 nyx/build/
+
+# Device secrets (WiFi creds etc.) — copy *.example and fill locally
+secrets.h

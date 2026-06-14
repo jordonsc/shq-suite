@@ -41,7 +41,7 @@ class KioskConfig(DeploymentConfig):
     install_path: str = "/home/shq/display"
     systemd_service: str = "display"
     wallpaper_local_path: Optional[str] = None
-    dashboard_url: str = "http://redacted.host:8123/dashboard-kiosk/{kiosk_name}?kiosk"
+    dashboard_url: str = "http://HOST:8123/dashboard-kiosk/{kiosk_name}?kiosk"
     kiosk_service_file: str = None
     display_service_file: str = None
 

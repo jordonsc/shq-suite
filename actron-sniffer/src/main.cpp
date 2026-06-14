@@ -49,10 +49,19 @@
 #include "state.h"
 #include "ws_api.h"
 
-// ---- WiFi (baked in — throwaway experiment, LAN only) --------------------
-static const char *WIFI_SSID = "SHQ";
-static const char *WIFI_PASS = "REDACTED-WIFI-PASS";
-static const char *HOSTNAME = "actron-sniffer";  // -> http://redacted.local/
+// ---- WiFi — credentials come from secrets.h (gitignored). ----------------
+// Copy secrets.h.example -> secrets.h and fill in. The fallbacks below let the
+// repo build without secrets present; they won't connect to a real network.
+#if __has_include("secrets.h")
+#include "secrets.h"
+#endif
+#ifndef WIFI_SSID
+#define WIFI_SSID "your-ssid"
+#endif
+#ifndef WIFI_PASS
+#define WIFI_PASS "your-wifi-password"
+#endif
+static const char *HOSTNAME = "actron-sniffer";  // -> http://actron-sniffer.local/
 
 // ---- pins -----------------------------------------------------------------
 // Endpoint A = indoor board side, UART1 (the existing transceiver).
