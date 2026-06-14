@@ -21,6 +21,18 @@ WebSocketsServer* g_server = nullptr;
 volatile bool g_dirty = false;
 uint32_t g_last_heartbeat_ms = 0;
 
+// Wedge watchdog. WebSocketsServer has a hard WEBSOCKETS_SERVER_CLIENT_MAX (5) client cap. A
+// buggy/duplicate client can fill every slot with live-but-idle connections — each kept alive by
+// its own WS keepalive, so the heartbeat reaper (enableHeartbeat) never evicts them — after which
+// the library refuses all new handshakes (accept then drop with no HTTP response) and the device
+// looks dead to HA while HTTP and the SDN bus stay perfectly healthy. A controller only ever has
+// ONE legitimate HA coordinator, so sitting at the full client cap for minutes is an unambiguous
+// wedge: self-heal by rebooting (WiFi creds + motor config live in NVS; the device re-announces
+// over zeroconf and HA reconnects). The HA client also got a close-before-reconnect fix that stops
+// the leak at source — this is the firmware backstop so no future client can wedge us permanently.
+constexpr uint32_t WEDGE_REBOOT_MS = 5 * 60 * 1000;  // continuously at capacity this long => reboot
+uint32_t g_at_capacity_since_ms = 0;                 // millis() when we hit the cap; 0 = below cap
+
 const char* movementName(sdn::MovementState m) {
   switch (m) {
     case sdn::MovementState::MOVING_UP: return "up";
@@ -299,6 +311,23 @@ void loop() {
   if ((int32_t)(t - g_last_heartbeat_ms) >= (int32_t)HEARTBEAT_INTERVAL_MS) {
     broadcastState();
     g_last_heartbeat_ms = t;
+  }
+
+  // Wedge watchdog (see the note by g_at_capacity_since_ms): if every WS slot has been occupied
+  // continuously for WEDGE_REBOOT_MS, the server can no longer accept the HA coordinator — reboot
+  // to self-heal. Any drop below the cap resets the timer, so only a genuine stuck-full state trips.
+  if (g_server->connectedClients() >= WEBSOCKETS_SERVER_CLIENT_MAX) {
+    if (g_at_capacity_since_ms == 0) {
+      g_at_capacity_since_ms = t;
+    } else if ((uint32_t)(t - g_at_capacity_since_ms) >= WEDGE_REBOOT_MS) {
+      Serial.printf("[ws] WEDGE: %u clients at cap for >%us — rebooting to self-heal\n",
+                    g_server->connectedClients(), WEDGE_REBOOT_MS / 1000);
+      Serial.flush();
+      delay(50);
+      ESP.restart();
+    }
+  } else {
+    g_at_capacity_since_ms = 0;
   }
 }
 

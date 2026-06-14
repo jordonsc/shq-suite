@@ -72,6 +72,17 @@ class ActronMitmCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return
         self._connecting = True
         try:
+            # Tear down any previous connection before opening a new one. The availability
+            # monitor force-reconnects when state goes quiet for AVAILABILITY_TIMEOUT_S, which
+            # can fire while the old socket is still physically alive (e.g. the ESP went silent
+            # for >30 s but the TCP stayed half-open). Without an explicit close here, connect()
+            # would orphan that socket: it stays alive on its own WS keepalive and holds one of
+            # the firmware's WebSocketsServer client slots forever. Repeat a few times and every
+            # slot is a live-but-useless zombie, the ESP refuses all new handshakes, and the
+            # device looks dead to HA while HTTP stays fine. Closing sends a FIN so the firmware
+            # reaps the slot. (_connecting is set, so the cancel-driven _on_disconnect below
+            # won't queue a rival reconnect — _schedule_reconnect early-returns.)
+            await self._teardown_connection()
             try:
                 await self.client.connect()
             except Exception as err:  # noqa: BLE001
@@ -82,6 +93,18 @@ class ActronMitmCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._run_task = asyncio.create_task(self.client.run())
         finally:
             self._connecting = False
+
+    async def _teardown_connection(self):
+        """Cancel the reader task and close the socket so the firmware reaps our WS slot."""
+        task = self._run_task
+        self._run_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        await self.client.close()
 
     def _schedule_reconnect(self, delay: int = RECONNECT_DELAY_S):
         if self._shutdown or self._connecting:
