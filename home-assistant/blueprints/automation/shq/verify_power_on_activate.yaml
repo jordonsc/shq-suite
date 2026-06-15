@@ -1,0 +1,123 @@
+blueprint:
+  name: Verify power on activation
+  description: >-
+    When a device is switched on, wait a short settle period and check its
+    power draw. If the draw is below the expected threshold — the device
+    reports "on" but isn't actually running (e.g. a Shelly dimmer that engages
+    its output without illuminating) — power-cycle it (off, brief pause, on)
+    and re-check, up to a retry limit. Bounded by max cycles so a genuinely
+    dead device can't loop forever. Optionally notifies on each recovery cycle.
+  domain: automation
+  input:
+    target:
+      name: Target device
+      description: The light/switch to watch for turn-on and power-cycle.
+      selector:
+        entity:
+          domain:
+            - light
+            - switch
+    power_sensor:
+      name: Power sensor
+      description: The target's power-measurement sensor (watts).
+      selector:
+        entity:
+          domain: sensor
+          device_class: power
+    power_threshold:
+      name: Minimum power (W)
+      description: >-
+        If draw is below this after the settle delay, the activation is treated
+        as failed and the device is power-cycled.
+      default: 5
+      selector:
+        number:
+          min: 0
+          max: 1000
+          step: 0.5
+          unit_of_measurement: W
+          mode: box
+    check_delay:
+      name: Settle delay
+      description: How long to wait after turn-on before checking power.
+      default:
+        hours: 0
+        minutes: 0
+        seconds: 2
+      selector:
+        duration:
+    off_time:
+      name: Power-off time
+      description: How long to hold the device off during a cycle.
+      default:
+        hours: 0
+        minutes: 0
+        seconds: 1
+      selector:
+        duration:
+    max_retries:
+      name: Max cycles
+      description: Maximum power-cycle attempts per activation before giving up.
+      default: 3
+      selector:
+        number:
+          min: 1
+          max: 10
+          step: 1
+          mode: slider
+    notify_service:
+      name: Notify action
+      description: >-
+        Notify action to call on each recovery cycle (e.g.
+        notify.mobile_app_redacted_phone). Leave empty for no notification.
+      default: ""
+      selector:
+        text:
+
+variables:
+  target: !input target
+  power_sensor: !input power_sensor
+  power_threshold: !input power_threshold
+  notify_service: !input notify_service
+
+triggers:
+  - trigger: state
+    entity_id: !input target
+    to: "on"
+
+# mode: single — the recovery cycle's own off->on re-fires this trigger; while
+# the run is still looping, single drops it, so the bounded repeat below is the
+# only thing that re-checks. Without this the internal turn_on would spawn a
+# fresh run and reset the retry counter, looping forever on a dead device.
+mode: single
+
+actions:
+  - repeat:
+      count: !input max_retries
+      sequence:
+        - delay: !input check_delay
+        - if:
+            - condition: numeric_state
+              entity_id: !input power_sensor
+              below: !input power_threshold
+          then:
+            - if:
+                - condition: template
+                  value_template: "{{ notify_service != '' }}"
+              then:
+                - action: "{{ notify_service }}"
+                  data:
+                    title: Activation failed
+                    message: >-
+                      {{ state_attr(target, 'friendly_name') or target }} turned on but is
+                      drawing {{ states(power_sensor) }} W (below {{ power_threshold }} W).
+                      Power-cycling (attempt {{ repeat.index }}).
+            - action: homeassistant.turn_off
+              target:
+                entity_id: !input target
+            - delay: !input off_time
+            - action: homeassistant.turn_on
+              target:
+                entity_id: !input target
+          else:
+            - stop: Power draw OK
