@@ -42,6 +42,24 @@ Swapping Chrome to a clock URL would force an ugly dashboard reload on wake. A s
 
 Deployed **by the kiosk deployer** alongside the nyx binary to `/home/shq/display/chronos` (nyx resolves it via `current_exe().parent`). `./setup kiosk --build` builds it; a deploy without a built binary just skips it (clock mode is opt-in).
 
+## Rolling it out to a kiosk (runbook)
+
+Enabling the clock on a kiosk is a **runtime** operation, **not** a code/config change — `idle_mode` is per-kiosk state nyx persists to `~/.config/shqd/config.json`, driven by an HA select entity. There is no checked-in list of which kiosks use it (the live source of truth is HA + nyx; the human-readable map is the wiki). To roll out to one or more kiosks:
+
+1. **Identify the kiosk number.** The host→room map is premises-specific and lives privately — in the deploy config (`deploy/config/deployment/kiosk.yaml`, room comments) and the wiki estate notes — not in this public repo. HA friendly names are generic ("SHQ Display Kiosk NN"), so don't rely on them; use the map.
+2. **Check prerequisites** (chronos ships with the nyx 1.1.0+ kiosk deploy, so this is usually already satisfied fleet-wide):
+   - nyx ≥ 1.1.0: `sensor.shq_display_kiosk_NN_version` (older nyx reports `idle_mode` as `unknown`).
+   - chronos binary present: `ssh -i ~/.ssh/<key> <user>@<kiosk-host> 'ls -l /home/shq/display/chronos'` (host/user/key per the deploy config).
+   - If either is missing, `./setup kiosk --build` to (re)deploy nyx + chronos first.
+3. **Flip the mode** via the HA select (entity id pattern `select.shq_display_kiosk_NN_idle_mode`, options `off`|`clock`):
+   ```bash
+   ./ha post /api/services/select/select_option \
+     '{"entity_id": "select.shq_display_kiosk_NN_idle_mode", "option": "clock"}'
+   ```
+   The select reads back from nyx's own state, so re-reading it confirms nyx accepted and persisted the change. The clock then appears at that kiosk's next idle `auto_off_time`; a tap dismisses it.
+
+To disable, set the same select back to `off`. After a rollout, **update the wiki kiosk map** so the next session doesn't have to rediscover which kiosks are on the clock.
+
 ## Runtime requirements
 
 - A **wlroots-based Wayland compositor** advertising `zwlr_layer_shell_v1` (labwc on the kiosks).

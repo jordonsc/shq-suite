@@ -73,5 +73,5 @@ config/
 - All remote services are **systemd user services** (not system-wide)
 - Kiosk deployer templates the dashboard URL from hostname (e.g. `redacted.host` -> `dashboard-kiosks/kiosk02`)
 - Uses `loginctl enable-linger` so services persist without an active login session
-- SSH key: `~/.ssh/deploy.pem`, username: `shq` (kiosks/overwatch/dosa) or `jordonsc` (HA)
+- SSH key: `~/.ssh/jordon.pem`, username: `shq` (kiosks/overwatch/dosa) or `jordonsc` (HA). Manual check, e.g.: `ssh -i ~/.ssh/jordon.pem shq@<kiosk-host>` (real hosts live in the gitignored `config/deployment/*.yaml`). Remote binaries install to `/home/shq/display/` (`nyx`, `chronos`)
 - Kiosk `--build` builds **both** `nyx` and `chronos`; the deployer copies the chronos binary alongside nyx (after the `--delete` rsync, so it isn't wiped). The `nyx.service` template exports `WAYLAND_DISPLAY=wayland-0` so nyx can spawn chronos (a Wayland layer-shell client). See `chronos/CLAUDE.md`.

@@ -79,7 +79,7 @@ Use MAJOR.MINOR.PATCH: MAJOR = breaking API/protocol change, MINOR = new back-co
 - Deploy tool is symlinked as `./setup` in project root
 - Sensitive config lives in `deploy/config/` (gitignored)
 - All services run as **systemd user services** under the `shq` user
-- SSH auth via `~/.ssh/deploy.pem`
+- SSH auth via `~/.ssh/jordon.pem` (username `shq` for kiosks/overwatch/dosa, `jordonsc` for HA). The deploy targets/keys live in `deploy/config/deployment/*.yaml` (gitignored; mirrored in `shq-suite-config`)
 
 ### Home Assistant Components
 - `shq_display`, `overwatch`, `dosa` use YAML config (no config flow)
