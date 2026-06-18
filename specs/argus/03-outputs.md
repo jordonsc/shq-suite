@@ -3,7 +3,14 @@
 > Sub-spec of [Argus master plan](./00-master.md). Depends on **Phase 2** (`CaseState` + its
 > broadcast channel + timeline-event vocabulary).
 >
-> **Status: 📝 NOT STARTED.**
+> **Status: ✅ IMPLEMENTED & SHAPE-VERIFIED (2026-06-18); LIVE-FIRE DEFERRED.**
+> Overwatch gRPC voice client (tonic 0.11, proto symlinked from overwatch), the
+> positive-only gate (pure, unit-tested), the PagerDuty Events v2 client
+> (`build_event` split from `send` for shape-testing), and the `out::run` wiring
+> (timeline-diff → independent voice + PD channels) are all built and compile
+> warning-free; 9 unit tests pass. **No live-fire**: no real `SetAlarm`/
+> `Verbalise`/klaxon and no real PD page were sent (residence asleep). Owed for
+> sign-off: Overwatch reachable on the LAN + a real `PAGERDUTY_ROUTING_KEY`.
 >
 > **Goal:** act on `CaseState`. Speak **positive-only** progress through Overwatch to intimidate the
 > intruder, and dispatch/maintain a dossier on the security station (PagerDuty for M1).
@@ -105,9 +112,51 @@ pagerduty:
 ---
 
 ## Deviations from spec
-_(Implementing agent: record the final speakable-milestone whitelist, PD update cadence, and any
-Overwatch/PD quirks.)_
+
+- **Speakable-milestone whitelist (final):** `case_opened` → "Intruder detected.
+  Security protocol engaged."; `intruder_identified` → "Intruder identified."
+  (+ the latest identified intruder's descriptor if present);
+  `best_still_upgraded` → "Clear image captured."; `security_station_notified` →
+  "Security station has received your image and location.";
+  `threat_level_changed` → "Threat level elevated/critical." **only on an
+  escalation** (de-escalation is silent). **`intruder_detected` is deliberately
+  NOT spoken** (the case-open line already announced the protocol; per-subject
+  detection chatter is left to the HUD and would reveal we're still counting
+  people). `standdown`/`cleared` → silent. The gate is a whitelist `match` —
+  structurally incapable of a negative line; failure modes are never timeline
+  events so they have no path to the gate.
+- **Klaxon** is bound to case lifecycle, not a spoken line: `SetAlarm(enabled:
+  true)` on `case_opened`, `SetAlarm(enabled: false)` on `standdown`/`cleared`.
+  It and speech share ONE serial voice worker (klaxon tunnelled as a sentinel) so
+  a stop can't race a `Verbalise`.
+- **PD update cadence:** `trigger` (same dedup_key = `case_id`) on `case_opened`,
+  `intruder_detected`, `intruder_identified`, `threat_level_changed` (material
+  changes refresh the dossier); `resolve` on `standdown`/`cleared`.
+  `best_still_upgraded`/`security_station_notified` do NOT re-page on their own.
+- **`security_station_notified` (M1):** Phase 3 cannot mutate the engine-owned
+  `CaseState`, so it does NOT emit a `SecurityStationNotified` timeline event.
+  Instead the consumer speaks the security-station line **directly** on
+  `case_opened` (alongside the PD trigger). Wiring a feedback channel so the event
+  lands in the timeline (→ HUD ticker + gate) is a noted future. The reserved
+  `TimelineKind::SecurityStationNotified` is still mapped in the gate for when
+  that channel exists.
+- **No presigned URLs:** the PD `custom_details.evidence_s3_prefix` is the BARE
+  `s3://<bucket>/<prefix>/<case_id>/` (per 02a — atlas has write-only creds);
+  responders mint a presigned GET out-of-band with the admin principal.
+- **Build:** tonic/prost/tonic-build pinned to **0.11/0.12/0.11** (= Overwatch);
+  `proto/voice.proto` is a relative symlink to `../overwatch/proto/voice.proto`;
+  `build.rs` builds the **client only** (`build_server(false)`). System `protoc`
+  (libprotoc 34.1) used. PagerDuty reuses argus's existing `reqwest` (rustls) — no
+  new HTTP dep.
 
 ## Inputs to Phase 4
-_(Implementing agent: note anything Phase 4 should mirror — e.g. if best-still URLs are referenced in
-PD payloads, the URL scheme must match what Phase 4's HTTP server serves.)_
+
+- **PD payload uses NO best-still HTTP URLs yet** — only the bare S3 case prefix.
+  When Phase 4 serves `/stills/<id>.jpg`, the PD `custom_details` could additionally
+  carry those URLs; if so the URL scheme must match Phase 4's HTTP server.
+- **HUD ticker = the same `TimelineKind` vocabulary** Phase 3 maps. Phase 4 should
+  render every kind (including `security_station_notified` once the engine emits
+  it — see the M1 direct-speak deviation; today the HUD will NOT see that event
+  because Phase 3 speaks it directly without a timeline write).
+- **Voice + HUD share the case_id cursor pattern** (diff `timeline` length per
+  `case_id`) — Phase 4 can reuse `out::run`'s diffing approach.

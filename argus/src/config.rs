@@ -31,6 +31,71 @@ pub struct Config {
     /// Offsite case replication to S3 (Phase 2a). Absent block = disabled.
     #[serde(default)]
     pub offsite: OffsiteConfig,
+    /// Overwatch gRPC voice/klaxon output (Phase 3). Absent = voice disabled.
+    #[serde(default)]
+    pub overwatch: Option<OverwatchConfig>,
+    /// PagerDuty security-station output (Phase 3). Absent (or an empty
+    /// `routing_key`) = PagerDuty disabled.
+    #[serde(default)]
+    pub pagerduty: Option<PagerDutyConfig>,
+}
+
+/// Overwatch gRPC voice server (Phase 3 output sink).
+///
+/// Present = Argus speaks positive-only milestones and drives the klaxon via
+/// Overwatch's `VoiceService` (gRPC, port 50051). Absent = the voice channel is
+/// not spawned. Connection/RPC failures are logged, never fatal.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OverwatchConfig {
+    /// Overwatch host (the voice RPi). gRPC is plaintext on the LAN.
+    pub host: String,
+    /// gRPC port.
+    #[serde(default = "default_overwatch_port")]
+    pub port: u16,
+    /// `SetAlarm` alarm_id (a key in Overwatch's `alarms` config map).
+    #[serde(default = "default_alarm_id")]
+    pub alarm_id: String,
+    /// AWS Polly voice id for `Verbalise` (default "Amy").
+    #[serde(default = "default_voice_id")]
+    pub voice_id: String,
+    /// Volume 0.0–1.0 for both the klaxon and spoken lines.
+    #[serde(default = "default_volume")]
+    pub volume: f32,
+}
+
+fn default_overwatch_port() -> u16 {
+    50051
+}
+
+fn default_alarm_id() -> String {
+    "security".to_string()
+}
+
+fn default_voice_id() -> String {
+    "Amy".to_string()
+}
+
+fn default_volume() -> f32 {
+    1.0
+}
+
+/// PagerDuty Events v2 security-station dispatch (Phase 3 output sink).
+///
+/// The `routing_key` arrives via `${PAGERDUTY_ROUTING_KEY}` env-expansion and may
+/// be **empty or absent** — that is NOT a startup blocker, it simply disables the
+/// PagerDuty channel (a build/CI box has no key). `source` labels the PD event.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PagerDutyConfig {
+    /// Events v2 integration routing key. Empty = PagerDuty disabled. NEVER logged.
+    #[serde(default)]
+    pub routing_key: String,
+    /// PagerDuty `payload.source` (a fixed dedup-independent label).
+    #[serde(default = "default_pd_source")]
+    pub source: String,
+}
+
+fn default_pd_source() -> String {
+    "argus@atlas".to_string()
 }
 
 /// Real-time offsite replication of the case dir to S3 (Phase 2a).

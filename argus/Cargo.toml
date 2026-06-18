@@ -1,6 +1,6 @@
 [package]
 name = "argus"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Argus — AI-powered alarm assessment daemon (native x86_64, runs on atlas)"
 
@@ -43,3 +43,15 @@ directories = "5.0"
 # match reqwest above (no native OpenSSL). Explicit static write-only creds — no
 # aws-config / ambient credential chain.
 aws-sdk-s3 = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls"] }
+
+# Overwatch gRPC voice client (Phase 3). Versions pinned to match Overwatch's own
+# Cargo.toml (tonic 0.11 / prost 0.12) so the generated stubs are wire-compatible.
+# tonic's default transport pulls a TLS-free hyper client, which is what we want —
+# Overwatch's gRPC listens plaintext on the LAN.
+tonic = "0.11"
+prost = "0.12"
+
+[build-dependencies]
+# Compiles proto/voice.proto (a symlink to overwatch/proto/voice.proto) into
+# client stubs. Matches Overwatch's build.rs / tonic-build version.
+tonic-build = "0.11"

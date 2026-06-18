@@ -76,6 +76,9 @@ async fn main() -> Result<()> {
     // (Phase 2a) uses this receiver as a wake signal. We spawn it only in daemon
     // mode (a `--once` cycle is ephemeral and exits before an upload would matter).
     let offsite_rx = state_tx.subscribe();
+    // Same for the Phase 3 outputs consumer (voice + PagerDuty), taken before the
+    // sender moves into the engine.
+    let outputs_rx = state_tx.subscribe();
 
     let mut eng = Engine::new(cfg.clone(), rest, sonnet, opus, seed, state_tx);
 
@@ -89,6 +92,27 @@ async fn main() -> Result<()> {
         let base = case::default_case_base()?;
         info!("Spawning offsite S3 replication (Phase 2a)");
         tokio::spawn(out::offsite::run(offsite_cfg, base, offsite_rx));
+    }
+
+    // Phase 3 outputs. Voice spawns iff `overwatch:` is configured; PagerDuty iff
+    // a non-empty `routing_key` is present. An absent block / empty key disables
+    // that channel — neither is a hard blocker. Both log on failure, never crash.
+    let voice = cfg.overwatch.as_ref().map(|o| {
+        info!(host = %o.host, port = o.port, "Voice output enabled (Overwatch gRPC)");
+        out::voice::VoiceClient::new(&o.host, o.port, o.alarm_id.clone(), o.voice_id.clone(), o.volume)
+    });
+    let pagerduty = cfg.pagerduty.as_ref().and_then(|p| {
+        if p.routing_key.trim().is_empty() {
+            info!("PagerDuty configured but routing_key empty; PagerDuty output disabled");
+            None
+        } else {
+            info!(source = %p.source, "PagerDuty output enabled (Events v2)");
+            Some(out::pagerduty::PagerDuty::new(p.routing_key.clone(), p.source.clone()))
+        }
+    });
+    if voice.is_some() || pagerduty.is_some() {
+        info!("Spawning Phase 3 outputs consumer (voice + PagerDuty)");
+        tokio::spawn(out::run(outputs_rx, voice, pagerduty, cfg.offsite.clone()));
     }
 
     run_daemon(cfg, eng).await

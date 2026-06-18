@@ -7,10 +7,13 @@ with the private premises seed, and logs a natural-language assessment.
 **Native x86_64** service that runs on **atlas** (the HA + RAG host) — `cargo
 build --release` + systemd, **not** a `cross`/Podman RPi build like nyx/overwatch/dosa.
 
-> **Phase status:** Phases 1 (foundation) and 2 (assessment loop + `CaseState`)
-> complete. Offsite resilience (2a), outputs (Overwatch/PagerDuty, Phase 3), the
-> kiosk HUD (Phase 4), and the HA component (Phase 5) are later phases. See
-> `specs/argus/` (read `00-master.md` first).
+> **Phase status:** Phases 1 (foundation), 2 (assessment loop + `CaseState`), 2a
+> (offsite S3 resilience), and 3 (outputs — Overwatch voice + PagerDuty) are
+> implemented + shape-verified. The kiosk HUD (Phase 4) and the HA component
+> (Phase 5) are later phases. See `specs/argus/` (read `00-master.md` first).
+> **Phase 3 is NOT live-fired**: voice (`SetAlarm`/`Verbalise`) and PagerDuty
+> sends are wired + compiled + shape-tested only — no real klaxon/page has been
+> sent (residence-asleep constraint).
 
 ## The `CaseState` contract
 
@@ -37,7 +40,10 @@ replicated to S3 — **one schema, three surfaces**. The LLM returns *deltas*
 | `src/ha/ws.rs` | HA WS client: auth handshake, `subscribe_events`/`state_changed`, reconnect+backoff, emits `HaEvent::{AlarmTriggered, AlarmCleared}` over an mpsc channel |
 | `src/ha/rest.rs` | `RestClient::snapshot(entity)` → JPEG; `state(entity)` + `telemetry(entities)` → per-tick sensor text |
 | `src/llm/mod.rs` | `AnthropicClient::assess(&AssessRequest)` → `Completion { text, usage }`. Raw HTTP to `/v1/messages`; multi-image base64 vision, `cache_control` seed, `Reasoning::{Fast,Deep}` (Sonnet effort-low/no-think vs Opus adaptive+high), optional `output_config.format` structured output |
-| `src/out/mod.rs` | Output-sink module (Phase 2a+). Declares `pub mod offsite;` — sinks consume the `CaseState` stream + case dir; none call the LLM/HA |
+| `src/out/mod.rs` | Output-sink module (Phase 2a+). Declares `offsite`/`voice`/`voice_policy`/`pagerduty`; sinks consume the `CaseState` stream + case dir, none call the LLM/HA. **Phase 3 `run()`** subscribes to the `watch` channel, diffs the timeline per `case_id` (length cursor), and routes each NEW `TimelineEvent` to the voice gate + PagerDuty as INDEPENDENT channels (one failing never blocks the other). Speech is serialised through a single voice worker (mpsc) so milestones don't talk over each other; klaxon on/off is tunnelled as a sentinel on the same channel so a stop can't race a line |
+| `src/out/voice.rs` | **Phase 3** Overwatch gRPC client. `build.rs` (tonic-build 0.11) compiles `proto/voice.proto` (a relative symlink to `../overwatch/proto/voice.proto`) into the `voice` module (client only). `VoiceClient::{set_alarm,verbalise}` dial `host:port` lazily per call; on connect/RPC failure they log + return (never panic, never block the PD channel) |
+| `src/out/voice_policy.rs` | **Phase 3** the POSITIVE-ONLY gate: pure `line_for(event, state) -> Option<SpokenLine>`. A whitelist `match` over `TimelineKind` — `case_opened`/`intruder_identified`/`best_still_upgraded`/`security_station_notified` speak; `threat_level_changed` speaks ONLY on escalation (parses the engine's `"<from> → <to>"` detail); `intruder_detected`/`standdown`/`cleared` → `None`. Structurally cannot emit a failure line (failures aren't timeline events). Unit-tested (no network) |
+| `src/out/pagerduty.rs` | **Phase 3** PagerDuty Events v2 (`reqwest`, reuses the rustls client). `build_event()` (PURE, no network — the shape-test surface) is split from `send()`. `trigger` (dedup_key=`case_id`) on case open + material change; `resolve` on standdown. `custom_details` = threat level + intruders + recent timeline + the deterministic `s3://<bucket>/<prefix>/<case_id>/` prefix when offsite is enabled (bare prefix — atlas has write-only creds, NO presigned URL). Routing key never logged |
 | `src/out/offsite.rs` | **Phase 2a** offsite S3 replicator: `run(cfg, base, wake)` walks `<base>/cases/`, PUTs each non-`.tmp`/un-`.uploaded` file (events+stills first), drops a `.uploaded` marker, retries with `retry_backoff_secs`. Woken by the `watch` receiver, with a `scan_interval_secs` re-scan fallback (+ startup crash recovery). EXPLICIT static write-only creds (`aws-sdk-s3`, rustls), NOT the ambient chain; relies on bucket-default Object Lock |
 
 ## Config
@@ -85,7 +91,10 @@ Deploy as a systemd **user** service (`argus.service.example`).
 - **Structured output**: the LLM returns JSON via `output_config.format` (`{type:"json_schema", schema}`). Schema rules: every object `additionalProperties:false`, all props `required`, optional fields nullable-but-required (`["string","null"]`), **no** numeric/string constraints (`minimum`/`maxLength`). The model emits *deltas* (`LiveAssessment`/`Identification`); Argus derives the `timeline`.
 - **Case dir = upload queue**: each `events/NNNNNN.json` + `stills/*.jpg` is written atomically (`.tmp` then rename) and is an independent unit. Phase 2a adds upload markers + an S3 mirror; don't change the per-file granularity.
 - **Offsite is write-only by design (Phase 2a)**: `src/out/offsite.rs` builds the S3 client from EXPLICIT static creds (an `s3:PutObject`-only IAM key), never the ambient/instance chain — a compromised atlas must not be able to read or delete prior evidence. The case dir *is* the durable queue: a file with a sibling `<file>.uploaded` marker is done, a `.tmp` is an in-progress write (skip both); failed PUTs retry next pass with `retry_backoff_secs` backoff. Object immutability is the **bucket's** Object Lock — Argus sets no per-object retention. S3 key = `<prefix>/<case_id>/<rest>` (the path relative to `cases/`). The `upload.routine_frames`/`best_stills` throttles are parsed but near-no-ops today (Phase 2 only persists best stills to disk; `#[allow(dead_code)]` on those fields).
-- **`watch` channel**: the engine broadcasts `Option<CaseState>` on every mutation; Phases 3/4 subscribe (`state_tx.subscribe()`), not poll. `main` currently drops `_state_rx` — Phases 3/4 keep it.
+- **`watch` channel**: the engine broadcasts `Option<CaseState>` on every mutation; Phases 3/4 subscribe (`state_tx.subscribe()`), not poll. `main` takes `offsite_rx` (2a) and `outputs_rx` (3) BEFORE `state_tx` moves into `Engine::new`.
+- **Phase 3 config guards**: voice spawns iff `overwatch:` is present; PagerDuty spawns iff `pagerduty.routing_key` is non-empty. Either absent disables only that channel — never a hard error. Spawned in DAEMON mode only (not `--once`).
+- **Proto symlink + tonic version pin**: `argus/proto/voice.proto` is a *relative* symlink to `../overwatch/proto/voice.proto` (same trick as the HA component). `build.rs` runs `tonic_build::configure().build_server(false).compile(...)`. tonic/prost/tonic-build are pinned to **0.11/0.12/0.11** to match Overwatch's Cargo.toml so the stubs are wire-compatible. Needs `protoc` on PATH at build time (system protoc, as Overwatch's `setup-wsl2.sh` installs).
+- **`security_station_notified` (M1 direct-speak)**: Phase 3 CANNOT mutate the engine-owned `CaseState`, so it can't push a `SecurityStationNotified` timeline event for the gate to pick up. For M1, the outputs consumer speaks the security-station line **directly** on `CaseOpened` (when it also fires the PD trigger) rather than via the gate. **Noted future:** a feedback channel back to the engine so the event lands in the timeline → HUD ticker (Phase 4) and the gate, instead of a hard-coded direct line.
 - **Daemon vs `--once`**: the daemon assesses **every** configured camera on each trigger; the shipped example configures one (so "exactly one assessment per trigger" holds). Multi-camera fan-out is formalised in Phase 2.
 
 ## Versioning

@@ -65,3 +65,27 @@ telemetry_entities: []
 #     routine_sample_secs: 30
 #     retry_backoff_secs: [2, 5, 15, 60]  # per-pass backoff on PUT failures
 #     scan_interval_secs: 5               # periodic re-scan fallback (also crash recovery)
+
+# Overwatch gRPC voice output (Phase 3). Present = Argus speaks POSITIVE-ONLY
+# milestones (intruder identified / clear image captured / security station
+# notified) and drives the security klaxon (SetAlarm loop) to intimidate an
+# intruder. The gate structurally never speaks a failure/uncertainty. Absent
+# block = voice disabled. Connection/RPC failures are logged, never fatal.
+#
+# overwatch:
+#   host: "<overwatch-host>"              # the voice RPi (gRPC plaintext on the LAN)
+#   port: 50051
+#   alarm_id: "security"                  # key in Overwatch's `alarms` config map
+#   voice_id: "Amy"                       # AWS Polly voice for Verbalise
+#   volume: 1.0                           # 0.0–1.0, for both klaxon and speech
+
+# PagerDuty Events v2 security-station dispatch (Phase 3). trigger on case open +
+# material change (same dedup_key = case_id), resolve on standdown. The dossier
+# (threat level, intruders, recent timeline, and the bare S3 case prefix if
+# offsite is configured) rides in custom_details. An ABSENT block OR an empty
+# routing_key disables PagerDuty — that is NOT a startup blocker (a build/CI box
+# has no key). The routing_key is never logged.
+#
+# pagerduty:
+#   routing_key: "${PAGERDUTY_ROUTING_KEY}"   # Events v2 integration key; empty = disabled
+#   source: "argus@atlas"                     # payload.source label
