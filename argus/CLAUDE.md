@@ -28,7 +28,7 @@ replicated to S3 — **one schema, three surfaces**. The LLM returns *deltas*
 | File | Purpose |
 |------|---------|
 | `src/main.rs` | Entry point + CLI. Loads config/seed; builds the Sonnet + Opus clients + the `watch<Option<CaseState>>` channel; `--once` (single tick → print CaseState) and the daemon (Ctrl-C aborts the engine task) |
-| `src/config.rs` | `config.yaml` loader. `${VAR}` env expansion, `~` expansion, default path `~/.config/argus/config.yaml`. Adds `loop_config` (cadence/cap) + `telemetry_entities` |
+| `src/config.rs` | `config.yaml` loader. `${VAR}` env expansion, `~` expansion, default path `~/.config/argus/config.yaml`. Adds `loop_config` (cadence/cap) + `telemetry_entities` + `offsite` (Phase 2a S3 replication; `OffsiteConfig`/`UploadConfig`) |
 | `src/case.rs` | **The `CaseState` contract** + `LiveAssessment`/`Identification` LLM-output types, their `*_schema()` JSON schemas, `TimelineKind` vocabulary, and `CaseDir` (the on-disk journal = Phase 2a upload queue) |
 | `src/engine.rs` | The assessment loop: per-tick multi-camera capture + telemetry → Sonnet live loop → merge into `CaseState` → best stills + Opus forensic; state machine; daily token cap; broadcast + journal |
 | `src/version.rs` | `ARGUS_VERSION` from `CARGO_PKG_VERSION` |
@@ -37,6 +37,8 @@ replicated to S3 — **one schema, three surfaces**. The LLM returns *deltas*
 | `src/ha/ws.rs` | HA WS client: auth handshake, `subscribe_events`/`state_changed`, reconnect+backoff, emits `HaEvent::{AlarmTriggered, AlarmCleared}` over an mpsc channel |
 | `src/ha/rest.rs` | `RestClient::snapshot(entity)` → JPEG; `state(entity)` + `telemetry(entities)` → per-tick sensor text |
 | `src/llm/mod.rs` | `AnthropicClient::assess(&AssessRequest)` → `Completion { text, usage }`. Raw HTTP to `/v1/messages`; multi-image base64 vision, `cache_control` seed, `Reasoning::{Fast,Deep}` (Sonnet effort-low/no-think vs Opus adaptive+high), optional `output_config.format` structured output |
+| `src/out/mod.rs` | Output-sink module (Phase 2a+). Declares `pub mod offsite;` — sinks consume the `CaseState` stream + case dir; none call the LLM/HA |
+| `src/out/offsite.rs` | **Phase 2a** offsite S3 replicator: `run(cfg, base, wake)` walks `<base>/cases/`, PUTs each non-`.tmp`/un-`.uploaded` file (events+stills first), drops a `.uploaded` marker, retries with `retry_backoff_secs`. Woken by the `watch` receiver, with a `scan_interval_secs` re-scan fallback (+ startup crash recovery). EXPLICIT static write-only creds (`aws-sdk-s3`, rustls), NOT the ambient chain; relies on bucket-default Object Lock |
 
 ## Config
 
@@ -82,6 +84,7 @@ Deploy as a systemd **user** service (`argus.service.example`).
 - **Prompt-cache floors differ by model**: Sonnet 4.6 caches a ≥2048-token prefix; **Opus 4.8 needs ≥4096 tokens**. `seed.example.md` (~2265 tokens) caches on Sonnet but is below the Opus floor — the **real premises seed must exceed ~4096 tokens** for the Opus forensic path to get cache reads.
 - **Structured output**: the LLM returns JSON via `output_config.format` (`{type:"json_schema", schema}`). Schema rules: every object `additionalProperties:false`, all props `required`, optional fields nullable-but-required (`["string","null"]`), **no** numeric/string constraints (`minimum`/`maxLength`). The model emits *deltas* (`LiveAssessment`/`Identification`); Argus derives the `timeline`.
 - **Case dir = upload queue**: each `events/NNNNNN.json` + `stills/*.jpg` is written atomically (`.tmp` then rename) and is an independent unit. Phase 2a adds upload markers + an S3 mirror; don't change the per-file granularity.
+- **Offsite is write-only by design (Phase 2a)**: `src/out/offsite.rs` builds the S3 client from EXPLICIT static creds (an `s3:PutObject`-only IAM key), never the ambient/instance chain — a compromised atlas must not be able to read or delete prior evidence. The case dir *is* the durable queue: a file with a sibling `<file>.uploaded` marker is done, a `.tmp` is an in-progress write (skip both); failed PUTs retry next pass with `retry_backoff_secs` backoff. Object immutability is the **bucket's** Object Lock — Argus sets no per-object retention. S3 key = `<prefix>/<case_id>/<rest>` (the path relative to `cases/`). The `upload.routine_frames`/`best_stills` throttles are parsed but near-no-ops today (Phase 2 only persists best stills to disk; `#[allow(dead_code)]` on those fields).
 - **`watch` channel**: the engine broadcasts `Option<CaseState>` on every mutation; Phases 3/4 subscribe (`state_tx.subscribe()`), not poll. `main` currently drops `_state_rx` — Phases 3/4 keep it.
 - **Daemon vs `--once`**: the daemon assesses **every** configured camera on each trigger; the shipped example configures one (so "exactly one assessment per trigger" holds). Multi-camera fan-out is formalised in Phase 2.
 

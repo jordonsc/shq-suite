@@ -3,7 +3,11 @@
 > Sub-spec of [Argus master plan](./00-master.md). Depends on **Phase 2** (the `CaseState`, its
 > event journal, and the case-dir still files).
 >
-> **Status: 📝 NOT STARTED.**
+> **Status: ✅ IMPLEMENTED (2026-06-18), build warning-free.** Offsite S3
+> replicator off the case dir (write-only static creds, events+stills first,
+> `.uploaded` markers, watch-woken + periodic re-scan, backoff). **Live S3
+> deferred** — no AWS creds this window; bucket + write-only IAM principal owed.
+> See Deviations.
 >
 > **Build priority: immediately after Phase 2, BEFORE Phases 3–4.** Surviving evidence outranks
 > intimidation theatre.
@@ -142,10 +146,76 @@ offsite:
 ---
 
 ## Deviations from spec
-_(Implementing agent: record the final S3 layout, the queue/marker mechanism, the exact IAM policy +
-Object Lock retention used, throttle numbers, and how the kill-atlas-mid-case test went.)_
+
+**Status: ✅ IMPLEMENTED (2026-06-18), build warning-free; live S3 DEFERRED**
+(no AWS creds this window — code + request shapes done, bucket/IAM owed).
+
+- **Replicator** (`src/out/offsite.rs`, module `src/out/mod.rs`): `async run(cfg:
+  OffsiteConfig, base: PathBuf, wake: watch::Receiver<Option<CaseState>>)`. Built
+  on **`aws-sdk-s3` 1.137** (`default-features=false`, features
+  `["behavior-version-latest","rustls"]` — rustls to match the rest of the crate;
+  **no `aws-config`**). The client uses **explicit static credentials**
+  (`Credentials::new(...)` → `Config::builder().behavior_version(latest)
+  .region(...).credentials_provider(...).build()` → `Client::from_conf`) — the
+  write-only key by design, **not** the ambient/instance-role chain.
+- **The case dir IS the queue** (no separate buffer). Each pass walks
+  `<base>/cases/`, and for every regular file that is not a `.tmp` (in-progress
+  atomic write), not a `.uploaded` marker, and lacks a sibling `<file>.uploaded`,
+  it reads the bytes and `PutObject`s, then atomically drops `<file>.uploaded`.
+  **Prioritisation**: `events/*.json` + `stills/*.jpg` (the evidence) sort/upload
+  **before** `state.json`/`dossier.json`/`manifest.json`.
+- **S3 key = `<prefix>/<rel>`** where `rel` is the path relative to
+  `<base>/cases/` — i.e. `<case_id>/<rest>`. With the default prefix `cases`,
+  `events/000001.json` → `cases/<case_id>/events/000001.json` (the spec layout
+  1:1). Content-type `image/jpeg` for `.jpg`, `application/json` for `.json`.
+  Relies on **bucket-default Object Lock retention** — no per-object retention or
+  legal hold is set.
+- **Real-time + durable**: woken promptly by `wake.changed()` (the Phase 2 watch
+  broadcast), with a `scan_interval_secs` (default 5) periodic re-scan as the
+  fallback that catches stills written between events **and** does
+  crash/restart recovery (the first scan re-uploads anything unmarked). A pass
+  with any PUT failure escalates an inter-pass backoff through
+  `retry_backoff_secs` (default `[2,5,15,60]`, capped at the last), reset on a
+  clean pass. Never panics, never drops an event.
+- **Wiring** (`main.rs`): `let offsite_rx = state_tx.subscribe();` is taken
+  **before** `state_tx` moves into `Engine::new`; then, in daemon mode only (not
+  `--once`), `if cfg.offsite.enabled { tokio::spawn(out::offsite::run(
+  cfg.offsite.clone(), case::default_case_base()?, offsite_rx)); }`. If `enabled`
+  but creds/bucket are empty, `run` logs a warning and the task exits cleanly —
+  it never crashes the daemon (validation at spawn, not config-parse).
+- **Throttle fields are near-no-ops today** (`#[allow(dead_code)]`): Phase 2 only
+  persists *best stills* to disk (routine all-camera frames are not written), so
+  `best_stills`/`routine_frames`/`routine_sample_secs` have no read site yet —
+  kept for forward-compat when routine-frame sampling is added.
+- **Owed before DoD sign-off** (none are hard blockers; recorded as owed):
+  - **Bucket provisioning**: dedicated bucket in `ap-southeast-2`, Block Public
+    Access on, **versioning + Object Lock compliance mode, ~1-year retention**,
+    SSE-S3.
+  - **Write-only IAM principal** for atlas: policy granting **only**
+    `s3:PutObject` (+ `s3:PutObjectRetention` only if the lock config needs it) on
+    `arn:aws:s3:::<bucket>/cases/*` — **no** `Delete*`/`Get*`/`List*`. Retrieval
+    uses a separate, locked-down principal.
+  - **Creds** via env (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`), never
+    committed; bucket name/region/IAM principal recorded **privately** in
+    `shq-suite-config` / wiki `estate/`.
+  - **DoD 1–5** (real-time arrival, kill-atlas partial recovery, write-only creds
+    can't read/delete, outage resume, throttle) — all require the live bucket.
+- **Versioning**: argus bumped `0.2.0 → 0.3.0` (new feature).
+- **M1 limitation reaffirmed**: a WAN cut defeats real-time push. M2 = LTE
+  out-of-band egress (hardware).
 
 ## Inputs to Phase 3
-_(Implementing agent: if PagerDuty payloads should link the S3 case, document the URL/prefix scheme
-and how presigned read URLs are minted out-of-band — atlas's write-only creds cannot generate read
-URLs.)_
+
+- **PagerDuty → S3 link**: the case's S3 prefix is deterministic —
+  `s3://<bucket>/<prefix>/<case_id>/` (`case_id` is the PagerDuty `dedup_key`),
+  so Phase 3 can embed the prefix in the PD payload `custom_details` without any
+  runtime S3 call. The `CaseState.case_id` is the single join key.
+- **No presigned URLs from atlas**: atlas holds **write-only** creds and
+  **cannot** mint read/presigned URLs. If responders need a clickable link,
+  generate a presigned GET **out-of-band** with the separate admin principal (not
+  in Argus). Phase 3 should embed the bare `s3://…/<case_id>/` prefix (or a
+  console path), not a presigned URL.
+- **`security_station_notified` timeline event**: Phase 3 emits this when it PUTs
+  to PagerDuty (the `TimelineKind` is reserved for it, per Phase 2's Inputs); the
+  offsite replicator will then carry that event object offsite like any other —
+  no extra Phase-2a work needed.

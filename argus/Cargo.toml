@@ -1,6 +1,6 @@
 [package]
 name = "argus"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Argus — AI-powered alarm assessment daemon (native x86_64, runs on atlas)"
 
@@ -38,3 +38,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Config/home-dir resolution (~/.config/argus precedent, mirrors nyx)
 directories = "5.0"
+
+# Offsite case replication (Phase 2a): S3 mirror of the case dir. rustls TLS to
+# match reqwest above (no native OpenSSL). Explicit static write-only creds — no
+# aws-config / ambient credential chain.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls"] }

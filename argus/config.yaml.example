@@ -39,3 +39,29 @@ loop_config:
 telemetry_entities: []
   # - binary_sensor.garage_door
   # - binary_sensor.front_door
+
+# Offsite case replication to S3 (Phase 2a). Mirrors the on-disk case dir
+# (events, best stills, state, dossier) to an immutable S3 bucket in real time so
+# the case survives destruction of atlas mid-incident. The case dir is the durable
+# upload queue (per-file `.uploaded` markers + retry/backoff). Disabled by default;
+# an absent block is equivalent to `enabled: false`.
+#
+# Provision: a DEDICATED bucket in ap-southeast-2, Block Public Access on,
+# versioning + Object Lock (compliance mode, ~1y retention), SSE-S3. atlas gets a
+# WRITE-ONLY IAM key (s3:PutObject only, scoped to cases/*) — no Delete/Get/List —
+# so a compromised atlas cannot read or erase prior evidence. Retrieval uses a
+# separate, locked-down principal. Keep bucket name/region in the private config.
+#
+# offsite:
+#   enabled: false
+#   bucket: "shq-argus-cases"             # estate detail — keep in private config
+#   region: "ap-southeast-2"              # away-from-premises region
+#   prefix: "cases"                       # key = <prefix>/<case_id>/<rest>
+#   aws_access_key_id: "${AWS_ACCESS_KEY_ID}"          # write-only IAM key
+#   aws_secret_access_key: "${AWS_SECRET_ACCESS_KEY}"  # never committed
+#   upload:
+#     best_stills: always                 # evidence is never throttled
+#     routine_frames: sampled             # always | sampled | never (forward-compat; see CLAUDE.md)
+#     routine_sample_secs: 30
+#     retry_backoff_secs: [2, 5, 15, 60]  # per-pass backoff on PUT failures
+#     scan_interval_secs: 5               # periodic re-scan fallback (also crash recovery)

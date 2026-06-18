@@ -28,6 +28,114 @@ pub struct Config {
     /// motion/reed/DOSA). Rendered as text after the cached seed.
     #[serde(default)]
     pub telemetry_entities: Vec<String>,
+    /// Offsite case replication to S3 (Phase 2a). Absent block = disabled.
+    #[serde(default)]
+    pub offsite: OffsiteConfig,
+}
+
+/// Real-time offsite replication of the case dir to S3 (Phase 2a).
+///
+/// An absent `offsite:` block (or `enabled: false`) disables it entirely, hence
+/// every field has a `#[serde(default)]`. The two AWS keys come via `${VAR}`
+/// env-expansion (handled by [`Config::load`]); they default to empty strings so
+/// the config still parses when the secrets are absent in a build/CI context —
+/// they're only *required* (and validated) when `enabled` is true.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct OffsiteConfig {
+    /// Master switch. False (the default) = no S3 client is built, no task spawned.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Destination bucket (estate detail — kept in the private config, not the repo).
+    #[serde(default)]
+    pub bucket: String,
+    /// Away-from-premises region.
+    #[serde(default = "default_region")]
+    pub region: String,
+    /// Key prefix; the case tree mirrors under `<prefix>/<case_id>/...`.
+    #[serde(default = "default_prefix")]
+    pub prefix: String,
+    /// Write-only S3 access key id (`${AWS_ACCESS_KEY_ID}` env-expanded).
+    #[serde(default)]
+    pub aws_access_key_id: String,
+    /// Write-only S3 secret (`${AWS_SECRET_ACCESS_KEY}` env-expanded). Never logged.
+    #[serde(default)]
+    pub aws_secret_access_key: String,
+    /// Upload throttling / retry policy.
+    #[serde(default)]
+    pub upload: UploadConfig,
+}
+
+fn default_region() -> String {
+    "ap-southeast-2".to_string()
+}
+
+fn default_prefix() -> String {
+    "cases".to_string()
+}
+
+/// How aggressively the replicator pushes, and how it backs off on failure.
+///
+/// The three throttle fields below (`best_stills` / `routine_frames` /
+/// `routine_sample_secs`) are parsed now so the config shape is stable, but not
+/// yet *read*: Phase 2 only persists best stills to the case dir (routine
+/// all-camera frames are NOT written to disk), so the throttle is currently a
+/// near-no-op — best stills + events are always replicated. They become live when
+/// routine-frame sampling is added. Hence `#[allow(dead_code)]` on them.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UploadConfig {
+    /// Best-stills policy: `always` (the evidence is never throttled).
+    #[serde(default = "default_best_stills")]
+    #[allow(dead_code)]
+    pub best_stills: String,
+    /// Routine all-camera-frame policy: `always | sampled | never`.
+    #[serde(default = "default_routine_frames")]
+    #[allow(dead_code)]
+    pub routine_frames: String,
+    /// Min seconds between sampled routine frames when `routine_frames: sampled`.
+    #[serde(default = "default_routine_sample_secs")]
+    #[allow(dead_code)]
+    pub routine_sample_secs: u64,
+    /// Per-pass exponential backoff schedule (seconds) applied after a failing
+    /// pass; escalates with consecutive failures, capped at the last value.
+    #[serde(default = "default_retry_backoff_secs")]
+    pub retry_backoff_secs: Vec<u64>,
+    /// Periodic re-scan interval (seconds) — the fallback that catches stills
+    /// written between events plus crash/restart recovery, independent of the
+    /// `watch` wake signal.
+    #[serde(default = "default_scan_interval_secs")]
+    pub scan_interval_secs: u64,
+}
+
+impl Default for UploadConfig {
+    fn default() -> Self {
+        Self {
+            best_stills: default_best_stills(),
+            routine_frames: default_routine_frames(),
+            routine_sample_secs: default_routine_sample_secs(),
+            retry_backoff_secs: default_retry_backoff_secs(),
+            scan_interval_secs: default_scan_interval_secs(),
+        }
+    }
+}
+
+fn default_best_stills() -> String {
+    "always".to_string()
+}
+
+fn default_routine_frames() -> String {
+    "sampled".to_string()
+}
+
+fn default_routine_sample_secs() -> u64 {
+    30
+}
+
+fn default_retry_backoff_secs() -> Vec<u64> {
+    vec![2, 5, 15, 60]
+}
+
+fn default_scan_interval_secs() -> u64 {
+    5
 }
 
 /// Assessment-loop cadence and cost guardrails (Phase 2).

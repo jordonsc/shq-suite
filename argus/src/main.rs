@@ -15,6 +15,7 @@ mod config;
 mod engine;
 mod ha;
 mod llm;
+mod out;
 mod state;
 mod version;
 
@@ -68,14 +69,26 @@ async fn main() -> Result<()> {
         cfg.anthropic.id_model.clone(),
     )?;
 
-    // Broadcast latest CaseState (Phases 3/4 subscribe in-process).
+    // Broadcast latest CaseState (Phases 2a/3/4 subscribe in-process).
     let (state_tx, _state_rx) = watch::channel::<Option<case::CaseState>>(None);
+
+    // Subscribe BEFORE moving `state_tx` into the engine: the offsite replicator
+    // (Phase 2a) uses this receiver as a wake signal. We spawn it only in daemon
+    // mode (a `--once` cycle is ephemeral and exits before an upload would matter).
+    let offsite_rx = state_tx.subscribe();
 
     let mut eng = Engine::new(cfg.clone(), rest, sonnet, opus, seed, state_tx);
 
     if cli.once {
         eng.run_once().await?;
         return Ok(());
+    }
+
+    if cfg.offsite.enabled {
+        let offsite_cfg = cfg.offsite.clone();
+        let base = case::default_case_base()?;
+        info!("Spawning offsite S3 replication (Phase 2a)");
+        tokio::spawn(out::offsite::run(offsite_cfg, base, offsite_rx));
     }
 
     run_daemon(cfg, eng).await
