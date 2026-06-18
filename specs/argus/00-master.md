@@ -99,9 +99,12 @@ alarm_control_panel.shq_alarm ──triggered──► Home Assistant (atlas)
   compromised atlas cannot tamper with or delete prior evidence. Evidence durability outranks the
   intimidation theatre — Phase 2a builds before Phases 3–4.
 - **The premises SEED is private and is the product's quality ceiling.** Floor plan, camera→room
-  map, resident & vehicle whitelist (with reference images for Opus to anchor on), and the
-  escalation policy. Lives in `shq-suite-config` / wiki `estate/`, **never** the public repo. The
-  public repo ships `argus/seed.example.md` only.
+  map, **camera imaging / IR night-vision metadata** (so the model doesn't misread IR illuminator
+  reflections off vehicle bodywork/headlight optics/number plates as lights being "on" — a verified
+  Phase-1 false positive), resident & vehicle whitelist (with reference images for Opus to anchor
+  on), and the escalation policy. Lives in `shq-suite-config` / wiki `estate/`, **never** the public
+  repo. The public repo ships `argus/seed.example.md` only. **Note:** the seed must exceed Sonnet's
+  ~2048-token cache floor for the prompt-cache economics to apply (the example template is below it).
 - **Versioning:** bump `argus/Cargo.toml` semver on every flashed/deployed change; HA component
   version in `custom_components/argus/manifest.json` independently. Maintain `argus/CLAUDE.md` and
   per-component docs as you go.
@@ -110,7 +113,7 @@ alarm_control_panel.shq_alarm ──triggered──► Home Assistant (atlas)
 
 | Phase | Spec | Goal | Status |
 |-------|------|------|--------|
-| 1 | [`01-foundation.md`](./01-foundation.md) | Skeleton + HA client + Anthropic vision: **trigger → still → assessment** on one camera, end-to-end | 📝 Not started |
+| 1 | [`01-foundation.md`](./01-foundation.md) | Skeleton + HA client + Anthropic vision: **trigger → still → assessment** on one camera, end-to-end | ✅ Implemented & verified (2026-06-18) — DoD 1–3 confirmed live (build, real Sonnet assessment, seed cache write→read); only DoD 4 (live trigger) unrun. Cache floor finding: real seed must exceed ~2048 tokens |
 | 2 | [`02-assessment-loop.md`](./02-assessment-loop.md) | Full multi-camera + telemetry loop; tiered Sonnet/Opus; prompt-cached seed; the **`CaseState`** contract | 📝 Not started |
 | 2a | [`02a-case-resilience.md`](./02a-case-resilience.md) | **Real-time offsite replication** of the case to S3 (immutable, write-only creds) — so the case survives destruction of atlas. **Build before Phases 3–4.** | 📝 Not started |
 | 3 | [`03-outputs.md`](./03-outputs.md) | Overwatch **positive-only** voice + PagerDuty trigger/resolve with the dossier | 📝 Not started |
@@ -145,7 +148,7 @@ client, Anthropic vision client, `trigger → still → assessment` on one camer
 read this master + `01-foundation.md` and can start cold.
 
 **Owed separately:** the **real premises seed** is a private authoring pass with the user (floor plan,
-camera→room map, resident/vehicle whitelist + reference images, escalation policy) into
-`shq-suite-config`/wiki — the quality ceiling for every assessment. Phase 1 ships only
-`argus/seed.example.md`. **M2 hardening:** LTE out-of-band egress so a WAN cut can't defeat offsite
+camera→room map, camera imaging/IR night-vision metadata, resident/vehicle whitelist + reference
+images, escalation policy) into `shq-suite-config`/wiki — the quality ceiling for every assessment.
+Phase 1 ships only `argus/seed.example.md`. Must exceed ~2048 tokens for prompt-caching to engage. **M2 hardening:** LTE out-of-band egress so a WAN cut can't defeat offsite
 replication (Phase 2a is best-effort on a single WAN).

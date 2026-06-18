@@ -53,6 +53,7 @@ Use MAJOR.MINOR.PATCH: MAJOR = breaking API/protocol change, MINOR = new back-co
 | `chronos/` | Rust | Fullscreen clock overlay (wlr-layer-shell) shown over the kiosk dashboard as an optional idle screensaver; spawned/killed by nyx for kiosks in `idle_mode: clock` |
 | `overwatch/` | Rust | TTS server + alarm system via AWS Polly, gRPC API |
 | `dosa/` | Rust | Door controller via grblHAL CNC, WebSocket API |
+| `argus/` | Rust (native x86_64) | AI alarm assessment daemon on **atlas** — on alarm `triggered`, captures camera stills and feeds them to Anthropic Claude with a private premises seed for real-time *who/what/where* assessment. Native `cargo build` + systemd (NOT a `cross`/RPi build). Phase 1 (foundation) done; phased design in [`specs/argus/`](specs/argus/00-master.md). |
 | `home-assistant/` | Python | Custom HA integrations for all the above + Centurion garage |
 | `deploy/` | Python | SSH/rsync deployment tool for all components |
 | `shelly/` | Python | CLI for discovering and configuring Shelly smart devices |

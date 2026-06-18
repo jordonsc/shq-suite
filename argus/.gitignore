@@ -1,0 +1,9 @@
+# Build artefacts
+/target
+/build
+
+# Live config + secrets + private seed (copy the *.example files and fill locally;
+# real values are mirrored to shq-suite-config, never committed here)
+config.yaml
+seed.md
+argus.env

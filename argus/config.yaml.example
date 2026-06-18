@@ -1,0 +1,24 @@
+# Argus configuration — copy to ~/.config/argus/config.yaml and fill in.
+#
+# Secrets are NOT stored here: ${VAR} is expanded from the environment at load
+# time (systemd EnvironmentFile, or your shell). The real config is gitignored
+# and mirrored to shq-suite-config.
+
+ha:
+  url: "http://localhost:8123"          # atlas-local Home Assistant
+  token: "${HA_TOKEN}"                  # long-lived token (HA UI → profile → long-lived tokens)
+
+anthropic:
+  api_key: "${ANTHROPIC_API_KEY}"
+  live_model: "claude-sonnet-4-6"       # Phase 1 uses this one (live what/where loop)
+  id_model: "claude-opus-4-8"           # reserved for Phase 2 (forensic who + dossier)
+
+# Path to the private premises seed (see seed.example.md). Phase 1 may point this
+# at a copy of seed.example.md; the real seed lives in shq-suite-config / wiki.
+seed_path: "~/.config/argus/seed.md"
+
+cameras:
+  - entity: "camera.garage_camera_high_resolution_channel"
+    label: "Garage"                     # human label included in the prompt
+
+alarm_entity: "alarm_control_panel.shq_alarm"
