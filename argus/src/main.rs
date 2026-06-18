@@ -28,7 +28,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use config::Config;
-use engine::Engine;
+use engine::{ControlCommand, Engine};
 use ha::{HaEvent, RestClient};
 use llm::AnthropicClient;
 
@@ -120,15 +120,24 @@ async fn main() -> Result<()> {
         tokio::spawn(out::run(outputs_rx, voice, pagerduty, cfg.offsite.clone()));
     }
 
+    // Phase 5 control channel: the `/control` WS (on the Phase 4 HUD server)
+    // forwards `acknowledge`/`standdown` commands from the HA component onto this
+    // mpsc; the engine's `select!` loop consumes the receiver. Created
+    // unconditionally so the engine always has a receiver; the sender is only
+    // handed to the HUD server when `web:` is configured (no web = no inbound
+    // control path, the receiver simply never fires). Argus always runs the web
+    // server in production, so the control surface is always present there.
+    let (control_tx, control_rx) = mpsc::channel::<ControlCommand>(16);
+
     // Phase 4 — kiosk HUD. The HUD HTTP/WS server spawns iff `web:` is configured;
     // the kiosk-takeover consumer spawns iff `web:` is configured AND `kiosks:` is
     // non-empty (the takeover URL is `web.public_base`, so no web = nothing to
     // navigate to). Both are daemon-only and never crash the daemon on failure.
     if let Some(web_cfg) = cfg.web.clone() {
         let case_base = case::default_case_base()?;
-        info!(bind = %web_cfg.bind, "Spawning Phase 4 HUD server");
+        info!(bind = %web_cfg.bind, "Spawning Phase 4 HUD server (+ Phase 5 /control WS)");
         let public_base = web_cfg.public_base.clone();
-        tokio::spawn(web::serve(web_cfg, web_rx, case_base));
+        tokio::spawn(web::serve(web_cfg, web_rx, case_base, control_tx.clone()));
 
         if !cfg.kiosks.is_empty() {
             // The takeover consumer drives HA directly, so it needs its own
@@ -144,11 +153,20 @@ async fn main() -> Result<()> {
         }
     }
 
-    run_daemon(cfg, eng).await
+    // Drop the original control sender; the web server (if spawned) holds a clone.
+    // With no web server, all senders are gone, so the engine's control arm never
+    // fires — harmless.
+    drop(control_tx);
+
+    run_daemon(cfg, eng, control_rx).await
 }
 
 /// Subscribe to the HA alarm and drive the engine until Ctrl-C.
-async fn run_daemon(cfg: Config, eng: Engine) -> Result<()> {
+async fn run_daemon(
+    cfg: Config,
+    eng: Engine,
+    control_rx: mpsc::Receiver<ControlCommand>,
+) -> Result<()> {
     let (tx, rx) = mpsc::channel::<HaEvent>(16);
 
     let ws_url = ha::websocket_url(&cfg.ha.url);
@@ -164,7 +182,7 @@ async fn run_daemon(cfg: Config, eng: Engine) -> Result<()> {
     );
 
     // Run the engine; cancel on Ctrl-C.
-    let engine_task = tokio::spawn(eng.run(rx));
+    let engine_task = tokio::spawn(eng.run(rx, control_rx));
     tokio::signal::ctrl_c().await.ok();
     info!("Shutdown requested");
     engine_task.abort();

@@ -140,6 +140,46 @@ class DosaConfig(DeploymentConfig):
             self.service_file = str(service_dir / "dosa" / "dosa.service")
 
 
+@dataclass
+class ArgusConfig(DeploymentConfig):
+    """Configuration for Argus (AI alarm assessment daemon) deployments.
+
+    Argus is the ONLY native (x86_64) Rust app — it runs on atlas, not a Pi —
+    so its source binary comes from a native `cargo build --release`
+    (`argus/target/release/argus`), NOT a `cross`/Podman `argus/build/` dir.
+    """
+
+    source_path: str = None
+    web_path: str = None
+    config_file: str = None
+    service_file: str = None
+    install_path: str = ".local"
+    systemd_service: str = "argus"
+
+    def __post_init__(self):
+        """Set default paths if not provided."""
+        project_root = Path(__file__).parent.parent.parent.parent
+        config_dir = Path(__file__).parent.parent.parent / "config"
+        app_config_dir = config_dir / "app"
+        service_dir = config_dir / "service"
+
+        if self.source_path is None:
+            # NATIVE release binary — not a cross/build dir (Argus runs on atlas).
+            self.source_path = str(project_root / "argus" / "target" / "release" / "argus")
+
+        if self.web_path is None:
+            # Kiosk HUD assets served from web.dir
+            self.web_path = str(project_root / "argus" / "web")
+
+        if self.config_file is None:
+            # Default config file in deploy/config/app
+            self.config_file = str(app_config_dir / "argus.yaml")
+
+        if self.service_file is None:
+            # Default service file in deploy/config/service
+            self.service_file = str(service_dir / "argus" / "argus.service")
+
+
 class ConfigPresets:
     """Predefined deployment configurations loaded from YAML files."""
 
@@ -231,4 +271,23 @@ class ConfigPresets:
             service_file=dosa.get("service_file"),  # None if not specified, will use default
             install_path=dosa.get("install_path", "dosa"),
             systemd_service=dosa.get("systemd_service", "dosa"),
+        )
+
+    @classmethod
+    def get_argus_config(cls) -> ArgusConfig:
+        """Get Argus deployment configuration from deployment/argus.yaml."""
+        config = cls._load_yaml("argus.yaml")
+        auth = config.get("auth", {})
+        argus = config.get("argus", {})
+
+        return ArgusConfig(
+            hostnames=config.get("hosts", []),
+            user=auth.get("username", ""),
+            private_key=auth.get("private_key", ""),
+            source_path=argus.get("source_path"),  # None if not specified, will use default
+            web_path=argus.get("web_path"),  # None if not specified, will use default
+            config_file=argus.get("config_file"),  # None if not specified, will use default
+            service_file=argus.get("service_file"),  # None if not specified, will use default
+            install_path=argus.get("install_path", ".local"),
+            systemd_service=argus.get("systemd_service", "argus"),
         )

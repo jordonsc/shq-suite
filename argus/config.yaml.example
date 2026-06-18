@@ -90,11 +90,14 @@ telemetry_entities: []
 #   routing_key: "${PAGERDUTY_ROUTING_KEY}"   # Events v2 integration key; empty = disabled
 #   source: "argus@atlas"                     # payload.source label
 
-# Kiosk HUD HTTP/WS server + takeover (Phase 4). When `web:` is present Argus
-# serves the sci-fi HUD web app at /alarm, the case stills at /stills/<id>.jpg,
-# and a /kiosk WebSocket that pushes the full CaseState (the same serde shape
-# journalled to disk) on every change. ABSENT block = the HUD server is not
-# spawned. `bind` is the LAN listen address (so kiosks can reach it);
+# Kiosk HUD HTTP/WS server + takeover (Phase 4) + the HA control WS (Phase 5).
+# When `web:` is present Argus serves the sci-fi HUD web app at /alarm, the case
+# stills at /stills/<id>.jpg, a /kiosk WebSocket that pushes the full CaseState
+# (the same serde shape journalled to disk) on every change, AND a /control
+# WebSocket (Phase 5) the HA `argus` component connects to for status +
+# acknowledge/standdown commands. The control WS shares this same `bind` port —
+# NO separate config/port. ABSENT block = neither the HUD server nor the control
+# WS is spawned. `bind` is the LAN listen address (so kiosks can reach it);
 # `public_base` is the LAN-reachable base URL kiosks are navigated to
 # (`<public_base>/alarm`) — set it to atlas's real address, NOT 0.0.0.0. `dir`
 # is the static HUD app dir; a relative path resolves next to the argus binary

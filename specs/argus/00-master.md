@@ -118,7 +118,7 @@ alarm_control_panel.shq_alarm ──triggered──► Home Assistant (atlas)
 | 2a | [`02a-case-resilience.md`](./02a-case-resilience.md) | **Real-time offsite replication** of the case to S3 (immutable, write-only creds) — so the case survives destruction of atlas. **Build before Phases 3–4.** | ✅ Implemented (2026-06-18), build warning-free — `aws-sdk-s3` replicator off the case dir (write-only static creds, events+stills first, `.uploaded` markers, watch-woken + re-scan). Live S3 deferred (AWS creds + bucket/IAM owed) |
 | 3 | [`03-outputs.md`](./03-outputs.md) | Overwatch **positive-only** voice + PagerDuty trigger/resolve with the dossier | ✅ Implemented & shape-verified (2026-06-18), build warning-free, 9 unit tests pass — tonic 0.11 voice client (proto symlinked), pure positive-only gate, PagerDuty Events v2 (`build_event`/`send` split), `out::run` timeline-diff wiring (independent voice + PD channels). **Live-fire deferred** (no real klaxon/page — residence asleep); owed: Overwatch reachable + real `PAGERDUTY_ROUTING_KEY` |
 | 4 | [`04-kiosk-hud.md`](./04-kiosk-hud.md) | Vector HUD web app + kiosk takeover via nyx + live `CaseState`/stills push | ✅ Implemented & shape-verified (2026-06-18), build warning-free — axum `/alarm`+`/stills/:id`+`/kiosk` WS server + the vector crimson/emerald HUD (`argus/web/`, `?demo=1` harness) + `shq_display.navigate` takeover. **Live takeover deferred** (asleep) + blocked on a nyx wake/kill-Chronos change; visual sign-off deferred to a human |
-| 5 | [`05-ha-component-docs.md`](./05-ha-component-docs.md) | `argus` HA component (status + arm/ack), deploy tool, docs, private seed | 📝 Not started |
+| 5 | [`05-ha-component-docs.md`](./05-ha-component-docs.md) | `argus` HA component (status + arm/ack), deploy tool, docs, private seed | ✅ Implemented (2026-06-18), Rust build warning-free + Python compiles — HA `argus` component (status sensors + ack/standdown buttons over a `/control` WS on the web port), control→engine channel (`ControlCommand`, `TimelineKind::Acknowledged`), native `deploy` `argus` target, cross-project docs. **Real premises seed still OWED** (private, needs the user) |
 
 Phases are **strictly ordered** — each consumes the prior phase's output. The **`CaseState` schema
 defined in Phase 2 is the central contract** that Phases 3 and 4 render.
@@ -135,20 +135,33 @@ defined in Phase 2 is the central contract** that Phases 3 and 4 render.
 
 ## Project status
 
-**2026-06-18 — design agreed, all seven specs authored & committed; no code yet.** Committed on
-branch **`argus-design-specs`** (not yet pushed). Ledger: `shq-suite-0002`.
+**2026-06-18 — ALL PHASES (1, 2, 2a, 3, 4, 5) IMPLEMENTED & COMMITTED** on branch
+**`argus-design-specs`** (not yet pushed). `cargo build --release` warning-free
+(argus **0.6.0**); the HA `argus` component + deploy tool compile. Ledger:
+`shq-suite-0002`.
 
-**Decided values** (don't re-litigate): models `claude-sonnet-4-6` (loop) + `claude-opus-4-8` (ID);
-host **atlas**, native x86_64 build (NOT cross); offsite store **AWS S3, `ap-southeast-2`,
-Object Lock compliance mode, 1-year retention, write-only creds**; kiosk HUD = vector themed
-component; M1 = all four outputs + Phase 2a resilience.
+**Decided values** (don't re-litigate): models `claude-sonnet-4-6` (loop) +
+`claude-opus-4-8` (ID); host **atlas**, native x86_64 build (NOT cross — the only
+non-cross Rust app here); offsite store **AWS S3, `ap-southeast-2`, Object Lock
+compliance mode, 1-year retention, write-only creds**; kiosk HUD = vector themed
+component (crimson/emerald, `argus/web/`); the control WS + HUD share the `web`
+port (default `8770`); M1 = all four outputs + Phase 2a resilience.
 
-**Next: Phase 1** ([`01-foundation.md`](./01-foundation.md)) — scaffold `argus/` on atlas, HA WS+REST
-client, Anthropic vision client, `trigger → still → assessment` on one camera. A fresh agent should
-read this master + `01-foundation.md` and can start cold.
+**Live-verified:** Phase 1 (trigger→still→assessment) + Phase 2 (`--once`:
+structured `CaseState`, Sonnet prompt-cache hit, case-dir journal). **Everything
+else is built + shape-verified with live-fire DEFERRED** to an authorised
+waking-hours window (the residence was asleep): a live alarm trigger, the
+Overwatch klaxon/voice, the PagerDuty incident, the kiosk takeover, and offsite
+S3 (needs the bucket + write-only IAM). See each phase's Deviations + 05's
+Follow-ons.
 
-**Owed separately:** the **real premises seed** is a private authoring pass with the user (floor plan,
-camera→room map, camera imaging/IR night-vision metadata, resident/vehicle whitelist + reference
-images, escalation policy) into `shq-suite-config`/wiki — the quality ceiling for every assessment.
-Phase 1 ships only `argus/seed.example.md`. Must exceed ~2048 tokens for prompt-caching to engage. **M2 hardening:** LTE out-of-band egress so a WAN cut can't defeat offsite
-replication (Phase 2a is best-effort on a single WAN).
+**Cache floors (verified):** Sonnet 4.6 caches a ≥2048-token seed; **Opus 4.8
+needs ≥4096 tokens** — the real seed must exceed ~4096 for the Opus path to cache.
+
+**Owed separately (needs the user):** the **real premises seed** — a private
+authoring pass (floor plan, camera→room map, camera imaging/IR night-vision
+metadata, resident/vehicle whitelist + reference images, escalation policy) into
+`shq-suite-config`/wiki — the quality ceiling for every assessment. The public
+repo ships only `argus/seed.example.md`. **nyx prerequisite:** `shq_display.navigate`
+must wake + kill-Chronos for the kiosk takeover to show on sleeping/clock kiosks.
+**M2:** LTE out-of-band egress so a WAN cut can't defeat offsite replication.

@@ -1,6 +1,6 @@
 # Home Assistant Custom Components
 
-Six custom integrations for Home Assistant.
+Custom integrations for Home Assistant.
 
 ## Components
 
@@ -9,6 +9,7 @@ Six custom integrations for Home Assistant.
 | `shq_display` | WebSocket | 8765 | YAML | Nyx kiosk display control |
 | `overwatch` | gRPC | 50051 | YAML | Voice TTS and alarm control |
 | `dosa` | WebSocket | 8766 | YAML | Door controller (CNC-driven) |
+| `argus` | WebSocket | 8770 | YAML | AI alarm-assessment status + ack/standdown (Argus daemon on atlas) |
 | `actron_mitm_controller` | WebSocket | 8767 | Config Flow | Actron A/C via local MITM bridge (actron-sniffer ESP32) |
 | `centurion` | HTTP REST | — | Config Flow | Centurion garage door |
 | `somfy_sdn` | WebSocket | 8767 | Config Flow | Somfy SDN blind motors via the somfy-sdn ESP32 (one `cover` per motor) |
@@ -75,6 +76,29 @@ dosa:
 **Architecture**: Same coordinator pattern as shq_display. Cover supports OPEN, CLOSE, STOP, SET_POSITION.
 
 **Key files**: `client.py` (WebSocket), `coordinator.py`, `cover.py`, `button.py`
+
+## argus (AI Alarm Assessment)
+
+Status + control surface for the **Argus** daemon (`argus/`, runs on atlas). Argus itself watches the HA alarm and drives the assessment; this component is the **reverse channel** — it connects to Argus's control WebSocket and surfaces the live `CaseState` in HA, plus exposes acknowledge/standdown actions.
+
+**Entities**:
+- `binary_sensor.argus_active` — a case is in progress (alarm `triggered`/`assessing`)
+- `sensor.argus_threat_level`, `sensor.argus_intruder_count`, `sensor.argus_summary`, `sensor.argus_case_id`, `sensor.argus_status` — the current `CaseState` projection
+- `button.argus_acknowledge`, `button.argus_standdown` — send the corresponding command back to Argus
+
+**Config** (YAML, like `shq_display`/`dosa`):
+```yaml
+argus:
+  host: 192.168.x.x    # atlas
+  port: 8770           # the Argus control/web port (web.bind)
+  name: "Argus"
+```
+
+**Architecture**: Same `local_push` coordinator pattern as `shq_display`/`dosa` — a control WebSocket to the Argus daemon, full-state push on every `CaseState` change, availability timeout + auto-reconnect. The transport rides the Argus **web port** (default `8770`, the same port that serves the kiosk HUD); the component speaks the control protocol, not the kiosk JSON stream.
+
+**Key files**: `client.py` (WebSocket), `coordinator.py` (push + reconnect + availability), `binary_sensor.py`, `sensor.py`, `button.py`.
+
+> The daemon, its `CaseState` contract, and the control-WS API live in `argus/CLAUDE.md` (owned by the Argus side). Argus runs on **atlas alongside HA** but is a separate process; this component is just the HA-side observability/control mirror.
 
 ## centurion (Garage Door)
 
@@ -311,7 +335,7 @@ EOF
 
 ## Common Patterns
 
-- WebSocket integrations (`shq_display`, `dosa`) share a coordinator pattern with:
+- WebSocket integrations (`shq_display`, `dosa`, `argus`) share a coordinator pattern with:
   - Persistent WebSocket connection with keepalive
   - Real-time state broadcasts from the server
   - Reconnection with backoff on disconnect

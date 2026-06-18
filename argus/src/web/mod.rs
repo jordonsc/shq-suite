@@ -17,6 +17,12 @@
 //!   `CaseState` JSON on every change. Reconnect is the client's job; the
 //!   server only pushes. The pushed JSON is the SAME serde serialisation
 //!   journalled to disk — one schema, three surfaces.
+//! - `GET /control` (Phase 5) → a WebSocket the HA `argus` component connects
+//!   to. Server→client: a COMPACT status object (`type:"status"`, not the full
+//!   `CaseState`) on connect and on every `CaseState` change. Client→server: a
+//!   command (`type:"command"`, `command:"acknowledge"|"standdown"`) forwarded
+//!   to the engine over the control mpsc. Malformed frames are logged + ignored;
+//!   client disconnects are tolerated.
 //!
 //! The server binds on the LAN (`web.bind`, default `0.0.0.0:8770`) so kiosks
 //! reach `http://atlas:<port>/alarm`. Absent `web:` config = this is never
@@ -35,24 +41,37 @@ use axum::{
     routing::get,
     Router,
 };
-use tokio::sync::watch;
+use serde_json::json;
+use tokio::sync::{mpsc, watch};
 use tower_http::services::ServeDir;
 use tracing::{debug, info, warn};
 
-use crate::case::CaseState;
+use crate::case::{CaseState, CaseStatus};
 use crate::config::WebConfig;
+use crate::engine::ControlCommand;
+use crate::version;
 
-/// Shared server state: the case broadcast receiver (cloned per WS connection)
-/// and the on-disk case base (`~/.local/share/argus`) for resolving stills.
+/// Shared server state: the case broadcast receiver (cloned per WS connection),
+/// the on-disk case base (`~/.local/share/argus`) for resolving stills, and the
+/// Phase 5 control channel into the engine (the `/control` WS forwards commands
+/// onto it).
 #[derive(Clone)]
 struct AppState {
     rx: watch::Receiver<Option<CaseState>>,
     case_base: Arc<PathBuf>,
+    control_tx: mpsc::Sender<ControlCommand>,
 }
 
 /// Spawn the HUD server. Runs until the process exits (or the bind fails, which
-/// is logged — a HUD failure must not take the daemon down).
-pub async fn serve(cfg: WebConfig, rx: watch::Receiver<Option<CaseState>>, case_base: PathBuf) {
+/// is logged — a HUD failure must not take the daemon down). `control_tx` is the
+/// Phase 5 control channel: the `/control` WS forwards `acknowledge`/`standdown`
+/// commands from the HA component onto it.
+pub async fn serve(
+    cfg: WebConfig,
+    rx: watch::Receiver<Option<CaseState>>,
+    case_base: PathBuf,
+    control_tx: mpsc::Sender<ControlCommand>,
+) {
     let dir = resolve_web_dir(&cfg.dir);
     if !dir.join("index.html").exists() {
         warn!(
@@ -67,6 +86,7 @@ pub async fn serve(cfg: WebConfig, rx: watch::Receiver<Option<CaseState>>, case_
     let state = AppState {
         rx,
         case_base: Arc::new(case_base),
+        control_tx,
     };
 
     // Static assets: ServeDir serves `/` → index.html and every asset under the
@@ -79,6 +99,7 @@ pub async fn serve(cfg: WebConfig, rx: watch::Receiver<Option<CaseState>>, case_
 
     let app = Router::new()
         .route("/kiosk", get(kiosk_ws))
+        .route("/control", get(control_ws))
         .route("/stills/:id", get(still))
         .nest_service("/alarm", alarm)
         .fallback_service(assets)
@@ -92,7 +113,7 @@ pub async fn serve(cfg: WebConfig, rx: watch::Receiver<Option<CaseState>>, case_
             return;
         }
     };
-    info!(bind = %bind, "HUD server listening (GET /alarm, /stills/:id, WS /kiosk)");
+    info!(bind = %bind, "HUD server listening (GET /alarm, /stills/:id, WS /kiosk, WS /control)");
     if let Err(e) = axum::serve(listener, app).await {
         warn!(error = %e, "HUD server exited");
     }
@@ -153,6 +174,130 @@ async fn send_state(socket: &mut WebSocket, state: &Option<CaseState>) -> Result
         }
     };
     socket.send(Message::Text(json)).await.map_err(|_| ())
+}
+
+/// `GET /control` → the Phase 5 HA-component WebSocket. Pushes a compact status
+/// object on connect + every change, and accepts `acknowledge`/`standdown`
+/// commands which it forwards to the engine.
+async fn control_ws(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
+    ws.on_upgrade(move |socket| control_socket(socket, state.rx.clone(), state.control_tx.clone()))
+}
+
+async fn control_socket(
+    mut socket: WebSocket,
+    mut rx: watch::Receiver<Option<CaseState>>,
+    control_tx: mpsc::Sender<ControlCommand>,
+) {
+    // Send current status immediately.
+    let current = rx.borrow_and_update().clone();
+    if send_status(&mut socket, &current).await.is_err() {
+        return;
+    }
+
+    loop {
+        tokio::select! {
+            // Broadcast change → push fresh status.
+            changed = rx.changed() => {
+                if changed.is_err() {
+                    debug!("control WS: broadcast closed; dropping connection");
+                    break;
+                }
+                let state = rx.borrow_and_update().clone();
+                if send_status(&mut socket, &state).await.is_err() {
+                    debug!("control WS: client gone; dropping connection");
+                    break;
+                }
+            }
+            // Inbound command from the HA component.
+            msg = socket.recv() => match msg {
+                Some(Ok(Message::Text(txt))) => {
+                    handle_control_text(&mut socket, &txt, &control_tx).await;
+                }
+                Some(Ok(Message::Binary(_))) => {
+                    warn!("control WS: ignoring unexpected binary frame");
+                }
+                Some(Ok(Message::Close(_))) | None => {
+                    debug!("control WS: client closed");
+                    break;
+                }
+                // Ping/Pong are handled by axum; nothing to do.
+                Some(Ok(_)) => {}
+                Some(Err(_)) => {
+                    debug!("control WS: receive error; dropping connection");
+                    break;
+                }
+            },
+        }
+    }
+}
+
+/// Parse an inbound control frame and forward a recognised command to the
+/// engine. Malformed/unknown frames are logged and ignored (never panic). On a
+/// recognised command we reply `{"type":"ack",...}` (best-effort).
+async fn handle_control_text(
+    socket: &mut WebSocket,
+    txt: &str,
+    control_tx: &mpsc::Sender<ControlCommand>,
+) {
+    let parsed: serde_json::Value = match serde_json::from_str(txt) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "control WS: ignoring non-JSON frame");
+            return;
+        }
+    };
+    if parsed.get("type").and_then(|v| v.as_str()) != Some("command") {
+        warn!("control WS: ignoring frame (not a command)");
+        return;
+    }
+    let cmd = parsed.get("command").and_then(|v| v.as_str());
+    let (control, name) = match cmd {
+        Some("standdown") => (ControlCommand::Standdown, "standdown"),
+        Some("acknowledge") => (ControlCommand::Acknowledge, "acknowledge"),
+        other => {
+            warn!(command = ?other, "control WS: ignoring unknown command");
+            return;
+        }
+    };
+    if control_tx.send(control).await.is_err() {
+        warn!("control WS: engine control channel closed; command dropped");
+        return;
+    }
+    let reply = json!({ "type": "ack", "command": name, "ok": true }).to_string();
+    let _ = socket.send(Message::Text(reply)).await;
+}
+
+/// Project the latest `CaseState` into the compact control-WS status object and
+/// send it as a WS text frame. `active` = a case exists whose status != cleared.
+async fn send_status(socket: &mut WebSocket, state: &Option<CaseState>) -> Result<(), ()> {
+    let status = match state {
+        Some(c) => json!({
+            "type": "status",
+            "version": version::ARGUS_VERSION,
+            "active": c.status != CaseStatus::Cleared,
+            "case_id": c.case_id,
+            "case_status": c.status,
+            "threat_level": c.threat_level,
+            "intruder_count": c.intruders.len(),
+            "summary": c.summary,
+            "updated_at": c.updated_at,
+        }),
+        None => json!({
+            "type": "status",
+            "version": version::ARGUS_VERSION,
+            "active": false,
+            "case_id": serde_json::Value::Null,
+            "case_status": serde_json::Value::Null,
+            "threat_level": serde_json::Value::Null,
+            "intruder_count": 0,
+            "summary": serde_json::Value::Null,
+            "updated_at": serde_json::Value::Null,
+        }),
+    };
+    socket
+        .send(Message::Text(status.to_string()))
+        .await
+        .map_err(|_| ())
 }
 
 /// `GET /stills/:id` → the JPEG for still `<id>`. We strip a trailing `.jpg` so

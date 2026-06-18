@@ -146,6 +146,10 @@ pub enum TimelineKind {
     BestStillUpgraded,
     ThreatLevelChanged,
     SecurityStationNotified,
+    /// An operator acknowledged the active case from the HA control surface
+    /// (Phase 5 `/control` WS). Additive milestone — does not change the case
+    /// status; the case keeps assessing.
+    Acknowledged,
     Standdown,
     Cleared,
 }

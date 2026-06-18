@@ -98,7 +98,10 @@ pub fn line_for(event: &TimelineEvent, state: &CaseState) -> Option<SpokenLine> 
         // IntruderDetected is deliberately NOT spoken: the case-open line already
         // announced the protocol; per-subject detection chatter is left to the
         // HUD, and speaking it could reveal we are still counting people.
+        // Acknowledged is an operator-side milestone (HA control surface); it is
+        // not broadcast over the klaxon — stay silent (fail closed to None).
         TimelineKind::IntruderDetected
+        | TimelineKind::Acknowledged
         | TimelineKind::Standdown
         | TimelineKind::Cleared => None,
     }

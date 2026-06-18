@@ -9,8 +9,11 @@ build --release` + systemd, **not** a `cross`/Podman RPi build like nyx/overwatc
 
 > **Phase status:** Phases 1 (foundation), 2 (assessment loop + `CaseState`), 2a
 > (offsite S3 resilience), 3 (outputs — Overwatch voice + PagerDuty), and 4
-> (kiosk HUD server + takeover — Rust side) are implemented + shape-verified. The
-> HA component (Phase 5) is the next phase. See `specs/argus/` (read
+> (kiosk HUD server + takeover — Rust side) are implemented + shape-verified.
+> **Phase 5 (control WS — Rust side)** is implemented: the `/control` WebSocket on
+> the HUD server + the `ControlCommand` channel into the engine (the HA `argus`
+> component connects here). The HA component itself + deploy + the real seed are
+> owned by other Phase 5 work. See `specs/argus/` (read
 > `00-master.md` first). **Phase 3 is NOT live-fired**: voice
 > (`SetAlarm`/`Verbalise`) and PagerDuty sends are wired + compiled + shape-tested
 > only — no real klaxon/page has been sent (residence-asleep constraint).
@@ -37,7 +40,7 @@ replicated to S3 — **one schema, three surfaces**. The LLM returns *deltas*
 | `src/main.rs` | Entry point + CLI. Loads config/seed; builds the Sonnet + Opus clients + the `watch<Option<CaseState>>` channel; `--once` (single tick → print CaseState) and the daemon (Ctrl-C aborts the engine task) |
 | `src/config.rs` | `config.yaml` loader. `${VAR}` env expansion, `~` expansion, default path `~/.config/argus/config.yaml`. Adds `loop_config` (cadence/cap) + `telemetry_entities` + `offsite` (Phase 2a S3 replication; `OffsiteConfig`/`UploadConfig`) |
 | `src/case.rs` | **The `CaseState` contract** + `LiveAssessment`/`Identification` LLM-output types, their `*_schema()` JSON schemas, `TimelineKind` vocabulary, and `CaseDir` (the on-disk journal = Phase 2a upload queue) |
-| `src/engine.rs` | The assessment loop: per-tick multi-camera capture + telemetry → Sonnet live loop → merge into `CaseState` → best stills + Opus forensic; state machine; daily token cap; broadcast + journal |
+| `src/engine.rs` | The assessment loop: per-tick multi-camera capture + telemetry → Sonnet live loop → merge into `CaseState` → best stills + Opus forensic; state machine; daily token cap; broadcast + journal. **Phase 5**: defines `ControlCommand::{Standdown, Acknowledge}`; `run()` `select!`s a `mpsc::Receiver<ControlCommand>` alongside the HA event stream + tick — `Standdown` reuses the `standdown()` path, `Acknowledge` pushes a `TimelineKind::Acknowledged` milestone + broadcasts (both no-op + log when no case is active) |
 | `src/version.rs` | `ARGUS_VERSION` from `CARGO_PKG_VERSION` |
 | `src/state.rs` | `AlarmState` (Disarmed/Triggered) + `AlarmTracker` → `Transition::{IntoTriggered, OutOfTriggered}` (both edges) |
 | `src/ha/mod.rs` | HA client module; `websocket_url()` (http→ws) |
@@ -48,7 +51,7 @@ replicated to S3 — **one schema, three surfaces**. The LLM returns *deltas*
 | `src/out/voice.rs` | **Phase 3** Overwatch gRPC client. `build.rs` (tonic-build 0.11) compiles `proto/voice.proto` (a relative symlink to `../overwatch/proto/voice.proto`) into the `voice` module (client only). `VoiceClient::{set_alarm,verbalise}` dial `host:port` lazily per call; on connect/RPC failure they log + return (never panic, never block the PD channel) |
 | `src/out/voice_policy.rs` | **Phase 3** the POSITIVE-ONLY gate: pure `line_for(event, state) -> Option<SpokenLine>`. A whitelist `match` over `TimelineKind` — `case_opened`/`intruder_identified`/`best_still_upgraded`/`security_station_notified` speak; `threat_level_changed` speaks ONLY on escalation (parses the engine's `"<from> → <to>"` detail); `intruder_detected`/`standdown`/`cleared` → `None`. Structurally cannot emit a failure line (failures aren't timeline events). Unit-tested (no network) |
 | `src/out/pagerduty.rs` | **Phase 3** PagerDuty Events v2 (`reqwest`, reuses the rustls client). `build_event()` (PURE, no network — the shape-test surface) is split from `send()`. `trigger` (dedup_key=`case_id`) on case open + material change; `resolve` on standdown. `custom_details` = threat level + intruders + recent timeline + the deterministic `s3://<bucket>/<prefix>/<case_id>/` prefix when offsite is enabled (bare prefix — atlas has write-only creds, NO presigned URL). Routing key never logged |
-| `src/web/mod.rs` | **Phase 4** the kiosk HUD HTTP/WS server (`axum` + tower-http `ServeDir`). `serve(cfg, rx, case_base)`: `GET /alarm` (+ `/` fallback) → the static `web/` app; `GET /stills/:id` → the JPEG for still `<id>` from the CURRENT case's `stills/<id>.jpg` (resolved via the latest `CaseState` on the watch channel), falling back to scanning every `cases/*/stills/<id>.jpg`; `GET /kiosk` → a WebSocket that sends the current `CaseState` (or `null`) on connect and pushes the full serde `CaseState` JSON on every change. Binds `web.bind` (LAN). Tolerates client disconnects + a missing `index.html` (404s until the frontend lands). Does NOT call the LLM/HA |
+| `src/web/mod.rs` | **Phase 4 + 5** the kiosk HUD HTTP/WS server (`axum` + tower-http `ServeDir`). `serve(cfg, rx, case_base, control_tx)`: `GET /alarm` (+ `/` fallback) → the static `web/` app; `GET /stills/:id` → the JPEG for still `<id>` from the CURRENT case's `stills/<id>.jpg` (resolved via the latest `CaseState` on the watch channel), falling back to scanning every `cases/*/stills/<id>.jpg`; `GET /kiosk` → a WebSocket that sends the current `CaseState` (or `null`) on connect and pushes the full serde `CaseState` JSON on every change. **`GET /control` (Phase 5)** → the HA `argus` component's WS: pushes a COMPACT status object (not the full `CaseState`) on connect + every change, and forwards inbound `acknowledge`/`standdown` commands to the engine over `control_tx`. Binds `web.bind` (LAN, shared with `/control` — no separate port). Tolerates client disconnects + a missing `index.html` (404s until the frontend lands). Does NOT call the LLM/HA |
 | `src/out/kiosks.rs` | **Phase 4** kiosk-takeover consumer: a `watch` consumer that on the first `CaseState` of a case (`triggered`/`assessing`) calls `shq_display.navigate` (`{device_id, url}`) for each configured kiosk → `<web.public_base>/alarm`, and on `cleared` navigates each back to its `dashboard_url`. Per-case deduped (navigate at most once each way). Uses `RestClient::call_service`. Failures logged, never fatal. **Live takeover deferred** (residence asleep) — built + compiled + locally smoke-tested, no real kiosk navigated. **nyx dependency** (see below) |
 | `src/out/offsite.rs` | **Phase 2a** offsite S3 replicator: `run(cfg, base, wake)` walks `<base>/cases/`, PUTs each non-`.tmp`/un-`.uploaded` file (events+stills first), drops a `.uploaded` marker, retries with `retry_backoff_secs`. Woken by the `watch` receiver, with a `scan_interval_secs` re-scan fallback (+ startup crash recovery). EXPLICIT static write-only creds (`aws-sdk-s3`, rustls), NOT the ambient chain; relies on bucket-default Object Lock |
 
@@ -68,10 +71,45 @@ takeover consumer builds its own `RestClient` (the engine owns the other one).
 | `GET /alarm` (+ `/`) | the static HUD app from `web.dir` (the frontend's `web/`; `index.html` is the SPA) |
 | `GET /stills/:id` | `<case_base>/cases/<case_id>/stills/<id>.jpg` as `image/jpeg`; current case first, else a scan of all case dirs; 404 if missing. Accepts `<id>` or `<id>.jpg` |
 | `GET /kiosk` | WebSocket — sends the current `CaseState` (or `null`) on connect, then pushes the full serde `CaseState` JSON on every change. Reconnect is the client's job |
+| `GET /control` | **Phase 5** WebSocket for the HA `argus` component (same `web.bind` port, NOT a separate listener). See below |
 
 The `/kiosk` WS frame is the SAME serde serialisation as the on-disk journal —
 one schema, three surfaces. The frontend references stills by
 `intruders[].best_stills[].id` → `/stills/<id>.jpg`.
+
+## Phase 5 — control WS (Rust side)
+
+`GET /control` (on the same `web.bind` HUD server — reuses the Phase-4 axum
+router + the `watch<Option<CaseState>>` state; **no second listener/port**). The
+HA `argus` component connects here for status + control.
+
+**Server → client** — a COMPACT status object (NOT the full `CaseState`), sent
+once on connect and on every `CaseState` change:
+
+```json
+{"type":"status","version":"<argus semver>","active":<bool>,"case_id":<string|null>,
+ "case_status":<string|null>,"threat_level":<string|null>,"intruder_count":<int>,
+ "summary":<string|null>,"updated_at":<string|null>}
+```
+
+`active` = a case exists whose status != `cleared`; the projection fields are
+null/0 when there is no case. `case_status` (not `status`) carries the case's
+status string so it never collides with the message `type`.
+
+**Client → server** — a command: `{"type":"command","command":"acknowledge"}` or
+`{"type":"command","command":"standdown"}`. Recognised commands are forwarded to
+the engine over the `mpsc::Sender<ControlCommand>` and answered best-effort with
+`{"type":"ack","command":<cmd>,"ok":true}`; malformed/unknown frames are logged +
+ignored (never panic). `standdown` → the engine's `standdown()` path (same as an
+HA `AlarmCleared` edge); `acknowledge` → a `TimelineKind::Acknowledged` milestone
+(detail "Operator acknowledged.") + broadcast.
+
+**Wiring:** `main` creates `mpsc::channel::<ControlCommand>()` unconditionally;
+the `Receiver` flows into the engine (`run(rx, control_rx)`), the `Sender` is
+cloned into `web::serve(...)` only when `web:` is configured (Argus always runs
+the web server in production, so the control surface is always present there). No
+new config — the control WS shares the `web` port. `--once` does NOT use the
+control channel (it calls `run_once`, never `run`).
 
 **nyx dependency (live-takeover blocker, flagged):** a bare
 `shq_display.navigate` only does a CDP `Page.navigate`. It does NOT wake a

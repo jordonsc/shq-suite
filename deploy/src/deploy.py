@@ -11,7 +11,13 @@ from pathlib import Path
 
 import click
 
-from deploy import DosaDeployer, HomeAssistantDeployer, KioskDeployer, OverwatchDeployer
+from deploy import (
+    ArgusDeployer,
+    DosaDeployer,
+    HomeAssistantDeployer,
+    KioskDeployer,
+    OverwatchDeployer,
+)
 from deploy.config import ConfigPresets
 
 
@@ -49,6 +55,54 @@ def run_build_script(project_name: str, verbose: bool = False) -> bool:
             capture_output=not verbose,
             text=True,
             check=True
+        )
+
+        if verbose and result.stdout:
+            click.echo(result.stdout)
+
+        click.echo(f"✓ {project_name} build complete")
+        return True
+
+    except subprocess.CalledProcessError as e:
+        click.echo(f"✗ {project_name} build failed", err=True)
+        if e.stdout:
+            click.echo(e.stdout, err=True)
+        if e.stderr:
+            click.echo(e.stderr, err=True)
+        return False
+
+
+def run_cargo_release(project_name: str, verbose: bool = False) -> bool:
+    """
+    Build a project NATIVELY with `cargo build --release`.
+
+    Unlike `run_build_script` (which runs the `cross`/Podman ARM64
+    `build-rpi.sh`), this is a plain native build for x86_64. Argus is the only
+    app that uses it — it runs on atlas (x86_64), not a Raspberry Pi.
+
+    Args:
+        project_name: Name of the project (e.g., 'argus')
+        verbose: Show build output
+
+    Returns:
+        True if build succeeded, False otherwise
+    """
+    project_root = get_project_root()
+    project_dir = project_root / project_name
+
+    if not (project_dir / "Cargo.toml").exists():
+        click.echo(f"Error: Cargo.toml not found at {project_dir}", err=True)
+        return False
+
+    click.echo(f"Building {project_name} (native cargo --release)...")
+
+    try:
+        result = subprocess.run(
+            ["cargo", "build", "--release"],
+            cwd=str(project_dir),
+            capture_output=not verbose,
+            text=True,
+            check=True,
         )
 
         if verbose and result.stdout:
@@ -382,6 +436,87 @@ def dosa(hostname, user, key, verbose, destination, build):
 
     click.echo()
     click.echo("DOSA deployment complete.")
+
+
+### ARGUS DEPLOYMENT ###
+@cli.command()
+@click.option(
+    "--hostname",
+    "-h",
+    multiple=True,
+    help="Override default hostname(s). Can be specified multiple times.",
+)
+@click.option(
+    "--user",
+    "-u",
+    help="Override default SSH user.",
+)
+@click.option(
+    "--key",
+    "-k",
+    help="Override default SSH private key path.",
+)
+@click.option(
+    "--verbose",
+    "-v",
+    is_flag=True,
+    help="Show verbose output.",
+)
+@click.option(
+    "--destination",
+    "-d",
+    help="Override install directory on remote host.",
+)
+@click.option(
+    "--build",
+    "-b",
+    is_flag=True,
+    help="Build the argus binary (NATIVE cargo --release, NOT cross) before deploying.",
+)
+def argus(hostname, user, key, verbose, destination, build):
+    """
+    Deploy the Argus AI alarm assessment daemon (atlas).
+
+    Builds NATIVELY (`cargo build --release`) — Argus runs on atlas (x86_64),
+    so it does NOT cross-compile to ARM64 like nyx/overwatch/dosa. Deploys the
+    binary to ~/.local/bin/argus, the kiosk HUD web/ assets to ~/.config/argus/web,
+    the config, and the systemd user service, then restarts it.
+
+    Configuration loaded from config/deployment/argus.yaml
+    """
+    # Build argus NATIVELY if --build flag is set (NOT the cross/build-rpi.sh path)
+    if build:
+        if not run_cargo_release("argus", verbose=verbose):
+            click.echo("Build failed. Aborting deployment.", err=True)
+            sys.exit(1)
+        click.echo()
+
+    config = ConfigPresets.get_argus_config()
+
+    # Override defaults if provided
+    hostnames = list(hostname) if hostname else config.hostnames
+    ssh_user = user if user else config.user
+    ssh_key = key if key else config.private_key
+    destination_dir = destination if destination else config.install_path
+
+    click.echo(f"Deploying Argus to {len(hostnames)} host(s)...")
+
+    deployer = ArgusDeployer(
+        hostnames=hostnames,
+        user=ssh_user,
+        private_key=ssh_key,
+        source_path=config.source_path,
+        destination_path=destination_dir,
+        service_name=config.systemd_service,
+        web_path=config.web_path,
+        config_file=config.config_file,
+        service_file=config.service_file,
+    )
+
+    deployer.deploy_all(verbose=verbose)
+
+    click.echo()
+    click.echo("Argus deployment complete.")
 
 
 if __name__ == "__main__":

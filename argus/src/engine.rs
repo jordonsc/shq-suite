@@ -27,6 +27,18 @@ use crate::config::Config;
 use crate::ha::{HaEvent, RestClient};
 use crate::llm::{AnthropicClient, AssessRequest, ImageInput, Reasoning, Usage};
 
+/// A command from the Phase 5 control surface (the HA component over the
+/// `/control` WS) into the engine. Delivered over a dedicated mpsc the engine's
+/// `select!` multiplexes alongside the HA event stream.
+#[derive(Debug, Clone, Copy)]
+pub enum ControlCommand {
+    /// Operator-initiated standdown — same path as the HA `AlarmCleared` edge.
+    Standdown,
+    /// Operator acknowledged the active case (records a timeline milestone; the
+    /// case keeps assessing).
+    Acknowledge,
+}
+
 /// Cap on stored best stills per intruder.
 const MAX_BEST_STILLS: usize = 5;
 /// Confidence improvement required before saving a fresh best still / re-running Opus.
@@ -100,8 +112,15 @@ impl Engine {
         }
     }
 
-    /// Drive the engine until the event channel closes (Ctrl-C path closes it).
-    pub async fn run(mut self, mut rx: mpsc::Receiver<HaEvent>) {
+    /// Drive the engine until the HA event channel closes (Ctrl-C path closes
+    /// it). `ctrl_rx` is the Phase 5 control channel (HA component `/control`
+    /// WS → `ControlCommand`); a closed/absent control channel is benign (its
+    /// arm just never fires).
+    pub async fn run(
+        mut self,
+        mut rx: mpsc::Receiver<HaEvent>,
+        mut ctrl_rx: mpsc::Receiver<ControlCommand>,
+    ) {
         loop {
             if self.active.is_some() {
                 let cadence = self.current_cadence();
@@ -110,6 +129,7 @@ impl Engine {
                         Some(ev) => self.handle(ev).await,
                         None => break,
                     },
+                    Some(cmd) = ctrl_rx.recv() => self.handle_control(cmd).await,
                     _ = tokio::time::sleep(Duration::from_secs(cadence)) => {
                         if let Err(e) = self.tick().await {
                             error!("assessment tick failed: {e:#}");
@@ -117,9 +137,12 @@ impl Engine {
                     }
                 }
             } else {
-                match rx.recv().await {
-                    Some(ev) => self.handle(ev).await,
-                    None => break,
+                tokio::select! {
+                    maybe = rx.recv() => match maybe {
+                        Some(ev) => self.handle(ev).await,
+                        None => break,
+                    },
+                    Some(cmd) = ctrl_rx.recv() => self.handle_control(cmd).await,
                 }
             }
         }
@@ -155,6 +178,40 @@ impl Engine {
             HaEvent::AlarmCleared { .. } => {
                 if self.active.is_some() {
                     self.standdown().await;
+                }
+            }
+        }
+    }
+
+    /// Handle a Phase 5 control command. `Standdown` reuses the existing
+    /// standdown path (identical to the HA `AlarmCleared` edge); `Acknowledge`
+    /// records an additive timeline milestone. Both are no-ops (logged) when no
+    /// case is active.
+    async fn handle_control(&mut self, cmd: ControlCommand) {
+        match cmd {
+            ControlCommand::Standdown => {
+                if self.active.is_some() {
+                    info!("control: operator standdown");
+                    self.standdown().await;
+                } else {
+                    info!("control: standdown ignored (no active case)");
+                }
+            }
+            ControlCommand::Acknowledge => {
+                if let Some(mut active) = self.active.take() {
+                    let now = Utc::now();
+                    active.state.push_event(
+                        now,
+                        TimelineKind::Acknowledged,
+                        "Operator acknowledged.",
+                    );
+                    if let Err(e) = self.persist_and_broadcast(&mut active) {
+                        error!("failed to flush acknowledgement: {e:#}");
+                    }
+                    self.active = Some(active);
+                    info!("control: operator acknowledged");
+                } else {
+                    info!("control: acknowledge ignored (no active case)");
                 }
             }
         }

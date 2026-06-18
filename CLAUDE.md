@@ -28,22 +28,24 @@ Use MAJOR.MINOR.PATCH: MAJOR = breaking API/protocol change, MINOR = new back-co
 ## Architecture Overview
 
 ```
-┌──────────────────────────────────────────────────────┐
-│                  Home Assistant                       │
-│               (redacted.host:8123)                    │
-│                                                      │
-│  ┌────────────┐ ┌──────────┐ ┌──────┐ ┌──────────┐  │
-│  │ shq_display│ │overwatch │ │ dosa │ │centurion │  │
-│  │ (WS:8765) │ │(gRPC:    │ │(WS:  │ │(HTTP)    │  │
-│  └─────┬──────┘ │50051)    │ │8766) │ └─────┬────┘  │
-│        │        └────┬─────┘ └──┬───┘       │       │
-└────────┼─────────────┼──────────┼───────────┼───────┘
-         │             │          │           │
-    ┌────▼────┐   ┌────▼────┐  ┌─▼──┐   ┌────▼────┐
-    │   Nyx   │   │Overwatch│  │DOSA│   │Centurion│
-    │(kiosks) │   │ (voice) │  │    │   │(garage) │
-    └─────────┘   └─────────┘  └────┘   └─────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                        Home Assistant                              │
+│                     (redacted.host:8123)                           │
+│                                                                    │
+│  ┌────────────┐ ┌──────────┐ ┌──────┐ ┌──────────┐ ┌──────────┐  │
+│  │ shq_display│ │overwatch │ │ dosa │ │centurion │ │  argus   │  │
+│  │ (WS:8765) │ │(gRPC:    │ │(WS:  │ │(HTTP)    │ │(WS:8770) │  │
+│  └─────┬──────┘ │50051)    │ │8766) │ └─────┬────┘ └─────┬────┘  │
+│        │        └────┬─────┘ └──┬───┘       │            │       │
+└────────┼─────────────┼──────────┼───────────┼────────────┼───────┘
+         │             │          │           │            │
+    ┌────▼────┐   ┌────▼────┐  ┌─▼──┐   ┌────▼────┐   ┌────▼─────┐
+    │   Nyx   │   │Overwatch│  │DOSA│   │Centurion│   │  Argus   │
+    │(kiosks) │   │ (voice) │  │    │   │(garage) │   │ (atlas)  │
+    └─────────┘   └─────────┘  └────┘   └─────────┘   └──────────┘
 ```
+
+Argus is unusual: the daemon runs **on the HA host itself (atlas)**, and HA also *consumes* it — Argus watches the alarm over the HA WS/REST API and pushes case status back to HA via the `argus` component's control WebSocket (default `8770`).
 
 ## Directory Structure
 
@@ -53,7 +55,7 @@ Use MAJOR.MINOR.PATCH: MAJOR = breaking API/protocol change, MINOR = new back-co
 | `chronos/` | Rust | Fullscreen clock overlay (wlr-layer-shell) shown over the kiosk dashboard as an optional idle screensaver; spawned/killed by nyx for kiosks in `idle_mode: clock` |
 | `overwatch/` | Rust | TTS server + alarm system via AWS Polly, gRPC API |
 | `dosa/` | Rust | Door controller via grblHAL CNC, WebSocket API |
-| `argus/` | Rust (native x86_64) | AI alarm assessment daemon on **atlas** — on alarm `triggered`, captures camera stills and feeds them to Anthropic Claude with a private premises seed for real-time *who/what/where* assessment. Native `cargo build` + systemd (NOT a `cross`/RPi build). Phase 1 (foundation) done; phased design in [`specs/argus/`](specs/argus/00-master.md). |
+| `argus/` | Rust (native x86_64) | AI alarm assessment daemon on **atlas** — on alarm `triggered`, captures camera stills and feeds them to Anthropic Claude with a private premises seed for a real-time *who/what/where* assessment (a tiered Sonnet live loop + Opus forensic ID), kept in a `CaseState`. Consumers: offsite S3 evidence, Overwatch voice + PagerDuty dispatch, a kiosk HUD web app (served from `argus/web/`), and an `argus` HA component. The **only native (non-`cross`) Rust app** — `cargo build --release` + systemd user service (NOT an RPi/`cross` build). Phases 1–5 implemented; phased design in [`specs/argus/`](specs/argus/00-master.md). |
 | `home-assistant/` | Python | Custom HA integrations for all the above + Centurion garage |
 | `deploy/` | Python | SSH/rsync deployment tool for all components |
 | `shelly/` | Python | CLI for discovering and configuring Shelly smart devices |
@@ -76,6 +78,10 @@ Use MAJOR.MINOR.PATCH: MAJOR = breaking API/protocol change, MINOR = new back-co
 - Run with `RUST_LOG=info` (or `RUST_LOG=<app>=debug`)
 - No test suites — tested manually on hardware
 
+### Argus is the exception — NATIVE x86_64 (atlas), not cross/RPi
+- Argus runs on **atlas** (x86_64), so it builds with a plain `cargo build --release` — **no `cross`, no Podman, no `build-rpi.sh`**. Output is `argus/target/release/argus` (not `argus/build/`).
+- `./setup argus --build` runs the native cargo build (via `run_cargo_release`, not `run_build_script`); same `tokio`/`tracing`/`serde` stack, deployed as a systemd user service to `~/.local/bin/argus`.
+
 ### Deployment
 - Deploy tool is symlinked as `./setup` in project root
 - Sensitive config lives in `deploy/config/` (gitignored)
@@ -83,7 +89,7 @@ Use MAJOR.MINOR.PATCH: MAJOR = breaking API/protocol change, MINOR = new back-co
 - SSH auth via `~/.ssh/jordon.pem` (username `shq` for kiosks/overwatch/dosa, `jordonsc` for HA). The deploy targets/keys live in `deploy/config/deployment/*.yaml` (gitignored; mirrored in `shq-suite-config`)
 
 ### Home Assistant Components
-- `shq_display`, `overwatch`, `dosa` use YAML config (no config flow)
+- `shq_display`, `overwatch`, `dosa`, `argus` use YAML config (no config flow)
 - `centurion` uses HA config flow (UI-driven setup)
 - WebSocket integrations use coordinator pattern with reconnection logic
 
@@ -91,7 +97,7 @@ Use MAJOR.MINOR.PATCH: MAJOR = breaking API/protocol change, MINOR = new back-co
 
 | Host | Role |
 |------|------|
-| `redacted.host` | Home Assistant server |
+| `atlas` (`redacted.host`) | Home Assistant server + RAG; also runs the **Argus** daemon (native x86_64) as a systemd user service under `shq` |
 | `redacted.host` | Wall display kiosks (RPi 5 + LCD) |
 | `redacted.host` | Voice/TTS server (RPi 5, console-only) |
 | `redacted.host` | Also runs DOSA door controller |
