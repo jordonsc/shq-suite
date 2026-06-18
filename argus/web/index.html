@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en-GB" data-state="boot">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="color-scheme" content="dark" />
+  <title>ARGUS — Command HUD</title>
+
+  <!-- Google fonts: industrial condensed display + clean mono. The app fully
+       renders with the system fallbacks below if these fail to load. -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Saira+Condensed:wght@500;600;700&family=Share+Tech+Mono&display=swap"
+    rel="stylesheet" />
+
+  <link rel="stylesheet" href="hud.css" />
+</head>
+<body>
+  <!-- =========================================================
+       The HUD is ONE parametric frame. Its hue + headline word
+       are driven entirely by  <html data-state="...">  +  the
+       --hud custom property (see hud.css). JS only flips the
+       state attribute and fills the content slots.
+       ========================================================= -->
+  <main class="hud" id="hud" aria-live="polite">
+
+    <!-- Vector chrome layer: corner brackets, segmented border,
+         crosshairs, radar sweep. All drawn (SVG/canvas), never raster. -->
+    <svg class="chrome" id="chrome" viewBox="0 0 1000 1778" preserveAspectRatio="none"
+         xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <!-- Outer segmented border -->
+      <g class="chrome-border">
+        <rect class="frame-outer" x="14" y="14" width="972" height="1750" rx="4" />
+        <rect class="frame-inner" x="22" y="22" width="956" height="1734" rx="2" />
+      </g>
+
+      <!-- Tick rail along the inner top/bottom edge -->
+      <g class="ticks" id="tickRail"></g>
+
+      <!-- Registration crosshairs (mid-edges + interior marks) -->
+      <g class="crosshairs" id="crosshairs"></g>
+
+      <!-- L-shaped corner brackets -->
+      <g class="brackets">
+        <path class="bk" d="M40 96 L40 40 L96 40" />
+        <path class="bk" d="M960 96 L960 40 L904 40" />
+        <path class="bk" d="M40 1682 L40 1738 L96 1738" />
+        <path class="bk" d="M960 1682 L960 1738 L904 1738" />
+      </g>
+    </svg>
+
+    <!-- Radar sweep + pulse live on a single cheap canvas -->
+    <canvas class="radar" id="radar" aria-hidden="true"></canvas>
+
+    <!-- The pulsing alert border (CSS box-shadow keyed to threat) -->
+    <div class="pulse-border" id="pulseBorder" aria-hidden="true"></div>
+
+    <!-- ================= HEADER BAND ================= -->
+    <header class="band">
+      <div class="band-l">
+        <svg class="emblem" id="emblem" viewBox="0 0 64 64" aria-hidden="true">
+          <!-- swapped per-state by JS (alarm: rose sigil / authorised: triangle) -->
+        </svg>
+        <div class="wordmark">
+          <span class="wm-1">BLACKROSE</span>
+          <span class="wm-2">GLOBAL&nbsp;COMMAND</span>
+        </div>
+      </div>
+
+      <div class="band-c">
+        <div class="timer" id="timer">00:00:00</div>
+        <div class="timer-sub" id="timerSub">SYSTEM TIME</div>
+      </div>
+
+      <div class="band-r">
+        <div class="clr-label">CLEARANCE</div>
+        <div class="clr-badge" id="clearance">OMEGA</div>
+      </div>
+    </header>
+
+    <!-- ================= HEADLINE ================= -->
+    <div class="headline-row">
+      <span class="hatch hatch-l" aria-hidden="true"></span>
+      <svg class="warn-tri" id="warnTri" viewBox="0 0 48 44" aria-hidden="true">
+        <path class="wt-body" d="M24 3 L45 41 L3 41 Z" />
+        <rect class="wt-bang" x="22.4" y="16" width="3.2" height="14" rx="1.4" />
+        <circle class="wt-dot" cx="24" cy="35" r="2" />
+      </svg>
+      <h1 class="headline" id="headline">ALARM MODE</h1>
+      <span class="hatch hatch-r" aria-hidden="true"></span>
+    </div>
+
+    <!-- ================= CONTENT PANEL ================= -->
+    <section class="panel" id="panel">
+      <!-- Panel corner ticks (drawn) -->
+      <span class="p-corner tl"></span><span class="p-corner tr"></span>
+      <span class="p-corner bl"></span><span class="p-corner br"></span>
+
+      <!-- (a) Primary camera view -->
+      <figure class="camview" id="camview">
+        <div class="cam-frame">
+          <img class="cam-img" id="camImg" alt="" decoding="async" />
+          <div class="cam-placeholder" id="camPlaceholder">
+            <svg viewBox="0 0 120 90" aria-hidden="true">
+              <rect x="2" y="2" width="116" height="86" rx="3" class="ph-rect" />
+              <path d="M30 60 L52 38 L66 52 L82 34 L100 60" class="ph-line" />
+              <circle cx="44" cy="28" r="7" class="ph-line" />
+              <line x1="2" y1="2" x2="118" y2="88" class="ph-x" />
+            </svg>
+            <span class="ph-text" id="camPhText">NO SIGNAL</span>
+          </div>
+          <figcaption class="cam-cap">
+            <span class="cam-loc" id="camLoc">—</span>
+            <span class="cam-act" id="camAct"></span>
+            <span class="cam-rec" id="camRec">● LIVE</span>
+          </figcaption>
+          <div class="scanline" aria-hidden="true"></div>
+        </div>
+      </figure>
+
+      <!-- (b) Intruder cards slide in here, keyed by intruder.id -->
+      <div class="intruders" id="intruders" aria-label="detected subjects"></div>
+
+      <!-- Idle / standby panel (shown when CaseState is null) -->
+      <div class="standby" id="standby" hidden>
+        <svg class="standby-ring" viewBox="0 0 200 200" aria-hidden="true">
+          <circle cx="100" cy="100" r="78" class="sb-ring-o" />
+          <circle cx="100" cy="100" r="62" class="sb-ring-i" />
+          <circle cx="100" cy="100" r="6" class="sb-core" />
+        </svg>
+        <div class="standby-text">
+          <span class="sb-1">SYSTEM ARMED</span>
+          <span class="sb-2">ALL SECTORS NOMINAL · STANDBY</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= TICKER ================= -->
+    <footer class="ticker" id="ticker">
+      <div class="ticker-head">
+        <span class="tk-dot" aria-hidden="true"></span>
+        <span class="tk-title">SITUATION FEED</span>
+        <span class="tk-summary" id="tkSummary"></span>
+      </div>
+      <ol class="ticker-feed" id="tickerFeed" aria-live="polite"></ol>
+    </footer>
+
+    <!-- Bottom-edge warning triangle (matches the concept) -->
+    <svg class="foot-tri" viewBox="0 0 36 32" aria-hidden="true">
+      <path d="M18 2 L34 30 L2 30 Z" />
+    </svg>
+
+    <!-- Link-status indicator (reconnect state) -->
+    <div class="linkstat" id="linkstat" data-link="connecting" aria-live="polite">
+      <span class="ls-dot"></span><span class="ls-text" id="lsText">LINK · CONNECTING</span>
+    </div>
+  </main>
+
+  <script src="hud.js"></script>
+  <script>
+    // Demo harness loads only on ?demo=1 — keeps the prod path clean.
+    if (new URLSearchParams(location.search).has('demo')) {
+      const s = document.createElement('script');
+      s.src = 'demo.js';
+      document.body.appendChild(s);
+    }
+  </script>
+</body>
+</html>

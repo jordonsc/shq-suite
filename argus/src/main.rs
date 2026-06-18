@@ -18,6 +18,7 @@ mod llm;
 mod out;
 mod state;
 mod version;
+mod web;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -79,6 +80,10 @@ async fn main() -> Result<()> {
     // Same for the Phase 3 outputs consumer (voice + PagerDuty), taken before the
     // sender moves into the engine.
     let outputs_rx = state_tx.subscribe();
+    // Phase 4 (kiosk HUD): the web server's WS push and the kiosk-takeover
+    // consumer each take a receiver here, before `state_tx` moves into the engine.
+    let web_rx = state_tx.subscribe();
+    let kiosks_rx = state_tx.subscribe();
 
     let mut eng = Engine::new(cfg.clone(), rest, sonnet, opus, seed, state_tx);
 
@@ -113,6 +118,30 @@ async fn main() -> Result<()> {
     if voice.is_some() || pagerduty.is_some() {
         info!("Spawning Phase 3 outputs consumer (voice + PagerDuty)");
         tokio::spawn(out::run(outputs_rx, voice, pagerduty, cfg.offsite.clone()));
+    }
+
+    // Phase 4 — kiosk HUD. The HUD HTTP/WS server spawns iff `web:` is configured;
+    // the kiosk-takeover consumer spawns iff `web:` is configured AND `kiosks:` is
+    // non-empty (the takeover URL is `web.public_base`, so no web = nothing to
+    // navigate to). Both are daemon-only and never crash the daemon on failure.
+    if let Some(web_cfg) = cfg.web.clone() {
+        let case_base = case::default_case_base()?;
+        info!(bind = %web_cfg.bind, "Spawning Phase 4 HUD server");
+        let public_base = web_cfg.public_base.clone();
+        tokio::spawn(web::serve(web_cfg, web_rx, case_base));
+
+        if !cfg.kiosks.is_empty() {
+            // The takeover consumer drives HA directly, so it needs its own
+            // RestClient (the engine owns the one built above).
+            let kiosk_rest = RestClient::new(&cfg.ha.url, &cfg.ha.token)?;
+            info!(kiosks = cfg.kiosks.len(), "Spawning Phase 4 kiosk-takeover consumer");
+            tokio::spawn(out::kiosks::run(
+                kiosks_rx,
+                cfg.kiosks.clone(),
+                kiosk_rest,
+                public_base,
+            ));
+        }
     }
 
     run_daemon(cfg, eng).await

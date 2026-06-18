@@ -14,6 +14,7 @@
 //! logs and continues). Speech is serialised through a single voice worker so
 //! milestones don't talk over each other.
 
+pub mod kiosks;
 pub mod offsite;
 pub mod pagerduty;
 pub mod voice;

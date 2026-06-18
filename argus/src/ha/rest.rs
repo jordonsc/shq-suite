@@ -78,6 +78,37 @@ impl RestClient {
         Ok(v.get("state").and_then(|s| s.as_str()).map(str::to_string))
     }
 
+    /// Call an HA service: `POST /api/services/<domain>/<service>` with `data`
+    /// as the JSON body. Used by the Phase 4 kiosk takeover to drive
+    /// `shq_display.navigate`. Errors (non-2xx, transport) are returned, not
+    /// fatal — the caller logs and continues (a takeover failure must never
+    /// crash the engine).
+    pub async fn call_service(
+        &self,
+        domain: &str,
+        service: &str,
+        data: serde_json::Value,
+    ) -> Result<()> {
+        let url = format!("{}/api/services/{}/{}", self.base_url, domain, service);
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(&data)
+            .send()
+            .await
+            .with_context(|| format!("service call {domain}.{service}"))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "service {domain}.{service} returned {status}: {body}"
+            ));
+        }
+        Ok(())
+    }
+
     /// Pull a security-telemetry bundle for the configured entities, rendered as
     /// a compact text block to append after the cached seed. Unavailable
     /// entities are tolerated (skipped with their last-known/`unknown` state).

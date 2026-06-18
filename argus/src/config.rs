@@ -38,6 +38,67 @@ pub struct Config {
     /// `routing_key`) = PagerDuty disabled.
     #[serde(default)]
     pub pagerduty: Option<PagerDutyConfig>,
+    /// Kiosk HUD HTTP/WS server (Phase 4). Absent = the HUD server is not
+    /// spawned (no `/alarm`, `/stills`, `/kiosk`).
+    #[serde(default)]
+    pub web: Option<WebConfig>,
+    /// Wall kiosks to take over on trigger (Phase 4). Empty = no takeover (the
+    /// HUD is still served and reachable, just not pushed to any kiosk). Only
+    /// driven when `web` is also configured (the takeover URL is `web.public_base`).
+    #[serde(default)]
+    pub kiosks: Vec<KioskConfig>,
+}
+
+/// The Phase 4 kiosk HUD server: serves the `argus/web/` app, the case stills,
+/// and the `/kiosk` WebSocket that pushes `CaseState`. Absent = not spawned.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WebConfig {
+    /// Listen address. Bind on the LAN (atlas) so kiosks can reach it.
+    #[serde(default = "default_web_bind")]
+    pub bind: String,
+    /// The base URL kiosks navigate to (`<public_base>/alarm`). This is what
+    /// `shq_display.navigate` sends — it must be the LAN-reachable address of
+    /// THIS server, not the bind (which may be `0.0.0.0`).
+    #[serde(default = "default_web_public_base")]
+    pub public_base: String,
+    /// Directory of the static HUD app to serve (`index.html` etc.). Relative
+    /// paths resolve against the argus binary's own directory (so a deployed
+    /// `web/` sitting next to the binary just works); absolute paths are used
+    /// verbatim. Default: `web`.
+    #[serde(default = "default_web_dir")]
+    pub dir: String,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            bind: default_web_bind(),
+            public_base: default_web_public_base(),
+            dir: default_web_dir(),
+        }
+    }
+}
+
+fn default_web_bind() -> String {
+    "0.0.0.0:8770".to_string()
+}
+
+fn default_web_public_base() -> String {
+    "http://atlas:8770".to_string()
+}
+
+fn default_web_dir() -> String {
+    "web".to_string()
+}
+
+/// One wall kiosk to take over on trigger (Phase 4).
+#[derive(Debug, Clone, Deserialize)]
+pub struct KioskConfig {
+    /// The `shq_display` device id (the `device_id` field of the
+    /// `shq_display.navigate` service — the kiosk key from HA's `configuration.yaml`).
+    pub ha_target: String,
+    /// The URL to navigate this kiosk BACK to on disarm (its normal dashboard).
+    pub dashboard_url: String,
 }
 
 /// Overwatch gRPC voice server (Phase 3 output sink).

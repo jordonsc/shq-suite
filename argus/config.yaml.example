@@ -89,3 +89,34 @@ telemetry_entities: []
 # pagerduty:
 #   routing_key: "${PAGERDUTY_ROUTING_KEY}"   # Events v2 integration key; empty = disabled
 #   source: "argus@atlas"                     # payload.source label
+
+# Kiosk HUD HTTP/WS server + takeover (Phase 4). When `web:` is present Argus
+# serves the sci-fi HUD web app at /alarm, the case stills at /stills/<id>.jpg,
+# and a /kiosk WebSocket that pushes the full CaseState (the same serde shape
+# journalled to disk) on every change. ABSENT block = the HUD server is not
+# spawned. `bind` is the LAN listen address (so kiosks can reach it);
+# `public_base` is the LAN-reachable base URL kiosks are navigated to
+# (`<public_base>/alarm`) — set it to atlas's real address, NOT 0.0.0.0. `dir`
+# is the static HUD app dir; a relative path resolves next to the argus binary
+# (a deployed `web/` beside the binary just works).
+#
+# web:
+#   bind: "0.0.0.0:8770"
+#   public_base: "http://atlas:8770"
+#   dir: "web"
+
+# Wall kiosks to take over on trigger (Phase 4). On the first CaseState of a case
+# Argus calls `shq_display.navigate` for each kiosk → `<web.public_base>/alarm`;
+# on `cleared` it navigates each back to its `dashboard_url`. `ha_target` is the
+# shq_display device id (the `device_id` of the navigate service). EMPTY (or
+# absent) = no takeover — the HUD is still served, just not pushed to any kiosk.
+# Takeover only runs when `web:` is also configured.
+#
+# NOTE (nyx dependency): a bare `shq_display.navigate` does NOT wake a sleeping
+# kiosk or kill a Chronos clock overlay (idle_mode: clock), so on those kiosks
+# the takeover is invisible until nyx gains a navigate-implies-wake behaviour (or
+# a `shq_display.wake` is called first). See argus/CLAUDE.md + 04-kiosk-hud.md.
+#
+# kiosks:
+#   - { ha_target: "kiosk03", dashboard_url: "http://athena/lovelace/kitchen" }
+#   - { ha_target: "kiosk04", dashboard_url: "http://athena/lovelace/bedroom" }

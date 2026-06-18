@@ -8,12 +8,16 @@ with the private premises seed, and logs a natural-language assessment.
 build --release` + systemd, **not** a `cross`/Podman RPi build like nyx/overwatch/dosa.
 
 > **Phase status:** Phases 1 (foundation), 2 (assessment loop + `CaseState`), 2a
-> (offsite S3 resilience), and 3 (outputs — Overwatch voice + PagerDuty) are
-> implemented + shape-verified. The kiosk HUD (Phase 4) and the HA component
-> (Phase 5) are later phases. See `specs/argus/` (read `00-master.md` first).
-> **Phase 3 is NOT live-fired**: voice (`SetAlarm`/`Verbalise`) and PagerDuty
-> sends are wired + compiled + shape-tested only — no real klaxon/page has been
-> sent (residence-asleep constraint).
+> (offsite S3 resilience), 3 (outputs — Overwatch voice + PagerDuty), and 4
+> (kiosk HUD server + takeover — Rust side) are implemented + shape-verified. The
+> HA component (Phase 5) is the next phase. See `specs/argus/` (read
+> `00-master.md` first). **Phase 3 is NOT live-fired**: voice
+> (`SetAlarm`/`Verbalise`) and PagerDuty sends are wired + compiled + shape-tested
+> only — no real klaxon/page has been sent (residence-asleep constraint).
+> **Phase 4 takeover is NOT live-fired**: the HUD server is built + locally
+> smoke-tested (HTTP routes + `/kiosk` WS handshake against the real `web/` app),
+> but no real kiosk has been navigated (residence-asleep). The `web/` HUD app is
+> owned by the frontend; the Rust side serves it.
 
 ## The `CaseState` contract
 
@@ -44,7 +48,40 @@ replicated to S3 — **one schema, three surfaces**. The LLM returns *deltas*
 | `src/out/voice.rs` | **Phase 3** Overwatch gRPC client. `build.rs` (tonic-build 0.11) compiles `proto/voice.proto` (a relative symlink to `../overwatch/proto/voice.proto`) into the `voice` module (client only). `VoiceClient::{set_alarm,verbalise}` dial `host:port` lazily per call; on connect/RPC failure they log + return (never panic, never block the PD channel) |
 | `src/out/voice_policy.rs` | **Phase 3** the POSITIVE-ONLY gate: pure `line_for(event, state) -> Option<SpokenLine>`. A whitelist `match` over `TimelineKind` — `case_opened`/`intruder_identified`/`best_still_upgraded`/`security_station_notified` speak; `threat_level_changed` speaks ONLY on escalation (parses the engine's `"<from> → <to>"` detail); `intruder_detected`/`standdown`/`cleared` → `None`. Structurally cannot emit a failure line (failures aren't timeline events). Unit-tested (no network) |
 | `src/out/pagerduty.rs` | **Phase 3** PagerDuty Events v2 (`reqwest`, reuses the rustls client). `build_event()` (PURE, no network — the shape-test surface) is split from `send()`. `trigger` (dedup_key=`case_id`) on case open + material change; `resolve` on standdown. `custom_details` = threat level + intruders + recent timeline + the deterministic `s3://<bucket>/<prefix>/<case_id>/` prefix when offsite is enabled (bare prefix — atlas has write-only creds, NO presigned URL). Routing key never logged |
+| `src/web/mod.rs` | **Phase 4** the kiosk HUD HTTP/WS server (`axum` + tower-http `ServeDir`). `serve(cfg, rx, case_base)`: `GET /alarm` (+ `/` fallback) → the static `web/` app; `GET /stills/:id` → the JPEG for still `<id>` from the CURRENT case's `stills/<id>.jpg` (resolved via the latest `CaseState` on the watch channel), falling back to scanning every `cases/*/stills/<id>.jpg`; `GET /kiosk` → a WebSocket that sends the current `CaseState` (or `null`) on connect and pushes the full serde `CaseState` JSON on every change. Binds `web.bind` (LAN). Tolerates client disconnects + a missing `index.html` (404s until the frontend lands). Does NOT call the LLM/HA |
+| `src/out/kiosks.rs` | **Phase 4** kiosk-takeover consumer: a `watch` consumer that on the first `CaseState` of a case (`triggered`/`assessing`) calls `shq_display.navigate` (`{device_id, url}`) for each configured kiosk → `<web.public_base>/alarm`, and on `cleared` navigates each back to its `dashboard_url`. Per-case deduped (navigate at most once each way). Uses `RestClient::call_service`. Failures logged, never fatal. **Live takeover deferred** (residence asleep) — built + compiled + locally smoke-tested, no real kiosk navigated. **nyx dependency** (see below) |
 | `src/out/offsite.rs` | **Phase 2a** offsite S3 replicator: `run(cfg, base, wake)` walks `<base>/cases/`, PUTs each non-`.tmp`/un-`.uploaded` file (events+stills first), drops a `.uploaded` marker, retries with `retry_backoff_secs`. Woken by the `watch` receiver, with a `scan_interval_secs` re-scan fallback (+ startup crash recovery). EXPLICIT static write-only creds (`aws-sdk-s3`, rustls), NOT the ambient chain; relies on bucket-default Object Lock |
+
+## Phase 4 — kiosk HUD (Rust side)
+
+The HUD HTTP/WS server (`src/web/mod.rs`) + the takeover consumer
+(`src/out/kiosks.rs`) are spawned in DAEMON mode only: the server iff `web:` is
+configured; the takeover consumer iff `web:` is configured AND `kiosks:` is
+non-empty. Their `watch::Receiver`s are taken in `main` via `state_tx.subscribe()`
+BEFORE `state_tx` moves into the engine (alongside the 2a/3 receivers). The
+takeover consumer builds its own `RestClient` (the engine owns the other one).
+
+**Endpoints** (bind `web.bind`, default `0.0.0.0:8770`):
+
+| Endpoint | Serves |
+|----------|--------|
+| `GET /alarm` (+ `/`) | the static HUD app from `web.dir` (the frontend's `web/`; `index.html` is the SPA) |
+| `GET /stills/:id` | `<case_base>/cases/<case_id>/stills/<id>.jpg` as `image/jpeg`; current case first, else a scan of all case dirs; 404 if missing. Accepts `<id>` or `<id>.jpg` |
+| `GET /kiosk` | WebSocket — sends the current `CaseState` (or `null`) on connect, then pushes the full serde `CaseState` JSON on every change. Reconnect is the client's job |
+
+The `/kiosk` WS frame is the SAME serde serialisation as the on-disk journal —
+one schema, three surfaces. The frontend references stills by
+`intruders[].best_stills[].id` → `/stills/<id>.jpg`.
+
+**nyx dependency (live-takeover blocker, flagged):** a bare
+`shq_display.navigate` only does a CDP `Page.navigate`. It does NOT wake a
+sleeping kiosk (backlight off) nor kill a Chronos clock overlay (which sits
+*above* Chrome on `idle_mode: clock` kiosks), so on those kiosks the takeover is
+invisible. nyx's `wake`/`set_display true` is what SIGKILLs Chronos + restores
+the backlight (`nyx/CLAUDE.md`, ledger `shq-suite-0001`). Needed before live
+takeover: either a small nyx change so `navigate` implies wake+overlay-kill, or a
+`shq_display.wake` service the consumer calls first. NOT yet wired (no
+`shq_display.wake` exists today) — see `04-kiosk-hud.md` Deviations.
 
 ## Config
 
