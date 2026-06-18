@@ -17,11 +17,50 @@ pub struct Config {
     pub anthropic: AnthropicConfig,
     /// Path to the private premises seed (env/`~` expanded).
     pub seed_path: String,
-    /// Cameras Argus may capture. Phase 1 assesses each configured camera once
-    /// per trigger; the shipped example ships a single camera.
+    /// Cameras Argus captures each assessment tick.
     pub cameras: Vec<CameraConfig>,
     /// The HA alarm entity Argus subscribes to.
     pub alarm_entity: String,
+    /// The assessment-loop cadence + guardrails (Phase 2).
+    #[serde(default)]
+    pub loop_config: LoopConfig,
+    /// Security-relevant HA entities pulled as per-tick telemetry (door/window/
+    /// motion/reed/DOSA). Rendered as text after the cached seed.
+    #[serde(default)]
+    pub telemetry_entities: Vec<String>,
+}
+
+/// Assessment-loop cadence and cost guardrails (Phase 2).
+#[derive(Debug, Clone, Deserialize)]
+pub struct LoopConfig {
+    /// Seconds between assessment ticks while the alarm is triggered.
+    #[serde(default = "default_cadence")]
+    pub cadence_secs: u64,
+    /// Optional daily billable-input-token cap. When exceeded, the loop slows to
+    /// `slow_cadence_secs` until UTC midnight. `null`/absent = no cap.
+    #[serde(default)]
+    pub daily_token_cap: Option<u64>,
+    /// Cadence used once the daily cap is hit.
+    #[serde(default = "default_slow_cadence")]
+    pub slow_cadence_secs: u64,
+}
+
+impl Default for LoopConfig {
+    fn default() -> Self {
+        Self {
+            cadence_secs: default_cadence(),
+            daily_token_cap: None,
+            slow_cadence_secs: default_slow_cadence(),
+        }
+    }
+}
+
+fn default_cadence() -> u64 {
+    6
+}
+
+fn default_slow_cadence() -> u64 {
+    30
 }
 
 /// Home Assistant connection (localhost on atlas).

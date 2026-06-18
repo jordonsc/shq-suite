@@ -2,20 +2,21 @@
 
 > AI-powered alarm assessment layer for the SHQ home-automation suite.
 
-When the house alarm (`alarm_control_panel.shq_alarm`) fires, **Argus** pulls a
-camera still, feeds it to a frontier multimodal LLM (Anthropic Claude) along with
-a private premises seed, and produces a real-time *who / what / where* assessment.
+When the house alarm (`alarm_control_panel.shq_alarm`) fires, **Argus** opens a
+case and runs a multi-camera + telemetry assessment loop: a frontier multimodal
+LLM (Anthropic Claude) builds an evolving structured **`CaseState`** — a
+real-time *who / what / where* record — fed by a private premises seed. Sonnet
+runs the fast live loop; Opus does forensic identification on the best stills.
 
 Argus **consumes** the existing Home Assistant alarm and the 11 UniFi Protect
 cameras — it is the intelligence layer on top, not a replacement. It is a native
 **x86_64** daemon that runs on **atlas** (the HA + RAG host).
 
-This is **Phase 1** — the smallest end-to-end slice: *trigger → still →
-assessment*, logged as text. The full system (multi-camera loop, tiered
-Sonnet/Opus, structured `CaseState`, real-time offsite resilience, Overwatch
-intimidation voice, PagerDuty dispatch, kiosk HUD, HA component) is delivered
-across later phases — see [`../specs/argus/`](../specs/argus/) (read
-`00-master.md` first).
+Phases 1–2 are complete: *trigger → multi-camera loop → structured `CaseState`*
+(journalled to disk + broadcast in-process). The remaining outputs (real-time
+offsite resilience, Overwatch intimidation voice, PagerDuty dispatch, kiosk HUD,
+HA component) are delivered across later phases — see
+[`../specs/argus/`](../specs/argus/) (read `00-master.md` first).
 
 ## Quick start
 
@@ -32,16 +33,17 @@ cp seed.example.md     ~/.config/argus/seed.md        # the real seed is private
 export HA_TOKEN=...            # HA UI → profile → long-lived tokens
 export ANTHROPIC_API_KEY=...
 
-# 4. Test the HA + Anthropic path without arming the house
-./target/release/argus --once --camera camera.garage_camera_high_resolution_channel
+# 4. Test the full pipeline without arming the house (one tick → print CaseState)
+./target/release/argus --once
 
-# 5. Run as a daemon (watches the alarm)
+# 5. Run as a daemon (watches the alarm, runs the loop while triggered)
 ./target/release/argus
 ```
 
-A second `--once` run within ~5 minutes should report
-`cache_read > 0` in the token-usage line — the premises seed is served from the
-prompt cache.
+A second `--once` run within ~5 minutes shows `cache_read > 0` in the per-tick
+token-usage line — the premises seed is served from the prompt cache (Sonnet
+caches a ≥2048-token seed; **Opus needs ≥4096 tokens**, so the real seed should
+exceed that). Cases are written under `~/.local/share/argus/cases/`.
 
 ## Configuration
 

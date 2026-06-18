@@ -7,23 +7,36 @@ with the private premises seed, and logs a natural-language assessment.
 **Native x86_64** service that runs on **atlas** (the HA + RAG host) — `cargo
 build --release` + systemd, **not** a `cross`/Podman RPi build like nyx/overwatch/dosa.
 
-> **Phase status:** Phase 1 (foundation) complete. The full multi-camera loop,
-> tiered Sonnet/Opus, the structured `CaseState`, offsite resilience, the
-> outputs (Overwatch/PagerDuty), the kiosk HUD, and the HA component are later
-> phases. See `specs/argus/` (read `00-master.md` first).
+> **Phase status:** Phases 1 (foundation) and 2 (assessment loop + `CaseState`)
+> complete. Offsite resilience (2a), outputs (Overwatch/PagerDuty, Phase 3), the
+> kiosk HUD (Phase 4), and the HA component (Phase 5) are later phases. See
+> `specs/argus/` (read `00-master.md` first).
+
+## The `CaseState` contract
+
+`src/case.rs` defines **`CaseState`** — the single source of truth for an alarm
+episode, and the central interface of the whole project: the engine produces it;
+Phases 2a/3/4 consume it (none of them call the LLM or HA). It is serialised to
+the `watch` broadcast channel, journalled to the case dir, and (Phase 2a)
+replicated to S3 — **one schema, three surfaces**. The LLM returns *deltas*
+(`LiveAssessment` from Sonnet, `Identification` from Opus, via
+`output_config.format` json_schema); Argus reconciles them and **derives the
+`timeline`** (closed `TimelineKind` vocabulary) by diffing — Phase 3 maps those.
 
 ## Source layout
 
 | File | Purpose |
 |------|---------|
-| `src/main.rs` | Entry point + CLI. Loads config/seed; `--once` path; daemon loop (select over Ctrl-C and the HA event channel) |
-| `src/config.rs` | `config.yaml` loader. `${VAR}` env expansion, `~` expansion, default path `~/.config/argus/config.yaml` |
+| `src/main.rs` | Entry point + CLI. Loads config/seed; builds the Sonnet + Opus clients + the `watch<Option<CaseState>>` channel; `--once` (single tick → print CaseState) and the daemon (Ctrl-C aborts the engine task) |
+| `src/config.rs` | `config.yaml` loader. `${VAR}` env expansion, `~` expansion, default path `~/.config/argus/config.yaml`. Adds `loop_config` (cadence/cap) + `telemetry_entities` |
+| `src/case.rs` | **The `CaseState` contract** + `LiveAssessment`/`Identification` LLM-output types, their `*_schema()` JSON schemas, `TimelineKind` vocabulary, and `CaseDir` (the on-disk journal = Phase 2a upload queue) |
+| `src/engine.rs` | The assessment loop: per-tick multi-camera capture + telemetry → Sonnet live loop → merge into `CaseState` → best stills + Opus forensic; state machine; daily token cap; broadcast + journal |
 | `src/version.rs` | `ARGUS_VERSION` from `CARGO_PKG_VERSION` |
-| `src/state.rs` | `AlarmState` (Disarmed/Triggered) + `AlarmTracker` (fires only on the edge into Triggered) |
+| `src/state.rs` | `AlarmState` (Disarmed/Triggered) + `AlarmTracker` → `Transition::{IntoTriggered, OutOfTriggered}` (both edges) |
 | `src/ha/mod.rs` | HA client module; `websocket_url()` (http→ws) |
-| `src/ha/ws.rs` | HA WS client: auth handshake, `subscribe_events`/`state_changed`, reconnect+backoff, emits `HaEvent::AlarmTriggered` over an mpsc channel |
-| `src/ha/rest.rs` | `RestClient::snapshot(entity)` → JPEG bytes via `/api/camera_proxy/<entity>` |
-| `src/llm/mod.rs` | `AnthropicClient::assess(seed, label, jpeg)` → `Assessment { text, usage }`. Raw HTTP to `/v1/messages`, base64 vision, `cache_control` seed |
+| `src/ha/ws.rs` | HA WS client: auth handshake, `subscribe_events`/`state_changed`, reconnect+backoff, emits `HaEvent::{AlarmTriggered, AlarmCleared}` over an mpsc channel |
+| `src/ha/rest.rs` | `RestClient::snapshot(entity)` → JPEG; `state(entity)` + `telemetry(entities)` → per-tick sensor text |
+| `src/llm/mod.rs` | `AnthropicClient::assess(&AssessRequest)` → `Completion { text, usage }`. Raw HTTP to `/v1/messages`; multi-image base64 vision, `cache_control` seed, `Reasoning::{Fast,Deep}` (Sonnet effort-low/no-think vs Opus adaptive+high), optional `output_config.format` structured output |
 
 ## Config
 
@@ -50,14 +63,15 @@ One `claude-sonnet-4-6` `/v1/messages` call per still:
 
 ```bash
 cargo build --release                         # native x86_64 (on/for atlas)
-./target/release/argus --once                 # assess the first configured camera now
-./target/release/argus --once --camera camera.garage_camera_high_resolution_channel
-./target/release/argus                         # daemon: watch the alarm
+./target/release/argus --once                 # ONE full assessment cycle now → print CaseState JSON
+./target/release/argus                         # daemon: watch the alarm, run the loop while triggered
 RUST_LOG=argus=debug ./target/release/argus    # verbose (per-state_changed logging)
 ```
 
-`--once` skips the alarm wait — tests the HA-REST + Anthropic path without arming
-the house. Deploy as a systemd **user** service (`argus.service.example`).
+`--once` opens an ephemeral case, runs one multi-camera tick, prints the
+`CaseState`, and stands down — tests the whole HA + tiered-Anthropic pipeline
+without arming the house. Cases are written to `~/.local/share/argus/cases/`.
+Deploy as a systemd **user** service (`argus.service.example`).
 
 ## Gotchas
 
@@ -65,6 +79,10 @@ the house. Deploy as a systemd **user** service (`argus.service.example`).
 - **Reconnect**: backoff resets to 1 s after a successfully-authenticated session, so a transient drop reconnects fast while a down HA backs off (max 30 s).
 - **camera_proxy** returns the JPEG in the response body (no temp file) — prefer it over `camera/snapshot`.
 - **No Rust Anthropic SDK** → raw `reqwest` HTTP. This is deliberate (see ledger `shq-suite-0002`).
+- **Prompt-cache floors differ by model**: Sonnet 4.6 caches a ≥2048-token prefix; **Opus 4.8 needs ≥4096 tokens**. `seed.example.md` (~2265 tokens) caches on Sonnet but is below the Opus floor — the **real premises seed must exceed ~4096 tokens** for the Opus forensic path to get cache reads.
+- **Structured output**: the LLM returns JSON via `output_config.format` (`{type:"json_schema", schema}`). Schema rules: every object `additionalProperties:false`, all props `required`, optional fields nullable-but-required (`["string","null"]`), **no** numeric/string constraints (`minimum`/`maxLength`). The model emits *deltas* (`LiveAssessment`/`Identification`); Argus derives the `timeline`.
+- **Case dir = upload queue**: each `events/NNNNNN.json` + `stills/*.jpg` is written atomically (`.tmp` then rename) and is an independent unit. Phase 2a adds upload markers + an S3 mirror; don't change the per-file granularity.
+- **`watch` channel**: the engine broadcasts `Option<CaseState>` on every mutation; Phases 3/4 subscribe (`state_tx.subscribe()`), not poll. `main` currently drops `_state_rx` — Phases 3/4 keep it.
 - **Daemon vs `--once`**: the daemon assesses **every** configured camera on each trigger; the shipped example configures one (so "exactly one assessment per trigger" holds). Multi-camera fan-out is formalised in Phase 2.
 
 ## Versioning

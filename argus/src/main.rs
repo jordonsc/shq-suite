@@ -1,11 +1,18 @@
-//! Argus — AI-powered alarm assessment daemon (Phase 1).
+//! Argus — AI-powered alarm assessment daemon.
 //!
-//! When `alarm_control_panel.shq_alarm` transitions to `triggered`, Argus
-//! captures a camera still, sends it to Claude with the premises seed, and logs
-//! a natural-language assessment. `--once` skips the alarm wait and assesses a
-//! camera immediately (tests the HA-REST + Anthropic path without arming).
+//! When `alarm_control_panel.shq_alarm` transitions to `triggered`, Argus opens
+//! a case and runs a multi-camera + telemetry assessment loop: the **Sonnet**
+//! live what/where loop builds an evolving structured [`CaseState`], and the
+//! **Opus** forensic pass firms up intruder identifications on the best stills.
+//! The case is journalled to disk and broadcast for downstream consumers
+//! (Phase 2a offsite replication, Phase 3 voice/PagerDuty, Phase 4 kiosk HUD).
+//!
+//! `--once` runs a single assessment cycle without the alarm and prints the
+//! resulting `CaseState` (tests the HA + tiered-Anthropic path without arming).
 
+mod case;
 mod config;
+mod engine;
 mod ha;
 mod llm;
 mod state;
@@ -14,11 +21,12 @@ mod version;
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
-use tokio::sync::mpsc;
-use tracing::{error, info};
+use tokio::sync::{mpsc, watch};
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use config::Config;
+use engine::Engine;
 use ha::{HaEvent, RestClient};
 use llm::AnthropicClient;
 
@@ -29,13 +37,9 @@ struct Cli {
     #[arg(long)]
     config: Option<PathBuf>,
 
-    /// Assess a camera once and exit, without waiting for the alarm.
+    /// Run a single assessment cycle now (no alarm) and print the CaseState.
     #[arg(long)]
     once: bool,
-
-    /// Camera entity to use with --once (default: the first configured camera).
-    #[arg(long)]
-    camera: Option<String>,
 }
 
 #[tokio::main]
@@ -55,25 +59,31 @@ async fn main() -> Result<()> {
     info!("Loaded premises seed ({} bytes) from {}", seed.len(), cfg.seed_path);
 
     let rest = RestClient::new(&cfg.ha.url, &cfg.ha.token)?;
-    let llm = AnthropicClient::new(cfg.anthropic.api_key.clone(), cfg.anthropic.live_model.clone())?;
+    let sonnet = AnthropicClient::new(
+        cfg.anthropic.api_key.clone(),
+        cfg.anthropic.live_model.clone(),
+    )?;
+    let opus = AnthropicClient::new(
+        cfg.anthropic.api_key.clone(),
+        cfg.anthropic.id_model.clone(),
+    )?;
+
+    // Broadcast latest CaseState (Phases 3/4 subscribe in-process).
+    let (state_tx, _state_rx) = watch::channel::<Option<case::CaseState>>(None);
+
+    let mut eng = Engine::new(cfg.clone(), rest, sonnet, opus, seed, state_tx);
 
     if cli.once {
-        let (entity, label) = resolve_camera(&cfg, cli.camera.as_deref())?;
-        assess_camera(&rest, &llm, &seed, &entity, &label).await?;
+        eng.run_once().await?;
         return Ok(());
     }
 
-    run_daemon(cfg, rest, llm, seed).await
+    run_daemon(cfg, eng).await
 }
 
-/// Subscribe to the alarm and assess on every trigger transition until Ctrl-C.
-async fn run_daemon(
-    cfg: Config,
-    rest: RestClient,
-    llm: AnthropicClient,
-    seed: String,
-) -> Result<()> {
-    let (tx, mut rx) = mpsc::channel::<HaEvent>(16);
+/// Subscribe to the HA alarm and drive the engine until Ctrl-C.
+async fn run_daemon(cfg: Config, eng: Engine) -> Result<()> {
+    let (tx, rx) = mpsc::channel::<HaEvent>(16);
 
     let ws_url = ha::websocket_url(&cfg.ha.url);
     let token = cfg.ha.token.clone();
@@ -87,85 +97,10 @@ async fn run_daemon(
         cfg.alarm_entity
     );
 
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                info!("Shutdown requested");
-                break;
-            }
-            maybe_event = rx.recv() => {
-                let Some(event) = maybe_event else {
-                    error!("event channel closed unexpectedly; exiting");
-                    break;
-                };
-                match event {
-                    HaEvent::AlarmTriggered { entity_id } => {
-                        info!("Alarm triggered ({entity_id}); running assessment");
-                        for cam in &cfg.cameras {
-                            if let Err(e) =
-                                assess_camera(&rest, &llm, &seed, &cam.entity, &cam.label).await
-                            {
-                                error!("assessment failed for {}: {e:#}", cam.label);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
+    // Run the engine; cancel on Ctrl-C.
+    let engine_task = tokio::spawn(eng.run(rx));
+    tokio::signal::ctrl_c().await.ok();
+    info!("Shutdown requested");
+    engine_task.abort();
     Ok(())
-}
-
-/// Capture one still and log the resulting assessment + token usage.
-async fn assess_camera(
-    rest: &RestClient,
-    llm: &AnthropicClient,
-    seed: &str,
-    entity: &str,
-    label: &str,
-) -> Result<()> {
-    info!("Capturing still from {label} ({entity})");
-    let jpeg = rest.snapshot(entity).await?;
-    info!(
-        "Captured {} bytes; assessing with {}",
-        jpeg.len(),
-        llm.model()
-    );
-
-    let assessment = llm.assess(seed, label, &jpeg).await?;
-
-    info!(camera = %label, "ASSESSMENT: {}", assessment.text);
-    info!(
-        input = assessment.usage.input_tokens,
-        output = assessment.usage.output_tokens,
-        cache_write = assessment.usage.cache_creation_input_tokens,
-        cache_read = assessment.usage.cache_read_input_tokens,
-        "token usage"
-    );
-    Ok(())
-}
-
-/// Resolve the (entity, label) to assess for `--once`: an explicit `--camera`
-/// (label looked up from config, falling back to the entity id) or the first
-/// configured camera.
-fn resolve_camera(cfg: &Config, camera_override: Option<&str>) -> Result<(String, String)> {
-    match camera_override {
-        Some(entity) => {
-            let label = cfg
-                .cameras
-                .iter()
-                .find(|c| c.entity == entity)
-                .map(|c| c.label.clone())
-                .unwrap_or_else(|| entity.to_string());
-            Ok((entity.to_string(), label))
-        }
-        None => {
-            let cam = cfg
-                .cameras
-                .first()
-                .context("no cameras configured; pass --camera or add one to config.yaml")?;
-            Ok((cam.entity.clone(), cam.label.clone()))
-        }
-    }
 }

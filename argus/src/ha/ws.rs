@@ -18,7 +18,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, error, info, warn};
 
-use crate::state::{AlarmState, AlarmTracker};
+use crate::state::{AlarmState, AlarmTracker, Transition};
 
 type WsRead = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 
@@ -28,8 +28,13 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// Events surfaced from the HA WebSocket stream.
 #[derive(Debug, Clone)]
 pub enum HaEvent {
-    /// The alarm entity transitioned into `triggered`.
+    /// The alarm entity transitioned **into** `triggered` — open a case.
     AlarmTriggered { entity_id: String },
+    /// The alarm entity transitioned **out of** `triggered` — stand down.
+    AlarmCleared {
+        #[allow(dead_code)]
+        entity_id: String,
+    },
 }
 
 /// Connect, authenticate, subscribe, and forward alarm-trigger transitions over
@@ -138,17 +143,23 @@ async fn handle_message(
     let new_state = data["new_state"]["state"].as_str().unwrap_or("unknown");
     debug!("{alarm_entity} state_changed → {new_state}");
 
-    if tracker.update(AlarmState::from_ha(new_state)) {
-        info!("{alarm_entity} transitioned to triggered");
-        if tx
-            .send(HaEvent::AlarmTriggered {
+    let event = match tracker.update(AlarmState::from_ha(new_state)) {
+        Some(Transition::IntoTriggered) => {
+            info!("{alarm_entity} transitioned to triggered");
+            HaEvent::AlarmTriggered {
                 entity_id: alarm_entity.to_string(),
-            })
-            .await
-            .is_err()
-        {
-            warn!("event channel closed; dropping trigger");
+            }
         }
+        Some(Transition::OutOfTriggered) => {
+            info!("{alarm_entity} left triggered ({new_state})");
+            HaEvent::AlarmCleared {
+                entity_id: alarm_entity.to_string(),
+            }
+        }
+        None => return,
+    };
+    if tx.send(event).await.is_err() {
+        warn!("event channel closed; dropping alarm transition");
     }
 }
 

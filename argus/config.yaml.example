@@ -17,8 +17,25 @@ anthropic:
 # at a copy of seed.example.md; the real seed lives in shq-suite-config / wiki.
 seed_path: "~/.config/argus/seed.md"
 
+# Cameras captured every assessment tick. The real config lists the full set
+# (perimeter, front yard, outdoor living, garage, laundry, kitchen, hallway,
+# stair landing, …). Each camera's still is sent to the live (Sonnet) loop.
 cameras:
   - entity: "camera.garage_camera_high_resolution_channel"
     label: "Garage"                     # human label included in the prompt
+  # - entity: "camera.front_yard_camera_high_resolution_channel"
+  #   label: "Front Yard"
 
 alarm_entity: "alarm_control_panel.shq_alarm"
+
+# Assessment-loop cadence + cost guardrails (Phase 2).
+loop_config:
+  cadence_secs: 6                       # seconds between ticks while triggered
+  daily_token_cap: null                 # optional billable-input-token/day cap; null = none
+  slow_cadence_secs: 30                 # cadence used once the daily cap is hit
+
+# Security-relevant HA entities pulled as per-tick telemetry (door/window/motion/
+# reed/DOSA). Rendered as a text block after the cached seed. Optional.
+telemetry_entities: []
+  # - binary_sensor.garage_door
+  # - binary_sensor.front_door
