@@ -49,7 +49,8 @@ Use MAJOR.MINOR.PATCH: MAJOR = breaking API/protocol change, MINOR = new back-co
 
 | Directory | Language | Description |
 |-----------|----------|-------------|
-| `nyx/` | Rust | Display server for kiosks — brightness, auto-dim, CDP navigation |
+| `nyx/` | Rust | Display server for kiosks — brightness, auto-dim, CDP navigation, clock-screensaver control |
+| `chronos/` | Rust | Fullscreen clock overlay (wlr-layer-shell) shown over the kiosk dashboard as an optional idle screensaver; spawned/killed by nyx for kiosks in `idle_mode: clock` |
 | `overwatch/` | Rust | TTS server + alarm system via AWS Polly, gRPC API |
 | `dosa/` | Rust | Door controller via grblHAL CNC, WebSocket API |
 | `home-assistant/` | Python | Custom HA integrations for all the above + Centurion garage |

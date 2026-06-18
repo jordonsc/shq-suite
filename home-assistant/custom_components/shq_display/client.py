@@ -142,7 +142,8 @@ class SHQDisplayClient:
         dim_level: Optional[int] = None,
         bright_level: Optional[int] = None,
         auto_dim_time: Optional[int] = None,
-        auto_off_time: Optional[int] = None
+        auto_off_time: Optional[int] = None,
+        idle_mode: Optional[str] = None
     ) -> bool:
         """Set auto-dim configuration."""
         command = {'type': 'set_auto_dim_config'}
@@ -154,6 +155,8 @@ class SHQDisplayClient:
             command['auto_dim_time'] = auto_dim_time
         if auto_off_time is not None:
             command['auto_off_time'] = auto_off_time
+        if idle_mode is not None:
+            command['idle_mode'] = idle_mode
 
         response = await self._send_command(command)
         return response.get('success', False) if response else False

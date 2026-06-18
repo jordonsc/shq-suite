@@ -22,7 +22,7 @@ The `--build` flag runs `build-rpi.sh` in the relevant project directory before 
 | `src/deploy.py` | Click CLI entry point with subcommands |
 | `src/deploy/base.py` | BaseDeployer — SSH, rsync, remote commands |
 | `src/deploy/config.py` | Config dataclasses + YAML loader |
-| `src/deploy/kiosk_deployer.py` | Kiosk deployment (Nyx binary, Chromium service, wallpaper) |
+| `src/deploy/kiosk_deployer.py` | Kiosk deployment (Nyx binary, Chronos clock binary, Chromium service, wallpaper) |
 | `src/deploy/ha_deployer.py` | HA custom component deployment |
 | `src/deploy/overwatch_deployer.py` | Overwatch binary, sounds, config, ALSA |
 | `src/deploy/dosa_deployer.py` | DOSA binary, config |
@@ -62,8 +62,9 @@ config/
 | `redacted.host` | HA custom_components | `/etc/hass/custom_components` |
 | `redacted.host` | configuration.yaml | `/etc/hass/configuration.yaml` |
 | `redacted.host` | blueprints | `/etc/hass/blueprints` |
-| `kiosk02-07` | Nyx binary | `/home/shq/display/display/` |
-| `kiosk02-07` | Wallpaper, services | `~/.config/systemd/user/` |
+| `kiosk02-10` | Nyx binary | `/home/shq/display/` |
+| `kiosk02-10` | Chronos clock binary (if built) | `/home/shq/display/chronos` |
+| `kiosk02-10` | Wallpaper, services | `~/.config/systemd/user/` |
 | `redacted.host` | Binary, sounds, config | `~/overwatch/` |
 | `redacted.host` | DOSA binary, config | `~/dosa/` |
 
@@ -73,3 +74,4 @@ config/
 - Kiosk deployer templates the dashboard URL from hostname (e.g. `redacted.host` -> `dashboard-kiosks/kiosk02`)
 - Uses `loginctl enable-linger` so services persist without an active login session
 - SSH key: `~/.ssh/deploy.pem`, username: `shq` (kiosks/overwatch/dosa) or `jordonsc` (HA)
+- Kiosk `--build` builds **both** `nyx` and `chronos`; the deployer copies the chronos binary alongside nyx (after the `--delete` rsync, so it isn't wiped). The `nyx.service` template exports `WAYLAND_DISPLAY=wayland-0` so nyx can spawn chronos (a Wayland layer-shell client). See `chronos/CLAUDE.md`.

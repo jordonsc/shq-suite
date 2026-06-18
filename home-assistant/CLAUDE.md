@@ -16,7 +16,9 @@ Six custom integrations for Home Assistant.
 
 ## shq_display (Nyx Kiosk Control)
 
-**Entities per device**: Light (brightness), Sensors (version, URL), Numbers (dim/bright levels, dim/off times)
+**Entities per device**: Light (brightness), Sensors (version, URL), Numbers (dim/bright levels, dim/off times), Select (**Idle Mode**: `off`|`clock`)
+
+**Idle Mode select** (`select.py`, component 1.1.0): `off` = blank the screen at the auto-off timeout (default, all kiosks); `clock` = show the Chronos clock overlay instead, held at `dim_level` brightness (see `chronos/` + `nyx/` "Clock screensaver"). Shows `unknown` for kiosks still on nyx < 1.1.0 (they don't report `idle_mode`). **All entities that call `set_auto_dim_config` (the four Numbers + this Select) pass the current `idle_mode`** — nyx resets an omitted `idle_mode` to `off`, so the Numbers must preserve it.
 
 **Services**: `shq_display.navigate` — navigate kiosk Chrome to a URL
 
@@ -31,7 +33,9 @@ shq_display:
 
 **Architecture**: Coordinator pattern with WebSocket. Real-time metrics via broadcast, 30s availability timeout, auto-reconnect with 5s delay.
 
-**Key files**: `client.py` (WebSocket), `coordinator.py` (HA coordinator), `light.py`, `sensor.py`, `number.py`
+**Key files**: `client.py` (WebSocket), `coordinator.py` (HA coordinator), `light.py`, `sensor.py`, `number.py`, `select.py` (Idle Mode)
+
+> Entity-id note (2026-06-18): the `kiosk03`/`kiosk04` light/number/version entity_ids had been historically crossed in the registry (kiosk03's entities slugged under `…kiosk_04`, kiosk04's under `…kiosk_04_2`). The unique_ids were always correct; the entity_ids were renamed in place to match (`…kiosk_03` / `…kiosk_04`). Nothing referenced the stale ids. The `url` sensors and the new `select`s were unaffected.
 
 ## overwatch (Voice/TTS)
 

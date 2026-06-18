@@ -189,10 +189,13 @@ def kiosk(hostname, user, key, verbose, destination, build):
 
     Configuration loaded from config/deployment/kiosk.yaml
     """
-    # Build nyx if --build flag is set
+    # Build nyx (and the Chronos clock overlay) if --build flag is set
     if build:
         if not run_build_script("nyx", verbose=verbose):
             click.echo("Build failed. Aborting deployment.", err=True)
+            sys.exit(1)
+        if not run_build_script("chronos", verbose=verbose):
+            click.echo("Chronos build failed. Aborting deployment.", err=True)
             sys.exit(1)
         click.echo()
 
@@ -217,6 +220,7 @@ def kiosk(hostname, user, key, verbose, destination, build):
         dashboard_url=config.dashboard_url,
         kiosk_service_file=config.kiosk_service_file,
         display_service_file=config.display_service_file,
+        chronos_source_path=config.chronos_source_path,
     )
 
     deployer.deploy_all(verbose=verbose)

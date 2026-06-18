@@ -77,7 +77,8 @@ class SHQDisplayDimLevel(SHQDisplayNumberBase):
             dim_level=int(value),
             bright_level=auto_dim_data.get('bright_level', 178),
             auto_dim_time=auto_dim_data.get('auto_dim_time', 0),
-            auto_off_time=auto_dim_data.get('auto_off_time', 0)
+            auto_off_time=auto_dim_data.get('auto_off_time', 0),
+            idle_mode=auto_dim_data.get('idle_mode')
         )
 
 
@@ -101,7 +102,8 @@ class SHQDisplayBrightLevel(SHQDisplayNumberBase):
             dim_level=auto_dim_data.get('dim_level', 25),
             bright_level=int(value),
             auto_dim_time=auto_dim_data.get('auto_dim_time', 0),
-            auto_off_time=auto_dim_data.get('auto_off_time', 0)
+            auto_off_time=auto_dim_data.get('auto_off_time', 0),
+            idle_mode=auto_dim_data.get('idle_mode')
         )
 
 
@@ -125,7 +127,8 @@ class SHQDisplayDimTime(SHQDisplayNumberBase):
             dim_level=auto_dim_data.get('dim_level', 25),
             bright_level=auto_dim_data.get('bright_level', 178),
             auto_dim_time=int(value),
-            auto_off_time=auto_dim_data.get('auto_off_time', 0)
+            auto_off_time=auto_dim_data.get('auto_off_time', 0),
+            idle_mode=auto_dim_data.get('idle_mode')
         )
 
 
@@ -149,5 +152,6 @@ class SHQDisplayOffTime(SHQDisplayNumberBase):
             dim_level=auto_dim_data.get('dim_level', 25),
             bright_level=auto_dim_data.get('bright_level', 178),
             auto_dim_time=auto_dim_data.get('auto_dim_time', 0),
-            auto_off_time=int(value)
+            auto_off_time=int(value),
+            idle_mode=auto_dim_data.get('idle_mode')
         )

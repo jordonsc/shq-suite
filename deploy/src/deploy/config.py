@@ -38,6 +38,7 @@ class KioskConfig(DeploymentConfig):
     """Configuration for Kiosk deployments."""
 
     source_path: str = None
+    chronos_source_path: str = None
     install_path: str = "/home/shq/display"
     systemd_service: str = "display"
     wallpaper_local_path: Optional[str] = None
@@ -54,6 +55,10 @@ class KioskConfig(DeploymentConfig):
         if self.source_path is None:
             # Path relative to project root: display/ or nyx/build
             self.source_path = str(project_root / "nyx" / "build")
+
+        if self.chronos_source_path is None:
+            # Chronos clock-overlay binary, deployed alongside nyx
+            self.chronos_source_path = str(project_root / "chronos" / "build" / "chronos")
 
         if self.wallpaper_local_path is None:
             # Default wallpaper path: deploy/assets/pi_splash.png

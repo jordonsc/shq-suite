@@ -1,12 +1,17 @@
 use anyhow::Result;
+use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::process::Child;
 use tokio::sync::{watch, Mutex};
 use tokio::task;
 use tokio::time::{interval, Duration};
 
 use crate::display::DisplayController;
-use crate::messages::{AutoDimConfig, AutoDimStatus};
+use crate::messages::{AutoDimConfig, AutoDimStatus, IdleMode};
 use crate::touch::TouchMonitor;
+
+/// Handle to the running Chronos clock overlay (None when not shown).
+type ClockHandle = Arc<Mutex<Option<Child>>>;
 
 /// Auto-dim manager for automatic brightness dimming and display power-off
 #[derive(Clone)]
@@ -16,6 +21,7 @@ pub struct AutoDimManager {
     display: DisplayController,
     touch_monitor: TouchMonitor,
     shutdown: watch::Sender<bool>,
+    clock: ClockHandle,
 }
 
 impl AutoDimManager {
@@ -33,12 +39,61 @@ impl AutoDimManager {
             display,
             touch_monitor,
             shutdown: shutdown_tx,
+            clock: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Resolve the Chronos binary, expected alongside the nyx executable.
+    fn chronos_path() -> PathBuf {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("chronos")))
+            .unwrap_or_else(|| PathBuf::from("chronos"))
+    }
+
+    /// Spawn the Chronos clock overlay. It draws on the wlr-layer-shell overlay
+    /// layer, above the fullscreen Chromium kiosk.
+    async fn spawn_clock() -> Option<Child> {
+        let path = Self::chronos_path();
+        let mut cmd = tokio::process::Command::new(&path);
+        cmd.kill_on_drop(true);
+        // Inherit the session env; backfill the Wayland socket if the unit
+        // didn't export it.
+        if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            cmd.env("WAYLAND_DISPLAY", "wayland-0");
+        }
+        match cmd.spawn() {
+            Ok(child) => {
+                tracing::info!("Spawned clock overlay ({})", path.display());
+                Some(child)
+            }
+            Err(e) => {
+                tracing::error!("Failed to spawn clock overlay {}: {}", path.display(), e);
+                None
+            }
+        }
+    }
+
+    /// Dismiss the clock overlay if it is up (SIGKILL → surface torn down,
+    /// revealing the live dashboard instantly).
+    async fn kill_clock(clock: &ClockHandle) {
+        let mut guard = clock.lock().await;
+        if let Some(mut child) = guard.take() {
+            let _ = child.kill().await;
+            tracing::info!("Clock overlay dismissed");
         }
     }
 
     /// Start the auto-dim manager
     pub async fn start(&self) -> Result<()> {
         tracing::info!("Auto-dim manager started");
+
+        // Kill any clock overlay orphaned by a previous nyx (e.g. a hard
+        // restart that skipped kill_on_drop), so we never stack overlays.
+        let _ = tokio::process::Command::new("pkill")
+            .args(["-x", "chronos"])
+            .status()
+            .await;
 
         // Create wake channel for touch monitor callbacks
         let (wake_tx, mut wake_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -48,16 +103,21 @@ impl AutoDimManager {
         let is_dimmed = self.is_dimmed.clone();
         let display = self.display.clone();
         let touch_monitor = self.touch_monitor.clone();
+        let clock = self.clock.clone();
         let mut shutdown_rx = self.shutdown.subscribe();
 
         // Spawn wake handler (handles touch events and explicit wake calls)
         let wake_display = self.display.clone();
         let wake_config = self.config.clone();
         let wake_touch = self.touch_monitor.clone();
+        let wake_clock = self.clock.clone();
         task::spawn(async move {
             while let Some(()) = wake_rx.recv().await {
                 tracing::info!("Wake request received");
                 let cfg = wake_config.lock().await.clone();
+
+                // Dismiss the clock overlay (no-op if it isn't up)
+                Self::kill_clock(&wake_clock).await;
 
                 // Reset idle time
                 wake_touch.reset_touch_timer().await;
@@ -94,6 +154,7 @@ impl AutoDimManager {
                             &is_dimmed,
                             &display,
                             &touch_monitor,
+                            &clock,
                         )
                         .await
                         {
@@ -118,6 +179,7 @@ impl AutoDimManager {
         _is_dimmed: &Arc<Mutex<bool>>,
         display: &DisplayController,
         touch_monitor: &TouchMonitor,
+        clock: &ClockHandle,
     ) -> Result<()> {
         let cfg = config.lock().await.clone();
         let idle_time = touch_monitor.get_idle_time().await;
@@ -127,13 +189,37 @@ impl AutoDimManager {
             return Ok(());
         }
 
-        // Auto-off: same as sleep
+        // Auto-off point: either blank the screen, or (clock mode) show the
+        // Chronos overlay held at dim_level. In both cases we grab touch so the
+        // wake tap is consumed rather than reaching Chrome.
         if cfg.auto_off_time > 0 && idle_time >= cfg.auto_off_time as f64 {
-            let current_brightness = display.get_brightness().await?;
-            if current_brightness > 0 {
-                tracing::info!("Auto-off triggered after {:.1} seconds idle", idle_time);
-                display.set_brightness(0).await?;
-                touch_monitor.set_should_block(true).await;
+            match cfg.idle_mode {
+                IdleMode::Off => {
+                    let current_brightness = display.get_brightness().await?;
+                    if current_brightness > 0 {
+                        tracing::info!("Auto-off triggered after {:.1} seconds idle", idle_time);
+                        display.set_brightness(0).await?;
+                        touch_monitor.set_should_block(true).await;
+                    }
+                }
+                IdleMode::Clock => {
+                    let mut guard = clock.lock().await;
+                    // Clear a handle whose process has already exited so we respawn.
+                    if let Some(child) = guard.as_mut() {
+                        if matches!(child.try_wait(), Ok(Some(_))) {
+                            *guard = None;
+                        }
+                    }
+                    if guard.is_none() {
+                        tracing::info!(
+                            "Clock screensaver triggered after {:.1} seconds idle",
+                            idle_time
+                        );
+                        *guard = Self::spawn_clock().await;
+                        display.set_brightness(cfg.dim_level).await?;
+                        touch_monitor.set_should_block(true).await;
+                    }
+                }
             }
             return Ok(());
         }
@@ -187,12 +273,15 @@ impl AutoDimManager {
             auto_off_time: config.auto_off_time,
             is_dimmed,
             last_touch_time,
+            idle_mode: config.idle_mode,
         }
     }
 
     /// Reset dimmed state and idle timer (call after manual brightness changes)
     pub async fn reset_dimmed_state(&self) {
         *self.is_dimmed.lock().await = false;
+        // A manual brightness change implies the screensaver is over.
+        Self::kill_clock(&self.clock).await;
         self.touch_monitor.reset_touch_timer().await;
         // Without this, an API-driven wake (set_display true / set_brightness >0)
         // leaves the device grabbed and the first tap gets consumed as a wake-trigger.
@@ -202,6 +291,9 @@ impl AutoDimManager {
     /// Wake the display (turn on and set to bright level)
     pub async fn wake(&self) -> Result<()> {
         let config = self.config.lock().await.clone();
+
+        // Dismiss the clock overlay if it's up
+        Self::kill_clock(&self.clock).await;
 
         // Reset idle time
         self.touch_monitor.reset_touch_timer().await;
@@ -219,8 +311,12 @@ impl AutoDimManager {
         Ok(())
     }
 
-    /// Sleep the display (turn off)
+    /// Sleep the display (turn off). An explicit sleep always blanks the
+    /// screen, even in clock mode — the clock is only the idle screensaver.
     pub async fn sleep(&self) -> Result<()> {
+        // Dismiss the clock overlay if it's up
+        Self::kill_clock(&self.clock).await;
+
         // Start grabbing
         self.touch_monitor.set_should_block(true).await;
 

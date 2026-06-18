@@ -25,6 +25,7 @@ class KioskDeployer(BaseDeployer):
         dashboard_url: str = "http://HOST:8123/dashboard-kiosk/{kiosk_name}?kiosk",
         kiosk_service_file: str = None,
         display_service_file: str = None,
+        chronos_source_path: str = None,
     ):
         """
         Initialize the Kiosk deployer.
@@ -47,6 +48,7 @@ class KioskDeployer(BaseDeployer):
         self.dashboard_url = dashboard_url
         self.kiosk_service_file = self._expand_path(kiosk_service_file)
         self.display_service_file = self._expand_path(display_service_file)
+        self.chronos_source_path = Path(chronos_source_path) if chronos_source_path else None
 
     def _extract_kiosk_name(self, hostname: str) -> str:
         """
@@ -59,6 +61,26 @@ class KioskDeployer(BaseDeployer):
             Short kiosk name (e.g., kiosk1)
         """
         return hostname.split('.')[0]
+
+    def _copy_chronos(self, hostname: str, verbose: bool = False) -> bool:
+        """
+        Copy the Chronos clock-overlay binary alongside the nyx binary.
+
+        Runs after the display-server rsync (which uses --delete) so it isn't
+        wiped. Skipped if not built — clock mode is opt-in per kiosk.
+        """
+        if not self.chronos_source_path or not self.chronos_source_path.exists():
+            print("No chronos binary built, skipping (clock mode unavailable).")
+            return True
+
+        destination = f"{self.destination_path}/display/chronos"
+        return self.run_rsync(
+            self.chronos_source_path,
+            destination,
+            hostname,
+            delete=False,
+            verbose=verbose,
+        )
 
     def _copy_wallpaper(self, hostname: str, verbose: bool = False) -> bool:
         """
@@ -204,6 +226,7 @@ class KioskDeployer(BaseDeployer):
             ("Copying display server", lambda: self.run_rsync(
                 f"{self.source_path}/", f"{self.destination_path}/display/", hostname, delete=True, verbose=verbose
             )),
+            ("Copying clock overlay", lambda: self._copy_chronos(hostname, verbose)),
             ("Copying wallpaper", lambda: self._copy_wallpaper(hostname, verbose)),
             ("Creating kiosk service", lambda: self._create_kiosk_service(hostname, verbose)),
             ("Creating display service", lambda: self._create_display_service(hostname, verbose)),

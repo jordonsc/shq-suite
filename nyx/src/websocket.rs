@@ -206,6 +206,7 @@ impl WebSocketServer {
                 bright_level,
                 auto_dim_time,
                 auto_off_time,
+                idle_mode,
             } => {
                 if bright_level == 0 {
                     return Ok(ServerMessage::Error {
@@ -218,6 +219,7 @@ impl WebSocketServer {
                     bright_level,
                     auto_dim_time,
                     auto_off_time,
+                    idle_mode,
                 };
 
                 self.auto_dim.set_config(config.clone()).await;

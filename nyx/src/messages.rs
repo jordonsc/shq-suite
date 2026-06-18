@@ -1,5 +1,16 @@
 use serde::{Deserialize, Serialize};
 
+/// What the display does once `auto_off_time` idle elapses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IdleMode {
+    /// Turn the backlight off (the default; behaviour all kiosks have today).
+    #[default]
+    Off,
+    /// Keep the backlight at `dim_level` and show the Chronos clock overlay.
+    Clock,
+}
+
 /// Client-to-server command messages
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -12,6 +23,9 @@ pub enum ClientMessage {
         bright_level: u8,
         auto_dim_time: u32,
         auto_off_time: u32,
+        // Optional so existing clients (which never send it) keep working.
+        #[serde(default)]
+        idle_mode: IdleMode,
     },
     GetAutoDimConfig,
     Wake,
@@ -59,6 +73,10 @@ pub struct AutoDimConfig {
     pub bright_level: u8,
     pub auto_dim_time: u32,
     pub auto_off_time: u32,
+    /// What to do at the auto-off point. Defaults to `Off` so existing config
+    /// files and other kiosks are unchanged.
+    #[serde(default)]
+    pub idle_mode: IdleMode,
 }
 
 impl Default for AutoDimConfig {
@@ -68,6 +86,7 @@ impl Default for AutoDimConfig {
             bright_level: 178,  // ~70% brightness
             auto_dim_time: 0,   // 0 = disabled
             auto_off_time: 0,   // 0 = disabled
+            idle_mode: IdleMode::Off,
         }
     }
 }
@@ -81,4 +100,5 @@ pub struct AutoDimStatus {
     pub auto_off_time: u32,
     pub is_dimmed: bool,
     pub last_touch_time: f64,
+    pub idle_mode: IdleMode,
 }

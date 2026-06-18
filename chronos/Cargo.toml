@@ -1,0 +1,30 @@
+[package]
+name = "chronos"
+version = "0.1.0"
+edition = "2021"
+description = "Fullscreen layer-shell clock overlay for SHQ kiosks"
+
+[dependencies]
+# Wayland layer-shell client + shm helpers.
+# No xkbcommon: Chronos takes no keyboard/input (nyx grabs touch), and dropping
+# it keeps the (cross-)build free of the xkbcommon system dependency.
+smithay-client-toolkit = { version = "0.19", default-features = false, features = ["calloop"] }
+# dlopen so we don't need libwayland in the cross sysroot at link time
+wayland-client = { version = "0.31", features = ["dlopen"] }
+
+# Glyph rasterisation (pure Rust, cross-compiles cleanly)
+fontdue = "0.9"
+
+# Local time
+chrono = "0.4"
+
+# Logging / errors
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+# Small, fast-starting binary — it's spawned on every screensaver entry
+opt-level = "z"
+lto = true
+strip = true

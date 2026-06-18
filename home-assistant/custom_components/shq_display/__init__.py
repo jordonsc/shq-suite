@@ -11,7 +11,7 @@ from .coordinator import SHQDisplayCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS = [Platform.LIGHT, Platform.NUMBER, Platform.SENSOR]
+PLATFORMS = [Platform.LIGHT, Platform.NUMBER, Platform.SENSOR, Platform.SELECT]
 
 
 async def async_setup(hass: HomeAssistant, config: dict):
@@ -77,6 +77,9 @@ async def async_setup(hass: HomeAssistant, config: dict):
     )
     await discovery.async_load_platform(
         hass, Platform.SENSOR, DOMAIN, {}, config
+    )
+    await discovery.async_load_platform(
+        hass, Platform.SELECT, DOMAIN, {}, config
     )
 
     return True
