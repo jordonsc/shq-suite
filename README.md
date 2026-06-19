@@ -49,13 +49,26 @@ On your network controller, give the Pi DNS to use, prefixed with a kiosk name.
 
 From there, you can run the deploy tool:
 
-    ./deploy kiosk -h kiosk01.myhouse.dev
+    ./setup kiosk -h kiosk01.myhouse.dev
 
 That will configure the Pi to run a dashboard with the display service installed. Home Assistant can then control
 the brightness and on/off state of kiosk's screen with any automations you so choose to create.
 
-> Pro-tips: Start Chromium manually once, set it to dark-mode and do NOT enter a keyring password (kiosk will use basic
-> auth). Log into HA manually so that the kiosk will work seemlessly afterwards.
+> Pro-tip — first HA login (no keyboard): the kiosk boots straight into full-screen Chromium, which lands on the HA
+> login form. Chromium already runs in dark-mode and uses the `basic` password store (no keyring prompt), so the only
+> manual step is logging into HA once. In kiosk mode the on-screen keyboard won't appear, so inject the credentials over
+> SSH with `wtype` (a Wayland virtual keyboard):
+>
+> ```bash
+> ssh -i ~/.ssh/jordon.pem shq@kioskXX.shq.sh
+> sudo apt-get install -y wtype                       # one-off, if not already installed
+> export WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/1000
+> wtype 'kiosk' -k Tab 'your-password' -k Return
+> ```
+>
+> `wtype` types into whatever field has focus; if `-k Tab` doesn't move from username to password, tap the password
+> field on the touchscreen first. Once logged in, HA stores a host-bound token in the profile and the dashboard loads
+> seamlessly on every restart thereafter.
 
 Overwatch Server Setup
 ----------------------

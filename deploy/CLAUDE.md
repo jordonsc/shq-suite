@@ -88,3 +88,4 @@ config/
 - Uses `loginctl enable-linger` so services persist without an active login session
 - SSH key: `~/.ssh/jordon.pem`, username: `shq` (kiosks/overwatch/dosa) or `jordonsc` (HA). Manual check, e.g.: `ssh -i ~/.ssh/jordon.pem shq@<kiosk-host>` (real hosts live in the gitignored `config/deployment/*.yaml`). Remote binaries install to `/home/shq/display/` (`nyx`, `chronos`)
 - Kiosk `--build` builds **both** `nyx` and `chronos`; the deployer copies the chronos binary alongside nyx (after the `--delete` rsync, so it isn't wiped). The `nyx.service` template exports `WAYLAND_DISPLAY=wayland-0` so nyx can spawn chronos (a Wayland layer-shell client). See `chronos/CLAUDE.md`.
+- Kiosk deploy installs `wtype` (`apt-get install -y`, idempotent) as its first step — the Wayland virtual-keyboard CLI used to inject HA credentials over SSH for the first login (the OSK won't show in Chromium kiosk mode). See the README "first HA login" pro-tip.

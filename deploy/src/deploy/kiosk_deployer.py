@@ -62,6 +62,21 @@ class KioskDeployer(BaseDeployer):
         """
         return hostname.split('.')[0]
 
+    def _install_packages(self, hostname: str, verbose: bool = False) -> bool:
+        """
+        Install OS packages the kiosk needs that aren't in the base image.
+
+        - wtype: Wayland virtual-keyboard CLI, used to inject the HA credentials
+          over SSH for the first login (the on-screen keyboard won't appear in
+          Chromium kiosk mode). See the README "first HA login" pro-tip.
+
+        Idempotent: apt-get install is a no-op if already present.
+        """
+        cmds = [
+            "sudo apt-get install -y wtype",
+        ]
+        return self.run_ssh_command(hostname, cmds, verbose=verbose)
+
     def _copy_chronos(self, hostname: str, verbose: bool = False) -> bool:
         """
         Copy the Chronos clock-overlay binary alongside the nyx binary.
@@ -203,6 +218,7 @@ class KioskDeployer(BaseDeployer):
         Perform initial setup of a kiosk host.
 
         This includes:
+        - Installing required OS packages (wtype)
         - Copying display files and wallpaper
         - Creating systemd services
         - Configuring desktop
@@ -223,6 +239,7 @@ class KioskDeployer(BaseDeployer):
         print(f"\n=== Setting up kiosk {hostname} ===")
 
         steps = [
+            ("Installing packages", lambda: self._install_packages(hostname, verbose)),
             ("Copying display server", lambda: self.run_rsync(
                 f"{self.source_path}/", f"{self.destination_path}/display/", hostname, delete=True, verbose=verbose
             )),
