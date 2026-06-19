@@ -209,8 +209,13 @@ live; these complete it.
   repo). Also the main lever left on the weapon/identity ceiling; the richer
   `authorised: bool`-per-person model is the related `CaseState` schema option. Design + build pending.
 * 🔧 **Kiosk monopolisation via Argus (remove the current approach)** — Argus drives the
-  takeover on kiosk11 today; migrate kiosks 02–10 off the HA alarm automations onto Argus,
-  then retire the HA-driven path.
+  takeover on kiosk11 today. **Scaffolding + cutover runbook DONE** (config-example entries
+  for kiosk02–10 added; the live HA path enumerated read-only — takeover is `script.kiosks_alarm`
+  from "Alarm Armed" id `1770878937433`, restore is `script.kiosks_dashboard` from "Alarm
+  Disarmed" id `1770879164083`). **Remaining: the live morning cutover** (add 02–10 to the
+  atlas Argus config, reflash nyx 1.2.0, redeploy Argus, retire the two HA script calls) —
+  full step/verify/rollback runbook in [`06-refinements.md`](./06-refinements.md) §
+  "Kiosk 02–10 cutover runbook". Kiosks 02–10 are in active use → do it with the user present.
 * 🆕 **Argus–Nyx link** — depends on the nyx `shq_display.navigate` wake + kill-Chronos
   prerequisite:
   - wake the screen when switching alarm mode

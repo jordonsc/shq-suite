@@ -197,10 +197,30 @@ telemetry_entities: []
 # kiosk or kill a Chronos clock overlay (idle_mode: clock), so on those kiosks
 # the takeover is invisible until nyx gains a navigate-implies-wake behaviour (or
 # a `shq_display.wake` is called first). See argus/CLAUDE.md + 04-kiosk-hud.md.
+# RESOLVED in nyx 1.2.0 (the kiosks consumer sends `wake:true` on takeover) — but
+# the kiosk MUST be running nyx >= 1.2.0 for the wake to take effect, else the
+# takeover is invisible through a clock/blank screensaver (kiosks 02–10 reflash).
+#
+# IMPORTANT: the REAL kiosk list lives in `~/.config/argus/config.yaml` on atlas
+# (gitignored; mirrored to shq-suite-config) — the block below is the EXAMPLE only.
+# kiosk11 is the test unit and is already on Argus. kiosks 02–10 are still driven
+# by the HA alarm automations (script.kiosks_alarm / script.kiosks_dashboard) and
+# are added to the LIVE config at cutover (see specs/argus/06-refinements.md →
+# "Kiosk 02–10 cutover runbook"). The `dashboard_url` is the kiosk's own dashboard
+# Argus navigates it back to on `cleared`; the real pattern (seen live on kiosk11)
+# is http://atlas.shq.sh:8123/dashboard-kiosks/<kiosk_name>?kiosk.
 #
 # kiosks:
-#   - { ha_target: "kiosk03", dashboard_url: "http://athena/lovelace/kitchen" }
-#   - { ha_target: "kiosk04", dashboard_url: "http://athena/lovelace/bedroom" }
+#   - { ha_target: "kiosk02", dashboard_url: "http://atlas.shq.sh:8123/dashboard-kiosks/kiosk02?kiosk" }  # Garage
+#   - { ha_target: "kiosk03", dashboard_url: "http://atlas.shq.sh:8123/dashboard-kiosks/kiosk03?kiosk" }  # Kitchen
+#   - { ha_target: "kiosk04", dashboard_url: "http://atlas.shq.sh:8123/dashboard-kiosks/kiosk04?kiosk" }  # Jordon Study
+#   - { ha_target: "kiosk05", dashboard_url: "http://atlas.shq.sh:8123/dashboard-kiosks/kiosk05?kiosk" }  # Laundry / DOSA
+#   - { ha_target: "kiosk06", dashboard_url: "http://atlas.shq.sh:8123/dashboard-kiosks/kiosk06?kiosk" }  # Entrance
+#   - { ha_target: "kiosk07", dashboard_url: "http://atlas.shq.sh:8123/dashboard-kiosks/kiosk07?kiosk" }  # Bed 1
+#   - { ha_target: "kiosk08", dashboard_url: "http://atlas.shq.sh:8123/dashboard-kiosks/kiosk08?kiosk" }  # Gym
+#   - { ha_target: "kiosk09", dashboard_url: "http://atlas.shq.sh:8123/dashboard-kiosks/kiosk09?kiosk" }  # Sal Study
+#   - { ha_target: "kiosk10", dashboard_url: "http://atlas.shq.sh:8123/dashboard-kiosks/kiosk10?kiosk" }  # Dining Room
+#   - { ha_target: "kiosk11", dashboard_url: "http://atlas.shq.sh:8123/dashboard-kiosks/kiosk11?kiosk" }  # test unit (already live)
 
 # Resident reference photos (Phase 3 forensic anchoring). Each is attached to the
 # Opus forensic IDENTIFY call ONLY — NOT the high-frequency Sonnet live loop (that

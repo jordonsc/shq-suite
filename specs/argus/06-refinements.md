@@ -222,6 +222,140 @@ clean standdown on disarm. Threat **held Critical** the whole time (ratchet).
   is LEFT as a safety net until Argus's klaxon control is live-verified. Plus the
   main-pane intruder-centric fix (see HUD redesign above).
 
+## Kiosk 02–10 cutover runbook (Argus takeover migration)
+
+> **Scaffolding + runbook DONE** (config-example entries added, live HA path
+> enumerated read-only). **The live cutover is a MORNING task with the user
+> present** — kiosks 02–10 are in active household use, so do this at a considered
+> time, not blind. Nothing below was actioned during the overnight scaffolding run.
+
+### What the legacy HA path does today (enumerated read-only, 2026-06-19)
+
+kiosk11 already runs on Argus. kiosks 02–10 are still driven by **two HA scripts**
+called from the alarm-state automations (NOT the trigger automation — takeover
+happens at **armed**, restore at **disarmed**):
+
+| Script | Navigates kiosk02–10 to | Called from automation |
+|--------|-------------------------|------------------------|
+| `script.kiosks_alarm` ("Kiosks - Alarm") | `http://atlas.shq.sh:8123/dashboard-kiosks/alarm?kiosk` | **Alarm Armed** (id `1770878937433`), on `arming → armed_away` |
+| `script.kiosks_dashboard` ("Kiosks - Dashboard") | each kiosk's own `…/dashboard-kiosks/kioskNN?kiosk` | **Alarm Disarmed** (id `1770879164083`), on `→ disarmed` |
+
+Each script is a single `parallel:` block of nine `shq_display.navigate` calls
+(`device_id: kiosk02 … kiosk10`). The dashboard-restore URL pattern matches the
+Argus `dashboard_url` exactly (`…/dashboard-kiosks/kioskNN?kiosk`), so the
+config-example entries are 1:1 with the live restore targets.
+
+**Important — the kiosk-restore is embedded in a multi-purpose automation.** The
+**Alarm Disarmed** automation (id `1770879164083`) also runs the DOSA-sensor
+restore (`input_boolean.laundry_door_auto` if it was on pre-arm). The **Alarm
+Armed** automation (id `1770878937433`) also caches/disables DOSA sensors, turns
+off `input_boolean.perimeter_security`, and speaks the "Security is now armed"
+line. So **do NOT disable these whole automations** — only neutralise the kiosk
+calls. The clean cut is to **remove the `script.kiosks_alarm` / `script.kiosks_dashboard`
+action from each automation** (or empty the two scripts' sequences), leaving the
+DOSA/perimeter/voice logic intact. (Disabling the two *scripts* outright also works
+and is fully reversible, but a disabled script called from a running automation
+logs a warning each disarm — removing the call is tidier.)
+
+Other alarm automations (NOT touched by this cutover): `Alarm Sensors` (id
+`1770875325186`, sets `input_text.alarm_trigger_room` + trips the panel),
+`Alarm Triggered` (id `1770876717605`, currently DISABLED per the test posture),
+`Stand Down Alarm` (id `1770878315171`, `script.alarm_stand_down` klaxon-off
+safety net), `Alarm Arming` (id `1770878814394`, arming voice).
+
+### Cutover steps (do in this dependency order, with the user)
+
+1. **Reflash nyx 1.2.0 onto kiosks 02–10** (they run 1.1.0; the wake/keep_awake
+   fields are no-ops on older nyx, so the takeover would be invisible behind a
+   clock/blank screensaver). Also ensure the `shq_display` HA component is ≥ 1.2.0
+   (load via `./setup ha --restart` if not already done for kiosk11):
+   ```bash
+   cd nyx && ./build-rpi.sh
+   cd .. && ./setup nyx          # deploys to all kiosk hosts (or per-host if the tool scopes)
+   ```
+   Verify each kiosk reports nyx 1.2.0 before proceeding.
+
+2. **Add kiosks 02–10 to the LIVE Argus config** — edit `~/.config/argus/config.yaml`
+   on atlas (gitignored; mirror the change to shq-suite-config afterwards). Append
+   to the `kiosks:` block (kiosk11 is already there):
+   ```yaml
+   kiosks:
+     - { ha_target: "kiosk02", dashboard_url: "http://atlas.shq.sh:8123/dashboard-kiosks/kiosk02?kiosk" }  # Garage
+     - { ha_target: "kiosk03", dashboard_url: "http://atlas.shq.sh:8123/dashboard-kiosks/kiosk03?kiosk" }  # Kitchen
+     - { ha_target: "kiosk04", dashboard_url: "http://atlas.shq.sh:8123/dashboard-kiosks/kiosk04?kiosk" }  # Jordon Study
+     - { ha_target: "kiosk05", dashboard_url: "http://atlas.shq.sh:8123/dashboard-kiosks/kiosk05?kiosk" }  # Laundry / DOSA
+     - { ha_target: "kiosk06", dashboard_url: "http://atlas.shq.sh:8123/dashboard-kiosks/kiosk06?kiosk" }  # Entrance
+     - { ha_target: "kiosk07", dashboard_url: "http://atlas.shq.sh:8123/dashboard-kiosks/kiosk07?kiosk" }  # Bed 1
+     - { ha_target: "kiosk08", dashboard_url: "http://atlas.shq.sh:8123/dashboard-kiosks/kiosk08?kiosk" }  # Gym
+     - { ha_target: "kiosk09", dashboard_url: "http://atlas.shq.sh:8123/dashboard-kiosks/kiosk09?kiosk" }  # Sal Study
+     - { ha_target: "kiosk10", dashboard_url: "http://atlas.shq.sh:8123/dashboard-kiosks/kiosk10?kiosk" }  # Dining Room
+     # kiosk11 already present (test unit)
+   ```
+   (`web:` must already be configured for takeover to run — it is, kiosk11 is live.)
+
+3. **Redeploy + restart Argus** to pick up the new kiosk list:
+   ```bash
+   argus/deploy-container.sh
+   ssh atlas 'systemctl --user restart argus.service'
+   ssh atlas 'journalctl --user -u argus.service -f'   # watch for the takeover navigates
+   ```
+   (A config-only change still needs the container restart — the config is
+   bind-mounted read-only and read once at startup.)
+
+4. **Retire the HA-driven kiosk path** — once Argus is verified driving 02–10,
+   remove the kiosk action from each automation (NOT the whole automation):
+   - **Alarm Armed** (id `1770878937433`): remove the `script.kiosks_alarm` action.
+   - **Alarm Disarmed** (id `1770879164083`): remove the `script.kiosks_dashboard` action.
+
+   **Prefer reversibility: disable (don't delete).** The lowest-risk form is to
+   *empty the two scripts' sequences* (or disable the two scripts) so the automation
+   calls become no-ops but every entity/id is preserved for rollback. Back up both
+   automation + script configs first (e.g. `./ha get /api/config/automation/config/1770878937433`,
+   same for `…/1770879164083` and `/api/config/script/config/kiosks_alarm`,
+   `…/kiosks_dashboard`) — mirror the originals to shq-suite-config.
+
+### Per-kiosk verification (repeat for each of 02–10)
+
+With the user, run the real alarm machine and confirm on each kiosk:
+
+- **Arm** → after wake, the kiosk shows the **HUD standby pane** (steel "SYSTEM
+  ARMED"). On a kiosk that was on a clock/blank screensaver, confirm it **woke**
+  (proves nyx 1.2.0 + `wake:true` landed).
+- **Trigger** (arm → walk past a camera) → the kiosk flips to the **alarm pane**
+  (takeover) and the screen is **force-on** (`keep_awake` pins it — it must not
+  blank/clock during the incident).
+- **Disarm** → the kiosk holds the green **AUTHORISED** dwell (~15 s) then is
+  **restored to its own dashboard** (`…/dashboard-kiosks/kioskNN?kiosk`), and
+  **normal idle blank/clock resumes** afterwards (the `keep_awake` pin released).
+
+Watch the Argus journal for one `shq_display.navigate` per kiosk on each edge, and
+confirm the legacy HA scripts no longer fire (no duplicate navigate).
+
+### Rollback
+
+If Argus's takeover misbehaves on 02–10:
+1. **Re-enable the HA path** — restore the `script.kiosks_alarm` / `script.kiosks_dashboard`
+   actions in the two automations (or re-enable/repopulate the scripts) from the
+   backups taken in step 4.
+2. **Remove kiosks 02–10 from `~/.config/argus/config.yaml`** (leave kiosk11),
+   then `argus/deploy-container.sh` + `systemctl --user restart argus.service`.
+
+The two halves are independent and either order is safe; doing both fully reverts
+to the pre-cutover behaviour. (nyx 1.2.0 on the kiosks is harmless to leave — the
+wake fields are simply unused by the HA path.)
+
+### Open items to confirm at cutover
+
+- **Legacy takeover is at `armed`, Argus's is at `arming`+`armed` (standby pane)
+  then `triggered` (alarm pane).** Argus shows a richer arming→armed→triggered
+  sequence on ONE `/alarm` URL; the legacy path only flips to a static alarm
+  dashboard at armed. Confirm the user is happy the standby pane replaces the
+  current armed-dashboard behaviour on 02–10.
+- **Does `./setup nyx` fan out to all kiosk hosts, or is it per-host?** Confirm the
+  deploy tool's kiosk scoping before the reflash so all of 02–10 get 1.2.0.
+- The `shq_display` HA component version on atlas — confirm it is ≥ 1.2.0 (needed
+  for the navigate `wake`/`keep_awake` fields) before relying on wake-through-clock.
+
 ## Open findings / next steps (for the fresh-context continuation)
 
 > The **canonical milestone roadmap** is
