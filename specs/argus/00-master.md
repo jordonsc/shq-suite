@@ -196,18 +196,25 @@ Status: ✅ done · 🔧 partial / in-progress · 📋 designed, not built · �
 The full working flow for a functioning prototype. The four core capabilities are already
 live; these complete it.
 
-* 🆕 **Reduce klaxon volume when verbalising** — duck the klaxon while a line plays, built
-  into Overwatch. (Today the klaxon only *stops* out-of-band on disarm, 0.24.0; it does not
-  duck during speech.)
-* 🔧 **PagerDuty flow: create, update and close alerts** — Phase 3 ([`03-outputs.md`](./03-outputs.md))
-  implements Events v2 trigger/resolve + re-page on `WeaponDetected`; owed: a real
-  `PAGERDUTY_ROUTING_KEY` + live-fire, plus the explicit acknowledge/update path.
-* 📋 **Trigger profiles** (`Alarm` / `Investigate` / `General`) — design complete in
-  [`07-trigger-profiles.md`](./07-trigger-profiles.md), not yet built.
-* 📋 **Resident reference photos** — attach resident photos to the Opus identify (and maybe
-  the live) call to anchor recognition; store privately (shq-suite-config, not the public
-  repo). Also the main lever left on the weapon/identity ceiling; the richer
-  `authorised: bool`-per-person model is the related `CaseState` schema option. Design + build pending.
+* ✅ **Reduce klaxon volume when verbalising** — **BUILT** (Overwatch 0.4.0 + argus 0.25.0):
+  `VerbaliseRequest.duck_alarm_volume` ducks every active alarm sink for the blocking clip then
+  restores; argus sends `duck_volume` (default 0.15) on every line. Owed: *audible* tuning by ear
+  (amp was off overnight).
+* ✅ **PagerDuty flow: create, update and close alerts** — **BUILT** (argus 0.26.0): Events v2
+  trigger → update (re-page on material change, stable `dedup_key=case_id`) → **acknowledge**
+  (wired from the control-WS `Acknowledged` milestone) → resolve. Shape/unit-tested only. Owed: a
+  real `PAGERDUTY_ROUTING_KEY` + live-fire (deferred — a real page causes panic).
+* ✅ **Trigger profiles** (`Alarm` / `Investigate` / `General`) — **BUILT** (argus 0.28.0 scaffolding
+  + 0.29.0 escalation; [`07-trigger-profiles.md`](./07-trigger-profiles.md)). `TriggerProfile` +
+  gated outputs + `evaluate_promotion`; a promoted case goes **full Alarm incl. klaxon AND trips the
+  real `alarm_control_panel`** (user-locked decisions). Alarm path byte-identical. Owed: the real
+  perimeter/front-door HA trigger entities (user-owned) + per-profile seed guidance + escalation
+  live-fire (trips the whole house — with user present).
+* ✅ **Resident reference photos** — **BUILT** (argus 0.27.0): labelled resident photos prepended to
+  the Opus identify call; `IDENTIFY_INSTRUCTION` matches-then-excludes a confident resident (keeps
+  the fail-toward-intruder bias); graceful absence (Opus-only, off the cached Sonnet loop). The
+  richer `authorised: bool`-per-person model is the related `CaseState` schema option. Owed: the
+  real private photos on atlas.
 * 🔧 **Kiosk monopolisation via Argus (remove the current approach)** — Argus drives the
   takeover on kiosk11 today. **Scaffolding + cutover runbook DONE** (config-example entries
   for kiosk02–10 added; the live HA path enumerated read-only — takeover is `script.kiosks_alarm`
@@ -216,8 +223,12 @@ live; these complete it.
   atlas Argus config, reflash nyx 1.2.0, redeploy Argus, retire the two HA script calls) —
   full step/verify/rollback runbook in [`06-refinements.md`](./06-refinements.md) §
   "Kiosk 02–10 cutover runbook". Kiosks 02–10 are in active use → do it with the user present.
-* 🆕 **Argus–Nyx link** — depends on the nyx `shq_display.navigate` wake + kill-Chronos
-  prerequisite:
+* ✅ **Argus–Nyx link** — **BUILT + kiosk11 live-validated** (nyx 1.2.0 / shq_display 1.2.0 /
+  argus 0.30.0): `shq_display.navigate` gains optional `wake`/`keep_awake`; nyx `wake` kills Chronos
+  + restores brightness, `keep_awake` pins the screen on via the idle loop. Argus sends `wake=true`
+  on every alarm-mode navigate, `keep_awake=true` only when Triggered / a live case. All three
+  behaviours verified on kiosk11 over the real nyx WS. Owed (mechanical, morning): load shq_display
+  1.2.0 into HA + redeploy Argus 0.30.0 for the end-to-end path; reflash nyx 1.2.0 to kiosks 02–10.
   - wake the screen when switching alarm mode
   - allow normal Nyx screen blank (clock / off) while armed
   - force the screen on while in alarm mode

@@ -10,7 +10,10 @@
 > Podman + systemd Quadlet, ledger `shq-suite-0004`), with the **kiosk HUD takeover
 > LIVE-FIRED on kiosk11** (alarm-mode arming/armed/triggered/authorised panes + 15s
 > green dwell) and the **disarm logic moved off HA into Argus** — see the version
-> history below.
+> history below. **The remaining six M1 items were then built in an overnight autonomous
+> pass (2026-06-20) → argus 0.30.0 / Overwatch 0.4.0 / nyx 1.2.0 — see
+> [§ M1 completion build](#m1-completion-build--overnight-autonomous-session-2026-06-20) for the
+> per-phase summary + the morning to-do (deploys are NOT yet on atlas).**
 
 ## ⚠️ CURRENT HOUSE POSTURE — TEST MODE (left deliberately, must restore later)
 
@@ -79,7 +82,47 @@ Real arm → walk into kitchen with a knife. Spoken, in order, no overlap:
 Final state: `armed=true weapon="possible knife" identified=true threat=critical`,
 clean standdown on disarm. Threat **held Critical** the whole time (ratchet).
 
-## Version history this session (argus 0.7.0 → 0.19.0; Overwatch 0.3.0)
+## M1 completion build — overnight autonomous session (2026-06-20)
+
+A serial, autonomous build pass implemented the **six remaining M1 items** from
+[`00-master.md` § Milestone task lists](./00-master.md#milestone-task-lists). All code
+compiles warning-free, 30 argus unit tests pass, each phase is its own commit on
+`argus-design-specs` (**not pushed**). Versions after this pass: **argus 0.30.0, Overwatch
+0.4.0, nyx 1.2.0, shq_display 1.2.0**.
+
+| Phase | Item | Commit | Versions | State |
+|---|---|---|---|---|
+| 1 | Klaxon volume ducking during speech | `d69f5d5` | ow 0.4.0 / argus 0.25.0 | built; audible tune owed (amp off) |
+| 2 | PagerDuty acknowledge (full lifecycle) | `3205c1f` | argus 0.26.0 | built, unit-tested; never live-paged |
+| 3 | Resident reference photos (Opus anchor) | `4960ab0` | argus 0.27.0 | plumbing built; real photos owed |
+| 4a | Trigger-profile scaffolding (Alarm-identical) | `63699f2` | argus 0.28.0 | built, behaviour-identical |
+| 4b | Trigger-profile escalation engine | `6d94b16` | argus 0.29.0 | built, unit-tested; live-fire owed |
+| 5 | Argus–Nyx wake/keep-awake link | `644bc00` | nyx 1.2.0 / shq_display 1.2.0 / argus 0.30.0 | built + **kiosk11 live-validated** |
+| 6 | Kiosk 02–10 monopolisation scaffolding + runbook | `d8755ff` | — | config-example + cutover runbook (below) |
+
+**Locked user decisions this session:** klaxon ducking lives in Overwatch (server-side, atomic
+with the blocking `Verbalise`); a self-escalated `Investigate`/`General` case goes **full Alarm
+posture incl. the klaxon** AND **trips the real `alarm_control_panel.shq_alarm`** (no opt-out).
+
+**Safety posture observed:** the Overwatch amplifier was physically OFF; the atlas Argus config
+has **no PagerDuty routing key** (verified — so `pd.trigger()` is a guarded no-op); kiosk11 was the
+only live test subject and was restored to its original state; kiosks 02–10 and the live HA
+automations were untouched. Nothing was deployed to atlas overnight (the running container is still
+0.24.0).
+
+### Morning to-do (with the user present)
+1. **Deploy the new builds:** `argus/deploy-container.sh` (→ 0.30.0 on atlas); `./setup ha` to load
+   shq_display 1.2.0; reflash nyx 1.2.0 to kiosk11 is done, kiosks 02–10 pending (see runbook).
+2. **Audible klaxon-duck** tune (amp on) — 0.15 is a first guess.
+3. **Trigger profiles live:** add the real perimeter/front-door HA trigger entities + per-profile
+   seed guidance to atlas's private config (none wired tonight → the softer-trigger path is inert);
+   then a controlled `Investigate`/`General` fire and a controlled escalation (**trips the whole
+   house** — kiosks 02–10 + DOSA cascade). Keep the PagerDuty routing key empty unless you
+   explicitly want a real page.
+4. **Resident photos:** drop the private JPEGs on atlas + add the `resident_photos:` block.
+5. **Kiosk 02–10 cutover** per the runbook below.
+
+
 
 - **0.7.0 — motion-gated ticks.** Baseline full sweep, then only cameras with
   recent smart-detect activity (+ any tracking an intruder); skip the LLM when
