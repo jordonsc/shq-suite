@@ -11,7 +11,7 @@ Rust application that controls wall display kiosks. Manages backlight brightness
 | `src/messages.rs` | JSON message types (ClientMessage/ServerMessage enums) |
 | `src/display.rs` | sysfs backlight control — reads/writes `/sys/class/backlight/*/brightness` |
 | `src/touch.rs` | evdev touch detection — grab/ungrab for sleep mode, idle tracking |
-| `src/auto_dim.rs` | Auto-dim logic — 25ms check loop, dim/bright/off states; spawns/kills the Chronos clock overlay in `idle_mode: clock` |
+| `src/auto_dim.rs` | Auto-dim logic — 25ms check loop, dim/bright/off states; spawns/kills the Chronos clock overlay in `idle_mode: clock`. Holds a `pinned_awake` `AtomicBool` (`set_pinned_awake`): while set the idle loop early-returns (never dims/blanks/spawns the clock); cleared = normal idle resumes. Set/cleared via `navigate{keep_awake}` |
 | `src/cdp.rs` | Chrome DevTools Protocol — raw HTTP + WebSocket for navigation |
 | `src/config.rs` | Persistent JSON config at `~/.config/shqd/config.json` |
 
@@ -21,7 +21,7 @@ Rust application that controls wall display kiosks. Manages backlight brightness
 - `set_display { state: bool }` — on/off
 - `set_brightness { brightness: 0-255 }` — direct brightness
 - `wake` / `sleep` — explicit wake/sleep
-- `navigate { url }` — Chrome navigation via CDP
+- `navigate { url, wake?, keep_awake? }` — Chrome navigation via CDP. `wake: true` (optional, default no) runs the full `wake()` (kill the Chronos overlay + restore `bright_level` + ungrab touch) BEFORE the navigate, so the new page is visible on a sleeping/`clock` kiosk. `keep_awake: true` PINS the display awake — the idle/auto-dim loop won't dim, blank, or spawn the clock until released; `keep_awake: false` releases the pin (normal idle resumes); omitting it leaves the pin unchanged. Both fields are `#[serde(default)]` (`Option`) so old callers that send only `{url}` are unaffected. (Used by Argus's kiosk takeover: `wake:true` on every alarm-mode navigate, `keep_awake:true` only while an alarm is *active* (Triggered/live case), `keep_awake:false` for arming/armed/authorised standby and on the return to the dashboard.)
 - `get_url` — current Chrome URL
 - `get_metrics` — request state broadcast
 - `set_auto_dim_config { dim_level, bright_level, auto_dim_time, auto_off_time, idle_mode? }`
@@ -61,6 +61,7 @@ By default a kiosk blanks the backlight at `auto_off_time` (`idle_mode: off`). A
 - **Wake** (touch / `wake` / `set_display true`): SIGKILL chronos (surface torn down → live dashboard revealed instantly, no Chrome reload), restore `bright_level`, ungrab. The existing evdev grab means the wake tap is consumed and never reaches Chrome.
 - **Explicit `sleep` / `set_brightness 0`** always blanks (kills the clock too) — the clock is only the *idle* screensaver.
 - On startup nyx `pkill -x chronos` to clear any overlay orphaned by a hard restart; spawned children are also `kill_on_drop`.
+- **Pinned awake** (`navigate{keep_awake:true}`): an `AtomicBool` the idle loop checks first — while set it never dims, blanks, or spawns the clock (used by Argus to force the screen on during a live alarm). `navigate{wake:true}` does a one-shot wake (kills the clock, restores brightness) but does NOT pin; combine with `keep_awake:true` to also hold it. `keep_awake:false` releases the pin and normal idle resumes. The pin does not survive a nyx restart (resets to false).
 
 Chronos is a Wayland layer-shell client, so nyx must run with `WAYLAND_DISPLAY` set (the `nyx.service` unit exports `wayland-0`; nyx also backfills it on spawn if absent). Requires the `process` tokio feature.
 

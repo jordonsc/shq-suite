@@ -78,7 +78,7 @@ replicated to S3 — **one schema, three surfaces**. The LLM returns *deltas*
 | `src/out/voice_policy.rs` | **Phase 3** the POSITIVE-ONLY gate: pure `line_for(event, state) -> Option<SpokenLine>`. A whitelist `match` over `TimelineKind` — `case_opened`/`intruder_identified`/`weapon_detected`/`best_still_upgraded`/`security_station_notified` speak; `threat_level_changed` speaks ONLY on escalation (parses the engine's `"<from> → <to>"` detail); `intruder_detected`/`acknowledged`/`standdown`/`cleared` → `None`. `weapon_detected` names the weapon if known. `intruder_entered_zone` → "Intruder in `<zone>`." (terse room-to-room tracking; parses the zone out of the `"Intruder entered <zone>."` detail). Structurally cannot emit a failure line (failures aren't timeline events). Unit-tested (no network) |
 | `src/out/pagerduty.rs` | **Phase 3** PagerDuty Events v2 (`reqwest`, reuses the rustls client). `build_event()` (PURE, no network — the shape-test surface) is split from `send()`. Full lifecycle on a **stable dedup_key=`case_id`**: `trigger` on case open + re-trigger (update) on a material change; `acknowledge` on an operator ack (control WS); `resolve` on standdown. Acknowledge/resolve carry NO payload (dedup_key alone moves/closes the incident). `custom_details` (trigger only) = threat level + intruders + recent timeline + the deterministic `s3://<bucket>/<prefix>/<case_id>/` prefix when offsite is enabled (bare prefix — atlas has write-only creds, NO presigned URL). Routing key never logged |
 | `src/web/mod.rs` | **Phase 4 + 5** the kiosk HUD HTTP/WS server (`axum` + tower-http `ServeDir`). `serve(cfg, rx, case_base, control_tx)`: `GET /alarm` (+ `/` fallback) → the static `web/` app; `GET /stills/:id` → the JPEG for still `<id>` from the CURRENT case's `stills/<id>.jpg` (resolved via the latest `CaseState` on the watch channel), falling back to scanning every `cases/*/stills/<id>.jpg`; `GET /kiosk` → a WebSocket that consumes the case AND `watch<AlarmMode>` channels and pushes the HUD frame on every change to either: the full serde `CaseState` JSON when a case is present, else a `{"type":"system","mode":...}` frame (arming/armed/authorised/disarmed) the HUD renders as the standby/green pane. **`GET /control` (Phase 5)** → the HA `argus` component's WS: pushes a COMPACT status object (not the full `CaseState`) on connect + every change, and forwards inbound `acknowledge`/`standdown` commands to the engine over `control_tx`. Binds `web.bind` (LAN, shared with `/control` — no separate port). Tolerates client disconnects + a missing `index.html` (404s until the frontend lands). Does NOT call the LLM/HA |
-| `src/out/kiosks.rs` | **Phase 4** kiosk-takeover consumer. Consumes BOTH the `watch<Option<CaseState>>` AND the `watch<AlarmMode>` channels and computes a `desired_target`: **HUD** (`<public_base>/alarm`) when a case is present (incl. the cleared/AUTHORISED dwell) OR the alarm is `Arming`/`Armed`/`Triggered`/`Authorised`; else the kiosk's **Dashboard**. Navigates (`shq_display.navigate`) only when the target changes — ONE `/alarm` URL covers arming→triggered→cleared (content switches over the WS, no re-navigation). **LIVE-FIRED on kiosk11** (2026-06-19). nyx caveat applies only to `idle_mode: clock` kiosks (kiosk11 is `off`) |
+| `src/out/kiosks.rs` | **Phase 4** kiosk-takeover consumer. Consumes BOTH the `watch<Option<CaseState>>` AND the `watch<AlarmMode>` channels and computes a `desired_target`: **HUD** (`<public_base>/alarm`) when a case is present (incl. the cleared/AUTHORISED dwell) OR the alarm is `Arming`/`Armed`/`Triggered`/`Authorised`; else the kiosk's **Dashboard**. Navigates (`shq_display.navigate`) only when the target changes — ONE `/alarm` URL covers arming→triggered→cleared (content switches over the WS, no re-navigation). **Phase 5 (0.30.0): drives nyx's screen wake/keep-awake.** Every HUD takeover navigate carries `wake: true` (wakes the backlight + kills any Chronos clock overlay BEFORE the navigate, so the pane shows on a sleeping/clock kiosk); `keep_awake` rides the new pure `alarm_active(case, mode)` — `true` ONLY while an alarm is actively sounding/assessing (`Triggered` or a live non-gated case), to PIN the screen on so the HUD can't blank; `false` for arming/armed/authorised standby. The restore-to-dashboard navigate sends `wake:false, keep_awake:false` (release the pin → normal idle/blank resumes). Requires nyx ≥ 1.2.0 + shq_display component ≥ 1.2.0 (older nyx ignores the fields). **LIVE-FIRED on kiosk11** (2026-06-19; pre-Phase-5). nyx clock-overlay caveat is now resolved by the wake field |
 | `src/out/offsite.rs` | **Phase 2a** offsite S3 replicator: `run(cfg, base, wake)` walks `<base>/cases/`, PUTs each non-`.tmp`/un-`.uploaded` file (events+stills first), drops a `.uploaded` marker, retries with `retry_backoff_secs`. Woken by the `watch` receiver, with a `scan_interval_secs` re-scan fallback (+ startup crash recovery). EXPLICIT static write-only creds (`aws-sdk-s3`, rustls), NOT the ambient chain; relies on bucket-default Object Lock |
 
 ## Phase 4 — kiosk HUD (Rust side)
@@ -137,15 +137,18 @@ the web server in production, so the control surface is always present there). N
 new config — the control WS shares the `web` port. `--once` does NOT use the
 control channel (it calls `run_once`, never `run`).
 
-**nyx dependency (live-takeover blocker, flagged):** a bare
-`shq_display.navigate` only does a CDP `Page.navigate`. It does NOT wake a
-sleeping kiosk (backlight off) nor kill a Chronos clock overlay (which sits
-*above* Chrome on `idle_mode: clock` kiosks), so on those kiosks the takeover is
-invisible. nyx's `wake`/`set_display true` is what SIGKILLs Chronos + restores
-the backlight (`nyx/CLAUDE.md`, ledger `shq-suite-0001`). Needed before live
-takeover: either a small nyx change so `navigate` implies wake+overlay-kill, or a
-`shq_display.wake` service the consumer calls first. NOT yet wired (no
-`shq_display.wake` exists today) — see `04-kiosk-hud.md` Deviations.
+**nyx dependency — RESOLVED (Phase 5, argus 0.30.0 / nyx 1.2.0 / shq_display
+1.2.0):** `shq_display.navigate` now takes optional `wake` + `keep_awake`. nyx's
+`navigate{wake:true}` runs the existing `wake()` (SIGKILL Chronos + restore
+`bright_level` + ungrab touch) BEFORE the CDP navigate, so the takeover is visible
+on a sleeping/`idle_mode: clock` kiosk; `keep_awake:true` PINS the screen on (an
+`AtomicBool` the auto-dim loop checks → no dim/blank/clock-spawn until released),
+`keep_awake:false` releases it. The kiosks consumer drives them (see the
+`src/out/kiosks.rs` row + ledger `shq-suite-0002`): `wake:true` on every alarm-mode
+navigate, `keep_awake` = `alarm_active` (force-on only during `Triggered`/a live
+case), `keep_awake:false` on the dashboard restore. Old nyx (< 1.2.0) ignores the
+unknown fields (pre-Phase-5 navigate-only). **Deploy ordering:** flash nyx + load
+the shq_display component change before the end-to-end path works.
 
 ## Config
 

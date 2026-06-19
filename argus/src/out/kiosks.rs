@@ -15,11 +15,16 @@
 //! - **Dashboard** otherwise (disarmed, no case). The engine drops the cleared
 //!   case off the broadcast after the dwell, which lands us here → restore.
 //!
-//! ## nyx DEPENDENCY (flagged — see 04-kiosk-hud.md Deviations)
-//! A bare `shq_display.navigate` only issues a CDP `Page.navigate`. It does NOT
-//! wake a sleeping kiosk nor kill a Chronos clock overlay (`idle_mode: clock`), so
-//! on those kiosks the takeover would be invisible until nyx gains a wake/overlay-
-//! kill on navigate. Kiosks with `idle_mode: off` are unaffected.
+//! ## nyx wake/keep-awake (Phase 5 — resolved)
+//! Every alarm-mode takeover navigate carries `wake: true` so nyx wakes the
+//! backlight + kills any Chronos clock overlay (`idle_mode: clock`) BEFORE the
+//! CDP navigate — the pane is visible even on a sleeping/clock kiosk. While the
+//! alarm is actively sounding/assessing (`Triggered` or a live case) it also
+//! carries `keep_awake: true` to PIN the screen on so the takeover HUD can't
+//! blank; arming/armed/authorised standby and the return to the dashboard send
+//! `keep_awake: false` so the kiosk may blank normally. Requires nyx >= 1.2.0 +
+//! shq_display component >= 1.2.0; older nyx ignores the unknown fields (the
+//! pre-Phase-5 navigate-only behaviour). See ledger shq-suite-0002.
 
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -61,6 +66,16 @@ fn desired_target(case: &Option<CaseState>, mode: AlarmMode) -> Target {
     }
 }
 
+/// Whether an alarm is ACTIVELY sounding/assessing — drives the `keep_awake` pin
+/// so the screen is FORCED on (no idle blank) for the duration. True when the
+/// mode is `Triggered` OR a live (non-gated) case is in progress. Arming/armed/
+/// authorised standby panes deliberately return false: the kiosk may blank
+/// normally while merely armed.
+fn alarm_active(case: &Option<CaseState>, mode: AlarmMode) -> bool {
+    let active_case = case.as_ref().is_some_and(|c| !c.gated());
+    active_case || matches!(mode, AlarmMode::Triggered)
+}
+
 /// Spawned in daemon mode only (and only when `web` is configured + `kiosks` is
 /// non-empty). Owns its own `watch` receivers + a `RestClient` for the service
 /// calls. Failures are logged, never fatal.
@@ -84,14 +99,21 @@ pub async fn run(
 
     loop {
         // Recompute + navigate on a change to EITHER channel.
-        let desired = {
+        let (desired, force_on) = {
             let case = case_rx.borrow();
             let mode = *mode_rx.borrow();
-            desired_target(&case, mode)
+            (desired_target(&case, mode), alarm_active(&case, mode))
         };
         if desired != current {
             match desired {
-                Target::Hud => takeover(&rest, &kiosks, &alarm_url).await,
+                // Wake the screen on every alarm-mode takeover so the standby/
+                // alarm pane is visible even on a sleeping/clock kiosk; PIN it
+                // awake (`keep_awake`) only while an alarm is actually ACTIVE
+                // (Triggered or a live case) so arming/armed/authorised standby
+                // can still blank normally.
+                Target::Hud => takeover(&rest, &kiosks, &alarm_url, force_on).await,
+                // Returning to the dashboard always releases the keep-awake pin so
+                // normal idle/blank resumes.
                 Target::Dashboard => restore(&rest, &kiosks).await,
             }
             current = desired;
@@ -110,29 +132,39 @@ pub async fn run(
     }
 }
 
-/// Navigate every kiosk to the alarm HUD.
-async fn takeover(rest: &RestClient, kiosks: &[KioskConfig], alarm_url: &str) {
-    info!(url = %alarm_url, "kiosks: TAKEOVER — navigating all kiosks to the HUD");
+/// Navigate every kiosk to the alarm HUD. Always `wake: true` (the takeover must
+/// be visible on a sleeping/clock kiosk); `keep_awake` = `force_on` (pin the
+/// screen on only while the alarm is actively sounding/assessing).
+async fn takeover(rest: &RestClient, kiosks: &[KioskConfig], alarm_url: &str, force_on: bool) {
+    info!(url = %alarm_url, keep_awake = force_on, "kiosks: TAKEOVER — navigating all kiosks to the HUD");
     for k in kiosks {
-        navigate(rest, &k.ha_target, alarm_url).await;
+        navigate(rest, &k.ha_target, alarm_url, true, force_on).await;
     }
 }
 
-/// Navigate every kiosk back to its own dashboard.
+/// Navigate every kiosk back to its own dashboard. Releases the keep-awake pin
+/// (`keep_awake: false`) so normal idle/blank resumes; no need to force a wake.
 async fn restore(rest: &RestClient, kiosks: &[KioskConfig]) {
     info!("kiosks: RESTORE — returning all kiosks to their dashboards");
     for k in kiosks {
-        navigate(rest, &k.ha_target, &k.dashboard_url).await;
+        navigate(rest, &k.ha_target, &k.dashboard_url, false, false).await;
     }
 }
 
-/// Issue one `shq_display.navigate` call. The service takes `{device_id, url}`
-/// (see home-assistant/shq_display/services.yaml). Logged-and-continue on any
-/// failure — one unreachable kiosk must not stop the others.
-async fn navigate(rest: &RestClient, device_id: &str, url: &str) {
-    let data = serde_json::json!({ "device_id": device_id, "url": url });
+/// Issue one `shq_display.navigate` call. The service takes
+/// `{device_id, url, wake, keep_awake}` (see home-assistant/shq_display/
+/// services.yaml) — `wake`/`keep_awake` drive nyx's screen wake + keep-awake pin
+/// (nyx >= 1.2.0; older nyx ignores them). Logged-and-continue on any failure —
+/// one unreachable kiosk must not stop the others.
+async fn navigate(rest: &RestClient, device_id: &str, url: &str, wake: bool, keep_awake: bool) {
+    let data = serde_json::json!({
+        "device_id": device_id,
+        "url": url,
+        "wake": wake,
+        "keep_awake": keep_awake,
+    });
     match rest.call_service("shq_display", "navigate", data).await {
-        Ok(()) => info!(device_id, url, "kiosks: navigate ok"),
+        Ok(()) => info!(device_id, url, wake, keep_awake, "kiosks: navigate ok"),
         Err(e) => warn!(device_id, url, error = %e, "kiosks: navigate failed"),
     }
 }
@@ -167,6 +199,20 @@ mod tests {
             desired_target(&case(TriggerProfile::General), AlarmMode::Disarmed)
                 == Target::Dashboard
         );
+    }
+
+    #[test]
+    fn alarm_active_pins_only_while_actually_alarming() {
+        // keep_awake fires for a live (non-gated) case or Triggered...
+        assert!(alarm_active(&case(TriggerProfile::Alarm), AlarmMode::Disarmed));
+        assert!(alarm_active(&None, AlarmMode::Triggered));
+        // ...but NOT for arming/armed/authorised standby (the screen may blank)...
+        assert!(!alarm_active(&None, AlarmMode::Arming));
+        assert!(!alarm_active(&None, AlarmMode::Armed));
+        assert!(!alarm_active(&None, AlarmMode::Authorised));
+        assert!(!alarm_active(&None, AlarmMode::Disarmed));
+        // ...nor for a gated (soft) case that hasn't escalated.
+        assert!(!alarm_active(&case(TriggerProfile::Investigate), AlarmMode::Armed));
     }
 
     #[test]

@@ -267,7 +267,24 @@ impl WebSocketServer {
                     url: None,
                 })
             }
-            ClientMessage::Navigate { url } => {
+            ClientMessage::Navigate {
+                url,
+                wake,
+                keep_awake,
+            } => {
+                // Wake first so a sleeping/clock kiosk actually shows the new page:
+                // kill the Chronos overlay, restore brightness, ungrab touch.
+                if wake == Some(true) {
+                    if let Err(e) = self.auto_dim.wake().await {
+                        tracing::error!("Failed to wake during navigate: {:#}", e);
+                    }
+                }
+                // Pin/unpin the idle loop. `Some(true)` holds the screen on past
+                // auto_off_time; `Some(false)` releases it (normal blank resumes);
+                // `None` leaves the pin unchanged.
+                if let Some(pin) = keep_awake {
+                    self.auto_dim.set_pinned_awake(pin);
+                }
                 match cdp::navigate(&url).await {
                     Ok(()) => {
                         tracing::info!("Navigated Chrome to {}", url);

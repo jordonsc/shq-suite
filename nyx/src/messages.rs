@@ -30,7 +30,20 @@ pub enum ClientMessage {
     GetAutoDimConfig,
     Wake,
     Sleep,
-    Navigate { url: String },
+    Navigate {
+        url: String,
+        /// If `Some(true)`, wake the display (kill the Chronos overlay + restore
+        /// `bright_level` + ungrab touch) BEFORE the CDP navigate, so the new page
+        /// is visible on a sleeping/clock kiosk. `None`/`Some(false)` = today's
+        /// behaviour (navigate only). Optional for back-compat with old callers.
+        #[serde(default)]
+        wake: Option<bool>,
+        /// If `Some(true)`, PIN the display awake — the auto-dim/idle loop will not
+        /// blank or spawn the clock until cleared. `Some(false)` clears the pin
+        /// (normal idle resumes). `None` leaves the pin unchanged.
+        #[serde(default)]
+        keep_awake: Option<bool>,
+    },
     GetUrl,
     Noop,
 }

@@ -21,7 +21,7 @@ Custom integrations for Home Assistant.
 
 **Idle Mode select** (`select.py`, component 1.1.0): `off` = blank the screen at the auto-off timeout (default, all kiosks); `clock` = show the Chronos clock overlay instead, held at `dim_level` brightness (see `chronos/` + `nyx/` "Clock screensaver"). Shows `unknown` for kiosks still on nyx < 1.1.0 (they don't report `idle_mode`). **All entities that call `set_auto_dim_config` (the four Numbers + this Select) pass the current `idle_mode`** — nyx resets an omitted `idle_mode` to `off`, so the Numbers must preserve it.
 
-**Services**: `shq_display.navigate` — navigate kiosk Chrome to a URL
+**Services**: `shq_display.navigate` — navigate kiosk Chrome to a URL. Optional `wake` (bool) + `keep_awake` (bool), component 1.2.0 / nyx ≥ 1.2.0: `wake: true` wakes the backlight + dismisses the clock overlay before navigating (so the page shows on a sleeping/`clock` kiosk); `keep_awake: true` pins the screen on (idle loop won't blank), `false` releases the pin. Both omitted by default and ignored by older nyx — Argus's alarm takeover drives them.
 
 **Config**:
 ```yaml
