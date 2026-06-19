@@ -105,6 +105,9 @@ impl VoiceService for VoiceServiceImpl {
         let notification_tone_id = req.notification_tone_id;
         let voice_id = req.voice_id;
         let await_playback = req.await_playback.unwrap_or(false);
+        // If set >0, duck any active klaxon to this volume for the clip so the
+        // spoken line stays intelligible, then restore. No-op when no alarm sounds.
+        let duck_alarm_volume = req.duck_alarm_volume.filter(|v| *v > 0.0);
 
         tracing::info!(
             "Verbalising text: '{}' with tone={:?}, voice={:?}",
@@ -183,12 +186,33 @@ impl VoiceService for VoiceServiceImpl {
                 ))
             })?;
 
+        // Duck any active klaxon BEFORE playback so the line is intelligible over
+        // it. FIFO on the single audio thread guarantees this lands before the
+        // (possibly blocking) play, and the restore lands after it.
+        if let Some(duck) = duck_alarm_volume {
+            tracing::info!("Ducking active alarm(s) to volume {} for speech", duck);
+            self.audio_manager.duck_alarms(duck).await;
+        }
+
         // Play synthesized audio. When await_playback is set, this blocks until the
         // clip finishes (no overlapping speech); otherwise it returns immediately
         // after synthesis (default = unchanged HA TTS behaviour).
-        self.audio_manager
+        let play_result = self
+            .audio_manager
             .play_bytes(audio_data, volume, await_playback)
-            .await
+            .await;
+
+        // Restore alarm volume regardless of playback outcome, so a failed clip
+        // never leaves the klaxon stuck at the ducked level. NOTE: ducking is only
+        // meaningful with await_playback=true (the only caller, Argus, always sets
+        // it) — with fire-and-forget the sink is detached and this restore would
+        // fire before the clip ends, un-ducking too early.
+        if duck_alarm_volume.is_some() {
+            tracing::debug!("Restoring alarm(s) to full volume after speech");
+            self.audio_manager.restore_alarms().await;
+        }
+
+        play_result
             .map_err(|e| Status::internal(format!("Audio playback failed: {}", e)))?;
 
         let response = VerbaliseResponse {
