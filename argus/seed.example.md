@@ -95,3 +95,22 @@ for this when reading a still — it is a common source of false positives:
 - `<what counts as a confirmed intruder vs. a likely false alarm>`
 - `<who to notify, and the threshold for the security station dispatch>`
 - `<any safe-words, pets, or scheduled activity that commonly trips the alarm>`
+
+## Trigger-profile guidance (Phase 4b — tiered response)
+
+> Argus assesses with a *posture* set by WHY it was woken. The live prompt frames
+> the look per profile; this seed supplies the premises-specific judgement. Fill
+> these in with the real estate detail (kept private).
+
+- **Alarm** (the house alarm fired) — an intrusion is assumed; respond fully. No
+  extra guidance needed beyond the resident/vehicle whitelists above.
+- **Investigate** (perimeter activity while secured) — `<what benign perimeter
+  activity looks like here: a resident arriving, a known delivery window, the
+  cleaner's day/time, expected vehicles>` vs `<what a prowler looks like: loitering
+  at an access point, trying doors/windows, masked, casing the property>`. Argus
+  promotes to a full alarm (and trips the real panel) on a confirmed prowler.
+- **General** (a friendly-zone approach, e.g. front door) — `<what an ordinary
+  visitor/delivery looks like at the door>`. Promote ONLY on an OBVIOUS danger
+  indicator: a balaclava / concealed face, a visibly brandished weapon, or clear
+  forced-entry behaviour. `<any front-door-specific notes — intercom, regular
+  couriers, etc.>`

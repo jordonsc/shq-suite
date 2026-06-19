@@ -175,10 +175,11 @@ async fn route_event(
                 debug!("outputs: voice queue full; dropped a line");
             }
         }
-        // Klaxon ON rides the case open. Klaxon OFF is handled out-of-band by the
-        // disarm path (`standdown_voice`), NOT here, so a stop can't wait behind a
-        // playing line.
-        if event.kind == TimelineKind::CaseOpened {
+        // Klaxon ON rides the case open — or the `Escalated` promotion of a gated
+        // case (Phase 4b), which is the first justified moment to sound it. Klaxon
+        // OFF is handled out-of-band by the disarm path (`standdown_voice`), NOT
+        // here, so a stop can't wait behind a playing line.
+        if matches!(event.kind, TimelineKind::CaseOpened | TimelineKind::Escalated) {
             let _ = tx.try_send(VoiceMsg::Alarm(true));
         }
     }
@@ -190,7 +191,10 @@ async fn route_event(
     if let Some(pd) = pd {
         match event.kind {
             // Material changes → (re)send a trigger with the latest dossier.
+            // `Escalated` (Phase 4b) is a case-open-equivalent: it's the first page
+            // for a promoted gated case (the gated `CaseOpened` was suppressed).
             TimelineKind::CaseOpened
+            | TimelineKind::Escalated
             | TimelineKind::IntruderDetected
             | TimelineKind::IntruderIdentified
             | TimelineKind::WeaponDetected

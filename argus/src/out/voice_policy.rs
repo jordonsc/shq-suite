@@ -53,7 +53,11 @@ impl SpokenLine {
 pub fn lines_for(event: &TimelineEvent, state: &CaseState) -> Vec<SpokenLine> {
     match event.kind {
         // ── Breach announcement (rides with the klaxon) ─────────────────────
-        TimelineKind::CaseOpened => {
+        // `CaseOpened` fires it for a real `Alarm` case at open; `Escalated` (Phase
+        // 4b) fires the SAME breach line when a gated case is promoted to `Alarm`
+        // (the gate suppressed `CaseOpened`, so the breach is announced retroactively
+        // at the promotion edge — the first justified moment to speak).
+        TimelineKind::CaseOpened | TimelineKind::Escalated => {
             // Prefer the alarm's trigger location (the zone that tripped it), then
             // any camera person-present fix; else a generic breach line.
             let location = state
@@ -143,15 +147,10 @@ pub fn lines_for(event: &TimelineEvent, state: &CaseState) -> Vec<SpokenLine> {
         // Threat-level changes (announcing "critical" sounds like panic),
         // best-still upgrades, per-subject detection, security-station marker,
         // operator acknowledgement, and standdown/cleared all stay silent.
-        //
-        // `Escalated` (a Phase-4b gated→Alarm promotion) is SILENT in 4a — 4b can
-        // wire a "Security breach detected…" breach line here at promotion. Kept
-        // silent now so the scaffolding never speaks on its own.
         TimelineKind::ThreatLevelChanged
         | TimelineKind::BestStillUpgraded
         | TimelineKind::SecurityStationNotified
         | TimelineKind::IntruderDetected
-        | TimelineKind::Escalated
         | TimelineKind::Acknowledged
         | TimelineKind::Standdown
         | TimelineKind::Cleared => Vec::new(),

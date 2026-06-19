@@ -61,15 +61,22 @@ cameras:
 
 alarm_entity: "alarm_control_panel.shq_alarm"
 
-# Trigger profiles (Phase 4a — tiered response). Each source maps an HA entity to
-# the posture a case opened by it takes:
+# Trigger profiles (Phase 4a/4b — tiered response). Each source maps an HA entity
+# to the posture a case opened by it takes:
 #   alarm       → confirmed intrusion: full immediate outputs (klaxon/voice/PD/kiosk)
-#   investigate → perimeter activity while secured: GATED (silent) until escalated
-#   general     → benign doorstep approach: GATED, fast/shallow triage
+#   investigate → perimeter activity while secured: GATED (silent), time-boxed; on a
+#                 confirmed prowler Argus PROMOTES to alarm — full outputs AND it
+#                 trips the real alarm_control_panel — else quiet standdown.
+#   general     → benign doorstep approach: GATED, fast/shallow (Sonnet-only, no Opus
+#                 unless escalated); promotes on an OBVIOUS threat (weapon / concealed
+#                 face / forced entry), else quiet standdown after a few ticks.
+# An escalation always goes to FULL alarm posture (klaxon included) and trips the
+# real house alarm — there is no softer "voice-only" escalation and no opt-out.
 # OMIT `triggers` (or leave it empty) and the `alarm_entity` above is synthesised
 # into a single `alarm`-profile source — i.e. exactly today's behaviour. The softer
 # sources below are USER-OWNED placeholders (the real perimeter/front-door entities
-# are private + wired at test time in Phase 4b); the gate stays dormant until then.
+# are private); the alarm entity drives the full arm/disarm machine, the softer ones
+# fire a one-shot gated case on their active (on/detected) edge.
 # triggers:
 #   - entity: "alarm_control_panel.shq_alarm"
 #     profile: alarm
@@ -77,6 +84,11 @@ alarm_entity: "alarm_control_panel.shq_alarm"
 #     profile: investigate
 #   - entity: "binary_sensor.front_door_approach"  # e.g. porch motion / doorbell approach
 #     profile: general
+#
+# Testing the gated/escalation paths without real softer-trigger entities:
+#   argus --once --profile general      # open a GATED General case, one tick, print it
+#   argus --once --profile investigate  # open a GATED Investigate case
+# (a gated --once case spends no Opus and fires no klaxon/voice/PD).
 
 # Optional: the HA entity whose state is the human location that tripped the alarm
 # (e.g. set by an "Alarm Sensors" automation to area_name(trigger.entity_id)). Read

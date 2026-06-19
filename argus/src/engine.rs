@@ -72,6 +72,18 @@ const AUTO_CLOSE_SECS: i64 = 3600;
 /// disarm paths use it).
 const AUTHORISED_DWELL_SECS: u64 = 15;
 
+/// `General` (benign-doorstep) standdown budget: a gated `General` case that sees
+/// nothing of concern auto-closes quietly after this many ticks. Kept small —
+/// `General` is a fast, shallow glance for OBVIOUS danger, not a deep ID; it must
+/// stay cheap (it fires on every doorstep visitor) and silent.
+const GENERAL_STANDDOWN_TICKS: u64 = 4;
+
+/// `Investigate` (perimeter-security) silent-run budget: a gated `Investigate`
+/// case quietly stands down when this window elapses with no escalation. Used to
+/// seed `ActiveCase.investigate_deadline` at case open (a real perimeter-cooldown
+/// telemetry timer could replace it later; the default holds until then).
+const INVESTIGATE_DEADLINE_SECS: u64 = 120;
+
 /// What the authorised-dwell timer does when it elapses.
 #[derive(Debug, Clone, Copy)]
 enum Revert {
@@ -188,6 +200,15 @@ struct ActiveCase {
     /// otherwise the FIRST zone an intruder is seen in becomes the initial one
     /// (suppressed), and subsequent fresh zones are announced.
     initial_zone_recorded: bool,
+    /// Whether this case has been PROMOTED to `Alarm` (Phase 4b). Guards `promote`
+    /// so it is idempotent — the real-alarm trip + the `Escalated` milestone fire
+    /// at most once. An `Alarm`-profile case opens with this already `true` (it is
+    /// born at full posture, never "promoted").
+    escalated: bool,
+    /// For an `Investigate` case: the instant its silent assessment window closes.
+    /// When it passes with no escalation, the case quietly stands down. `None` for
+    /// the other profiles (which don't use a deadline).
+    investigate_deadline: Option<Instant>,
 }
 
 /// Running daily token usage for the optional cap.
@@ -407,8 +428,14 @@ impl Engine {
 
     /// Run a single assessment cycle without the alarm (`--once`): open an
     /// ephemeral case, run one tick, print the resulting `CaseState`, stand down.
-    pub async fn run_once(&mut self) -> Result<()> {
-        self.open_case("manual").await?;
+    /// An optional `profile` override (the `--profile` flag) opens the manual case
+    /// at a softer (gated) posture so the Phase-4b gating/escalation paths can be
+    /// exercised without real softer-trigger HA entities.
+    pub async fn run_once(&mut self, profile: Option<TriggerProfile>) -> Result<()> {
+        match profile {
+            Some(p) => self.open_case_with_profile("manual", p).await?,
+            None => self.open_case("manual").await?,
+        }
         self.tick().await?;
         if let Some(active) = &self.active {
             println!("{}", serde_json::to_string_pretty(&active.state)?);
@@ -466,6 +493,23 @@ impl Engine {
                         }
                     }
                     AlarmMode::Authorised => {} // engine-internal; never from HA
+                }
+            }
+            // Phase 4b: a softer (non-alarm) trigger fired — open a GATED case with
+            // its profile. If a case is already active (incl. a just-promoted one
+            // that tripped the real alarm), do nothing: that case is the live one,
+            // and a second softer fire mustn't open a competing case or downgrade it.
+            HaEvent::TriggerFired { entity_id, profile } => {
+                if self.active.is_some() {
+                    info!("softer trigger {entity_id} ignored (case already active)");
+                    return;
+                }
+                if let Err(e) = self.open_case_with_profile(&entity_id, profile).await {
+                    error!("failed to open {profile:?} case for {entity_id}: {e:#}");
+                    return;
+                }
+                if let Err(e) = self.tick().await {
+                    error!("first assessment tick failed: {e:#}");
                 }
             }
         }
@@ -528,6 +572,27 @@ impl Engine {
     }
 
     async fn open_case(&mut self, alarm_entity: &str) -> Result<()> {
+        // Resolve the trigger profile for the firing entity (Phase 4a/4b). For the
+        // alarm entity (or the legacy single-source config) this is `Alarm`; a
+        // softer source resolves to its configured `Investigate`/`General`.
+        let profile = self
+            .cfg
+            .trigger_profile_map()
+            .get(alarm_entity)
+            .copied()
+            .unwrap_or(TriggerProfile::Alarm);
+        self.open_case_with_profile(alarm_entity, profile).await
+    }
+
+    /// Open a case for `alarm_entity` with an EXPLICIT trigger `profile` — the
+    /// softer-trigger firing path (Phase 4b) and the `--once --profile` override
+    /// use this; the alarm path goes through [`open_case`] (which resolves the
+    /// profile from config).
+    async fn open_case_with_profile(
+        &mut self,
+        alarm_entity: &str,
+        profile: TriggerProfile,
+    ) -> Result<()> {
         // A new incident cancels any pending authorised-dwell revert.
         self.revert_pending = None;
         let now = Utc::now();
@@ -535,20 +600,20 @@ impl Engine {
         let base = default_case_base()?;
         let dir = CaseDir::create(&base, &case_id, now, alarm_entity)
             .context("creating case dir")?;
-        // Resolve the trigger profile for the firing entity (Phase 4a). Today the
-        // only source is the alarm entity → `Alarm` → `Elevated`, so this is
-        // behaviour-identical; the softer profiles are wired in Phase 4b.
-        let profile = self
-            .cfg
-            .trigger_profile_map()
-            .get(alarm_entity)
-            .copied()
-            .unwrap_or(TriggerProfile::Alarm);
         let mut state = CaseState::new(case_id.clone(), now, profile);
         // Read the human location that tripped the alarm (set by the HA "Alarm
         // Sensors" automation) so the spoken breach line can name it.
         state.trigger_location = self.read_trigger_location().await;
-        state.push_event(now, TimelineKind::CaseOpened, "Alarm triggered; case opened.");
+        // The case-open detail reflects the profile. For a gated profile the
+        // `CaseOpened` event is suppressed by the output gate (no voice/PD), so
+        // this text only surfaces on the journal + HUD — but it must not say "Alarm
+        // triggered" for a silent perimeter/doorstep assessment.
+        let opened_detail = match profile {
+            TriggerProfile::Alarm => "Alarm triggered; case opened.",
+            TriggerProfile::Investigate => "Perimeter activity; silent assessment opened.",
+            TriggerProfile::General => "Doorstep approach; quick assessment opened.",
+        };
+        state.push_event(now, TimelineKind::CaseOpened, opened_detail);
         info!(
             case_id = %case_id,
             dir = %dir.root().display(),
@@ -583,6 +648,16 @@ impl Engine {
             tick_count: 0,
             announced_zones,
             initial_zone_recorded,
+            // An `Alarm` case is born at full posture (never "promoted"); the gated
+            // profiles start un-escalated and may be promoted by `evaluate_promotion`.
+            escalated: profile == TriggerProfile::Alarm,
+            // `Investigate` runs silent for a bounded window then quietly stands down.
+            investigate_deadline: match profile {
+                TriggerProfile::Investigate => {
+                    Some(Instant::now() + Duration::from_secs(INVESTIGATE_DEADLINE_SECS))
+                }
+                _ => None,
+            },
         };
         self.persist_and_broadcast(&mut active)?;
         self.active = Some(active);
@@ -659,8 +734,11 @@ impl Engine {
         // to a fixed period rather than adding the full cadence on top.
         self.last_tick_duration = t0.elapsed();
         match outcome {
+            // `close` = the case should end without a disarm: a 1-hour inactivity
+            // auto-close (Alarm), OR a gated profile's quiet standdown (4b — the
+            // specific reason is logged inside `decide_promotion`/`decay_threat`).
             Ok(true) => {
-                info!("auto-close: 1 hour of inactivity; standing down");
+                info!("case ending (auto-close / quiet standdown); standing down");
                 self.standdown().await;
                 Ok(())
             }
@@ -815,8 +893,13 @@ impl Engine {
             active.state.status = CaseStatus::Assessing;
         }
 
-        // 5. Best stills + Opus forensic for new/improved intruders (async).
-        self.upgrade_intruders(active, &stills, now).await;
+        // 5. Best stills + Opus forensic for new/improved intruders (async). A
+        // non-escalated `General` case is a SHALLOW, Sonnet-only glance — it must
+        // not spend Opus (it fires on every doorstep visitor). Once it escalates
+        // (`effective_profile` flips to `Alarm`), the forensic pass runs as normal.
+        if active.state.effective_profile != TriggerProfile::General || active.escalated {
+            self.upgrade_intruders(active, &stills, now).await;
+        }
 
         // 6. Threat model. Up only via the model/weapon WHILE active; down only via
         // the inactivity decay (below). Never let the model de-escalate.
@@ -826,11 +909,22 @@ impl Engine {
             let candidate = if armed { ThreatLevel::Critical } else { model_threat };
             self.raise_threat(active, candidate, now);
         }
-        let close = self.decay_threat(active, now);
+        let mut close = self.decay_threat(active, now);
+
+        // 7. Escalation policy (Phase 4b). For a GATED (`Investigate`/`General`)
+        // case, decide per-tick whether to PROMOTE it to full `Alarm` posture (which
+        // trips the real alarm + ungates all outputs) or quietly STAND DOWN. A
+        // promotion happens inside `evaluate_promotion`; it returns `true` only for
+        // a quiet auto-standdown (nothing of concern within the profile's budget).
+        // No-op for an already-`Alarm`/escalated case.
+        if self.evaluate_promotion(active, now).await? {
+            close = true;
+        }
 
         active.state.updated_at = now;
         info!(
             case_id = %active.state.case_id,
+            profile = ?active.state.effective_profile,
             threat = ?active.state.threat_level,
             intruders = active.state.intruders.len(),
             in_tok = summed.total_input(),
@@ -893,6 +987,78 @@ impl Engine {
         false
     }
 
+    /// PROMOTE a gated case to full `Alarm` posture (Phase 4b). Idempotent —
+    /// guarded on `active.escalated`, so the real-alarm trip + the `Escalated`
+    /// milestone fire AT MOST once. The locked user decisions: a self-escalated
+    /// case goes to FULL `Alarm` (klaxon included) AND Argus trips the real
+    /// `alarm_control_panel`, cascading the legacy whole-house automations.
+    ///
+    /// Steps: flip `effective_profile` to `Alarm`, push the `Escalated` milestone
+    /// (the gate lets THIS event through → 4b's breach voice/klaxon/PD fire off it),
+    /// broadcast (so the ungated state reaches the consumers), THEN trip the real
+    /// alarm. After this `gated()` is false, so subsequent events route normally.
+    async fn promote(&mut self, active: &mut ActiveCase, reason: &str, now: DateTime<Utc>) {
+        // Idempotent state mutation (flip posture + push the `Escalated` milestone).
+        // Returns false if it was already promoted — then there's nothing to do.
+        if !mark_promoted(active, reason, now) {
+            return;
+        }
+        // Ratchet up so the freshly-promoted case doesn't immediately decay.
+        if active.state.threat_level < ThreatLevel::Elevated {
+            self.set_threat(active, ThreatLevel::Elevated, now, "escalated");
+        }
+        info!(
+            case_id = %active.state.case_id,
+            reason,
+            "ESCALATED — promoting gated case to Alarm + tripping the real alarm panel"
+        );
+        // Broadcast the ungated state FIRST so the outputs consumer sees the
+        // `Escalated` milestone on a case whose `gated()` is now false.
+        if let Err(e) = self.persist_and_broadcast(active) {
+            error!("failed to flush escalation: {e:#}");
+        }
+        // Trip the real house alarm — the locked decision. This produces an
+        // `AlarmModeChanged{Triggered}` which `handle` no-ops (a case is already
+        // active), so it never opens a second case.
+        let entity = self.cfg.primary_alarm_entity();
+        if let Err(e) = self
+            .rest
+            .call_service(
+                "alarm_control_panel",
+                "alarm_trigger",
+                serde_json::json!({ "entity_id": entity }),
+            )
+            .await
+        {
+            error!("failed to trip the real alarm panel {entity}: {e:#}");
+        }
+    }
+
+    /// The Phase-4b escalation decision, run once per tick for an ACTIVE case.
+    /// No-op for an already-`Alarm`/escalated case (returns `false`). For a gated
+    /// (`Investigate`/`General`) case it either promotes (full alarm) or reports a
+    /// quiet auto-standdown (`true`) when the profile's silent budget elapses with
+    /// nothing of concern.
+    ///
+    /// - **Always-escalate (any profile):** an armed intruder, `threat_level ==
+    ///   Critical`, or a resident-in-danger signal (the threat-ratchet condition).
+    /// - **`General`:** also escalate on an OBVIOUS threat indicator (weapon /
+    ///   face-concealment / balaclava); else quiet standdown after
+    ///   `GENERAL_STANDDOWN_TICKS`.
+    /// - **`Investigate`:** escalate on a confirmed non-resident behaving as an
+    ///   intruder / attempted entry; else quiet standdown when
+    ///   `investigate_deadline` passes.
+    async fn evaluate_promotion(&mut self, active: &mut ActiveCase, now: DateTime<Utc>) -> Result<bool> {
+        match decide_promotion(active) {
+            PromotionDecision::Continue => Ok(false),
+            PromotionDecision::Standdown => Ok(true),
+            PromotionDecision::Promote(reason) => {
+                self.promote(active, reason, now).await;
+                Ok(false)
+            }
+        }
+    }
+
     /// Cameras to assess on a non-baseline tick: those with recent motion, any
     /// with no motion sensors configured (can't gate → always watched), and any
     /// camera currently tracking a detected intruder.
@@ -932,6 +1098,11 @@ impl Engine {
     /// while still passing telemetry + the current intruder roster (so it reuses
     /// existing `subject-N` ids). The RESIDENT RECOGNITION and WEAPONS & THREATS
     /// clauses are kept verbatim from the original multi-image instruction.
+    ///
+    /// The OPENING posture is parameterised by `state.effective_profile` (Phase
+    /// 4b): an `Alarm` case is hunting an intruder (today's text); `Investigate`
+    /// vets whether perimeter activity is a prowler vs a resident/known visitor;
+    /// `General` is a quick glance for OBVIOUS danger at a friendly zone.
     fn live_instruction_camera(&self, state: &CaseState, telemetry: &str, label: &str) -> String {
         let mut roster = String::new();
         if state.intruders.is_empty() {
@@ -948,8 +1119,30 @@ impl Engine {
                 ));
             }
         }
+        // Per-profile opening posture (Phase 4b). The structured output + the
+        // RESIDENT RECOGNITION / WEAPONS & THREATS clauses below are identical
+        // across profiles — only the framing of WHY Argus is looking changes.
+        let posture = match state.effective_profile {
+            TriggerProfile::Alarm => {
+                "The intruder alarm is active; assume an intrusion is in progress."
+            }
+            TriggerProfile::Investigate => {
+                "This is a PERIMETER SECURITY assessment while the premises is secured. Activity \
+                 has been detected on an external camera. Your job is to vet whether this is a \
+                 PROWLER (a non-resident loitering, trying doors or windows, attempting entry, \
+                 masked, or otherwise behaving like an intruder) versus a benign presence (a \
+                 resident arriving home, a known visitor, or a delivery). Do not assume an \
+                 intrusion — assess it."
+            }
+            TriggerProfile::General => {
+                "This is a QUICK doorstep check at a FRIENDLY zone (someone approaching). Assume a \
+                 benign visitor. Glance for OBVIOUS danger ONLY — a brandished weapon, a balaclava \
+                 or concealed face, or clear forced-entry behaviour. A delivery, a resident, or an \
+                 ordinary visitor is benign; do not over-read it."
+            }
+        };
         format!(
-            "The intruder alarm is active; assume an intrusion is in progress. You are assessing a \
+            "{posture} You are assessing a \
              SINGLE camera named \"{label}\" — the one still above. Report ONLY what is visible in \
              this one frame: your `locations` should describe just this camera, and your \
              `intruders`/`threats` only the people and threats visible in it. Return an updated \
@@ -1549,6 +1742,181 @@ fn zone_key(zone: &str) -> String {
     zone.trim().to_lowercase()
 }
 
+/// The Phase-4b per-tick escalation verdict for a gated case (pure of IO so it is
+/// unit-testable; [`Engine::evaluate_promotion`] acts on it).
+#[derive(Debug, PartialEq, Eq)]
+enum PromotionDecision {
+    /// Keep assessing (silent), no change this tick.
+    Continue,
+    /// Promote to full `Alarm` posture (trips the real alarm) — carries the reason.
+    Promote(&'static str),
+    /// Quiet auto-standdown (the profile's silent budget elapsed with nothing of
+    /// concern). The caller stands the case down with no outputs (still gated).
+    Standdown,
+}
+
+/// Decide the escalation verdict for an ACTIVE case this tick. No-op
+/// (`Continue`) for an already-`Alarm`/escalated case. For a gated profile:
+/// - **Always-escalate (any profile):** an armed intruder, `threat_level ==
+///   Critical`, or a resident-in-danger signal.
+/// - **`General`:** also escalate on an OBVIOUS threat indicator (weapon /
+///   face-concealment / balaclava); else quiet standdown once `tick_count` reaches
+///   `GENERAL_STANDDOWN_TICKS`.
+/// - **`Investigate`:** escalate on a confirmed intruder behaving as a prowler;
+///   else quiet standdown once `investigate_deadline` passes.
+fn decide_promotion(active: &ActiveCase) -> PromotionDecision {
+    if active.escalated || !active.state.gated() {
+        return PromotionDecision::Continue;
+    }
+    let state = &active.state;
+
+    // Always-escalate set (shared by both gated profiles).
+    if state.intruders.iter().any(|i| i.armed) {
+        return PromotionDecision::Promote("armed intruder");
+    }
+    if state.threat_level >= ThreatLevel::Critical {
+        return PromotionDecision::Promote("critical threat");
+    }
+    if resident_in_danger(state) {
+        return PromotionDecision::Promote("resident in danger");
+    }
+
+    match state.effective_profile {
+        TriggerProfile::Alarm => PromotionDecision::Continue, // unreachable (gated ruled out)
+        TriggerProfile::General => {
+            if obvious_threat(state) {
+                PromotionDecision::Promote("obvious threat at door")
+            } else if active.tick_count + 1 >= GENERAL_STANDDOWN_TICKS {
+                // +1: this is the (tick_count)-th tick about to complete.
+                PromotionDecision::Standdown
+            } else {
+                PromotionDecision::Continue
+            }
+        }
+        TriggerProfile::Investigate => {
+            if intruder_behaviour(state) {
+                PromotionDecision::Promote("prowler behaviour")
+            } else if active
+                .investigate_deadline
+                .is_some_and(|d| Instant::now() >= d)
+            {
+                PromotionDecision::Standdown
+            } else {
+                PromotionDecision::Continue
+            }
+        }
+    }
+}
+
+/// Idempotently mark a case PROMOTED to full `Alarm` posture (Phase 4b): set
+/// `escalated`, flip `effective_profile` to `Alarm`, refresh `last_activity` (the
+/// escalation is fresh justified activity), and push the `Escalated` milestone.
+/// Returns `true` if it actually promoted, `false` if the case was already
+/// promoted (the caller then skips the trip + broadcast). Pure of network/IO so
+/// it's unit-testable; [`Engine::promote`] wraps it with the threat ratchet,
+/// broadcast, and the real-alarm trip.
+fn mark_promoted(active: &mut ActiveCase, reason: &str, now: DateTime<Utc>) -> bool {
+    if active.escalated {
+        return false;
+    }
+    active.escalated = true;
+    active.state.effective_profile = TriggerProfile::Alarm;
+    active.last_activity = now;
+    active.state.push_event(
+        now,
+        TimelineKind::Escalated,
+        format!("Case escalated to full alarm ({reason})."),
+    );
+    true
+}
+
+/// Does any free-text `threats` line (or the summary) contain one of `needles`
+/// (case-insensitive substring)? The live model writes danger signs as free text
+/// (`threats`) plus a one-line `summary`; the escalation policy scans both. Used
+/// to detect resident-in-danger / face-concealment / forced-entry indicators the
+/// structured fields don't capture as a boolean.
+fn threats_mention(state: &CaseState, needles: &[&str]) -> bool {
+    let mut hay = state.summary.to_lowercase();
+    for t in &state.threats {
+        hay.push('\n');
+        hay.push_str(&t.to_lowercase());
+    }
+    needles.iter().any(|n| hay.contains(n))
+}
+
+/// A resident appears to be in apparent danger — the always-escalate signal that
+/// is independent of an intruder being armed (e.g. a person grabbed, threatened,
+/// or a struggle visible). Read from the free-text threat observations.
+fn resident_in_danger(state: &CaseState) -> bool {
+    threats_mention(
+        state,
+        &[
+            "resident in danger",
+            "in danger",
+            "being attacked",
+            "under threat",
+            "struggle",
+            "hostage",
+            "assault",
+        ],
+    )
+}
+
+/// An OBVIOUS threat indicator at a friendly zone (the `General` escalation bar):
+/// a visibly brandished weapon, face concealment (balaclava / mask), or
+/// forced-entry behaviour. `armed`/`Critical` are handled by the always-escalate
+/// set; this catches the obvious-but-not-yet-Critical signals from the free text.
+fn obvious_threat(state: &CaseState) -> bool {
+    threats_mention(
+        state,
+        &[
+            "balaclava",
+            "mask",
+            "masked",
+            "face conceal",
+            "face cover",
+            "covered face",
+            "concealed face",
+            "hood pulled",
+            "weapon",
+            "knife",
+            "firearm",
+            "forced entry",
+            "forcing",
+            "prying",
+            "breaking",
+        ],
+    )
+}
+
+/// A confirmed non-resident behaving as an intruder (the `Investigate` escalation
+/// bar): a detected intruder present AND behaving like a prowler — trying doors /
+/// windows, attempted entry, loitering at an access point, or the obvious-threat
+/// signals. A bare person on a perimeter camera is NOT enough; the model must read
+/// intruder-like behaviour (it excludes near-certain residents from `intruders`).
+fn intruder_behaviour(state: &CaseState) -> bool {
+    if state.intruders.is_empty() {
+        return false;
+    }
+    obvious_threat(state)
+        || threats_mention(
+            state,
+            &[
+                "trying door",
+                "trying the door",
+                "trying window",
+                "attempted entry",
+                "attempting entry",
+                "tampering",
+                "loitering",
+                "prowler",
+                "casing",
+                "climbing",
+                "intruder",
+            ],
+        )
+}
+
 /// Ensure the subject counter is at least `n` (used when the model coins ids).
 fn self_next_subject_at_least(active: &mut ActiveCase, n: u32) {
     if active.next_subject < n {
@@ -1585,4 +1953,194 @@ fn pick_still_label(
         return stills.keys().next().cloned();
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::case::{CaseState, Intruder};
+
+    /// Build a bare `ActiveCase` for the escalation-decision tests. The `CaseDir`
+    /// is rooted in a unique per-test temp dir (the decision/state helpers under
+    /// test don't touch it, but `ActiveCase` requires one).
+    fn active_case(profile: TriggerProfile) -> ActiveCase {
+        let now = Utc::now();
+        let case_id = format!("case-test-{}", uuid_like());
+        let base = std::env::temp_dir().join("argus-test").join(&case_id);
+        let dir = CaseDir::create(&base, &case_id, now, "manual").expect("temp case dir");
+        ActiveCase {
+            state: CaseState::new(case_id, now, profile),
+            dir,
+            next_subject: 1,
+            next_still: 1,
+            still_quality: HashMap::new(),
+            id_spoken: HashSet::new(),
+            identifying: HashSet::new(),
+            weapon_still: HashSet::new(),
+            last_activity: now,
+            tick_count: 0,
+            announced_zones: HashSet::new(),
+            initial_zone_recorded: false,
+            escalated: profile == TriggerProfile::Alarm,
+            investigate_deadline: match profile {
+                TriggerProfile::Investigate => {
+                    Some(Instant::now() + Duration::from_secs(INVESTIGATE_DEADLINE_SECS))
+                }
+                _ => None,
+            },
+        }
+    }
+
+    /// A cheap unique-ish id for temp-dir naming (avoids a `uuid`/`tempfile` dep).
+    fn uuid_like() -> u128 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        t ^ ((n as u128) << 96)
+    }
+
+    fn intruder(id: &str, armed: bool) -> Intruder {
+        Intruder {
+            id: id.to_string(),
+            descriptors: "test".to_string(),
+            confidence: 0.9,
+            id_quality: 0.8,
+            location: None,
+            activity: None,
+            armed,
+            weapon: if armed { Some("knife".to_string()) } else { None },
+            best_stills: Vec::new(),
+            identified: false,
+            dossier: None,
+            spoken_summary: None,
+            best_camera: None,
+        }
+    }
+
+    /// A `General` case with nothing of concern QUIETLY STANDS DOWN once it reaches
+    /// the tick budget — and never promotes (so no outputs ever fired: it stays
+    /// gated, no `Escalated` milestone).
+    #[test]
+    fn general_quietly_stands_down_after_budget() {
+        let mut c = active_case(TriggerProfile::General);
+        // Below the budget → keep assessing.
+        c.tick_count = 0;
+        assert_eq!(decide_promotion(&c), PromotionDecision::Continue);
+        // At the budget edge → quiet standdown.
+        c.tick_count = GENERAL_STANDDOWN_TICKS - 1;
+        assert_eq!(decide_promotion(&c), PromotionDecision::Standdown);
+        // It never escalated, so it stayed gated the whole time (no outputs).
+        assert!(c.state.gated());
+        assert!(!c.escalated);
+        assert!(!c
+            .state
+            .timeline
+            .iter()
+            .any(|e| e.kind == TimelineKind::Escalated));
+    }
+
+    /// An ARMED intruder promotes ANY gated profile (the always-escalate set).
+    #[test]
+    fn armed_intruder_promotes_any_profile() {
+        for profile in [TriggerProfile::General, TriggerProfile::Investigate] {
+            let mut c = active_case(profile);
+            c.state.intruders.push(intruder("subject-1", true));
+            assert_eq!(
+                decide_promotion(&c),
+                PromotionDecision::Promote("armed intruder"),
+                "{profile:?} with an armed intruder must promote",
+            );
+            // Applying the promotion flips the posture to Alarm + pushes Escalated.
+            assert!(mark_promoted(&mut c, "armed intruder", Utc::now()));
+            assert_eq!(c.state.effective_profile, TriggerProfile::Alarm);
+            assert!(c
+                .state
+                .timeline
+                .iter()
+                .any(|e| e.kind == TimelineKind::Escalated));
+        }
+    }
+
+    /// A promoted case is NO LONGER gated — its outputs flow from then on.
+    #[test]
+    fn promoted_case_is_not_gated() {
+        let mut c = active_case(TriggerProfile::Investigate);
+        assert!(c.state.gated(), "an Investigate case opens gated");
+        assert!(mark_promoted(&mut c, "prowler behaviour", Utc::now()));
+        assert!(!c.state.gated(), "a promoted case ungates");
+        // `mark_promoted` is idempotent: a second call does nothing (no double
+        // Escalated milestone, no re-trip).
+        assert!(!mark_promoted(&mut c, "again", Utc::now()));
+        assert_eq!(
+            c.state
+                .timeline
+                .iter()
+                .filter(|e| e.kind == TimelineKind::Escalated)
+                .count(),
+            1,
+            "Escalated fires exactly once (idempotent)"
+        );
+    }
+
+    /// An `Alarm`-profile case is never subject to the escalation policy (it's born
+    /// escalated/ungated) — the reconciliation invariant that a real-alarm case is
+    /// unchanged by Phase 4b.
+    #[test]
+    fn alarm_case_is_never_promoted_or_stood_down() {
+        let mut c = active_case(TriggerProfile::Alarm);
+        assert!(c.escalated);
+        assert!(!c.state.gated());
+        c.state.intruders.push(intruder("subject-1", true));
+        c.tick_count = 100;
+        assert_eq!(decide_promotion(&c), PromotionDecision::Continue);
+    }
+
+    /// `General` escalates on an OBVIOUS threat indicator (e.g. a balaclava) read
+    /// from the free-text threats — before the budget runs out.
+    #[test]
+    fn general_promotes_on_obvious_threat() {
+        let mut c = active_case(TriggerProfile::General);
+        c.state.threats.push("person wearing a balaclava".to_string());
+        assert_eq!(
+            decide_promotion(&c),
+            PromotionDecision::Promote("obvious threat at door")
+        );
+    }
+
+    /// `Investigate` escalates on a detected intruder behaving as a prowler (trying
+    /// a door), NOT on a bare presence.
+    #[test]
+    fn investigate_promotes_on_prowler_behaviour() {
+        // Bare presence with no intruder roster → keep assessing.
+        let mut c = active_case(TriggerProfile::Investigate);
+        c.state.threats.push("someone trying the door handle".to_string());
+        assert_eq!(
+            decide_promotion(&c),
+            PromotionDecision::Continue,
+            "no detected intruder yet → don't escalate on text alone"
+        );
+        // With a detected (non-resident) intruder + prowler behaviour → promote.
+        c.state.intruders.push(intruder("subject-1", false));
+        assert_eq!(
+            decide_promotion(&c),
+            PromotionDecision::Promote("prowler behaviour")
+        );
+    }
+
+    /// The escalation helpers' keyword scans (resident-in-danger / obvious-threat).
+    #[test]
+    fn threat_keyword_helpers() {
+        let mut c = active_case(TriggerProfile::General);
+        assert!(!resident_in_danger(&c.state));
+        c.state.summary = "A resident appears to be in danger".to_string();
+        assert!(resident_in_danger(&c.state));
+
+        let mut c2 = active_case(TriggerProfile::General);
+        c2.state.threats.push("visible KNIFE in hand".to_string());
+        assert!(obvious_threat(&c2.state));
+    }
 }

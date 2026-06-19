@@ -43,12 +43,25 @@ struct Cli {
     #[arg(long)]
     once: bool,
 
+    /// Trigger-profile override for `--once` (and the manual case it opens):
+    /// `alarm` (default), `investigate`, or `general`. Lets the gated/escalation
+    /// paths (Phase 4b) be exercised without wiring real softer-trigger HA
+    /// entities — a `general`/`investigate` override opens a GATED case so you can
+    /// eyeball the gated `CaseState` (no klaxon/voice/PD, no Opus unless escalated).
+    #[arg(long, value_parser = parse_profile)]
+    profile: Option<case::TriggerProfile>,
+
     /// Dry-voice mode: run the full voice gate but LOG every line/klaxon instead
     /// of contacting Overwatch (no real TTS or klaxon). Overrides `overwatch:` and
     /// forces the outputs consumer to run. Use it on a live (scratch-alarm) test to
     /// see exactly what WOULD be verbalised.
     #[arg(long)]
     dry_voice: bool,
+}
+
+/// clap value-parser for `--profile` (delegates to `TriggerProfile`'s `FromStr`).
+fn parse_profile(s: &str) -> std::result::Result<case::TriggerProfile, String> {
+    s.parse()
 }
 
 #[tokio::main]
@@ -113,7 +126,7 @@ async fn main() -> Result<()> {
     let mut eng = Engine::new(cfg.clone(), rest, sonnet, opus, seed, resident_photos, state_tx);
 
     if cli.once {
-        eng.run_once().await?;
+        eng.run_once(cli.profile).await?;
         return Ok(());
     }
     eng.set_mode_tx(mode_tx);
@@ -218,12 +231,18 @@ async fn run_daemon(
 
     let ws_url = ha::websocket_url(&cfg.ha.url);
     let token = cfg.ha.token.clone();
-    // The HA WS still subscribes to the single primary alarm entity in 4a
-    // (multi-source firing is 4b). For the legacy config this is exactly
-    // `cfg.alarm_entity`, so the subscription is unchanged.
+    // The primary `Alarm`-profile panel drives the full arm/disarm state machine.
+    // The softer (non-alarm) trigger sources (Phase 4b) each open a GATED case on
+    // their active edge — typically empty (the live atlas config has only the
+    // alarm entity; the perimeter/front-door entities are user-owned).
     let alarm_entity = cfg.primary_alarm_entity();
+    let softer_triggers: std::collections::HashMap<String, case::TriggerProfile> = cfg
+        .trigger_profile_map()
+        .into_iter()
+        .filter(|(e, _)| *e != alarm_entity)
+        .collect();
     tokio::spawn(async move {
-        ha::ws::run(ws_url, token, alarm_entity, tx).await;
+        ha::ws::run(ws_url, token, alarm_entity, softer_triggers, tx).await;
     });
 
     info!(

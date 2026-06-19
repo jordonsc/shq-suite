@@ -61,6 +61,22 @@ impl TriggerProfile {
     }
 }
 
+impl std::str::FromStr for TriggerProfile {
+    type Err = String;
+
+    /// Parse the snake_case profile name (for the `--profile` CLI override).
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "alarm" => Ok(TriggerProfile::Alarm),
+            "investigate" => Ok(TriggerProfile::Investigate),
+            "general" => Ok(TriggerProfile::General),
+            other => Err(format!(
+                "unknown trigger profile {other:?} (expected alarm|investigate|general)"
+            )),
+        }
+    }
+}
+
 // ───────────────────────────── CaseState (the contract) ─────────────────────
 
 /// The single source of truth for an alarm episode. Serialised to the broadcast

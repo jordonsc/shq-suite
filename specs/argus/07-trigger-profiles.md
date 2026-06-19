@@ -1,11 +1,18 @@
 # Phase 7 — Trigger Profiles (tiered response)
 
-> Sub-spec of the [Argus master plan](./00-master.md). **Status: 🟡 4a LANDED
-> (scaffolding, behaviour-identical), 4b PENDING.** Phase 4a (argus 0.28.0) lays the
-> rails — `TriggerProfile` + per-source config + the dormant output/kiosk gate, all
-> defaulting to `Alarm` so an existing case is byte-for-byte unchanged. The
-> escalation policy, softer-trigger firing, trip-real-alarm, and profile-parameterised
-> prompts are **Phase 4b**. **Promoted into M1** (2026-06-19): the
+> Sub-spec of the [Argus master plan](./00-master.md). **Status: 🟢 4a + 4b LANDED
+> (escalation engine live in code).** Phase 4a (argus 0.28.0) laid the rails —
+> `TriggerProfile` + per-source config + the dormant output/kiosk gate, all
+> defaulting to `Alarm` so an existing case is byte-for-byte unchanged. **Phase 4b
+> (argus 0.29.0)** makes the softer profiles work: the escalation/promotion engine,
+> softer-trigger firing, the real-alarm trip, and profile-parameterised prompts.
+> **Locked user decisions (2026-06-19):** a self-escalated case goes to FULL `Alarm`
+> posture **including the klaxon**, AND Argus **trips the real
+> `alarm_control_panel`** (cascading the legacy whole-house automations). No opt-out
+> flags. **Live-fire of a real escalation (which trips the whole-house alarm) is a
+> MORNING task with the user present** — 4b is unit-tested + `--once`-validated only;
+> the real perimeter/front-door HA entities are user-owned and NOT wired yet.
+> **Promoted into M1** (2026-06-19): the
 > tiered response is no longer a deferred M2 idea but a first-class M1 deliverable.
 > Supersedes the parked "Trigger TYPES `[alert, investigate]`" open finding in
 > [`06-refinements.md`](./06-refinements.md) and the M2 "perimeter-security" note —
@@ -136,14 +143,59 @@ The HA side owns *classifying* the trigger (it already sets
   never sees events for a gated case until promotion. An escalation may speak a
   first line ("Security breach detected…") at promotion rather than at case open.
 
-## Open questions (resolve at build time)
+## Phase 4b — what landed (argus 0.29.0)
 
-- Exact HA trigger wiring for `Investigate` / `General` (which entities/events, and
-  whether Argus trips the real `alarm_control_panel` on an `Investigate` escalation
-  or only runs its own outputs).
-- The escalation criteria thresholds per profile (how "obvious" must a `General`
-  threat be; how long an `Investigate` may run silent before auto-standdown).
-- Whether a promoted case fires the klaxon, or escalates to voice + PD only (the
-  klaxon may be too aggressive for an `Investigate` confirmation vs a real `Alarm`).
-- Cost shape: `General` should be cheap (it will fire often — every doorstep
-  visitor); confirm it stays Sonnet-only + short.
+- **Promotion (`engine.rs`).** `ActiveCase.{escalated, investigate_deadline}`; a
+  per-tick `decide_promotion(active) -> {Continue, Promote(reason), Standdown}`
+  (pure, unit-tested) consumed by `evaluate_promotion` at the end of `run_tick`.
+  `promote()` is idempotent (guards on `escalated`): flips `effective_profile` to
+  `Alarm`, pushes `TimelineKind::Escalated`, broadcasts the now-ungated state, then
+  **trips the real alarm** via `rest.call_service("alarm_control_panel",
+  "alarm_trigger", {entity_id})`. The resulting `Triggered` is no-op'd by `handle`
+  (a case is already active → no double-open; the existing 4a guard).
+- **Escalation rules.** Always-escalate (any profile): armed intruder / `Critical`
+  / resident-in-danger. `General`: also escalate on an OBVIOUS threat
+  (weapon/balaclava/forced-entry, scanned from the free-text `threats`+`summary`),
+  else quiet standdown after `GENERAL_STANDDOWN_TICKS` (4); Opus forensic is
+  **skipped** for a non-escalated `General` (Sonnet-only, cost). `Investigate`:
+  escalate on a detected intruder behaving as a prowler, else quiet standdown when
+  `investigate_deadline` (`INVESTIGATE_DEADLINE_SECS`, 120 s) passes.
+- **Outputs on `Escalated`.** `route_event` treats `Escalated` like a real
+  case-open: the breach voice line (`voice_policy::lines_for` shares the
+  `CaseOpened` arm), klaxon-on (`VoiceMsg::Alarm(true)`), and `pd.trigger()`. After
+  promotion `gated()` is false, so later events route normally and the kiosks
+  consumer takes over on its next tick.
+- **Softer-trigger firing (`ha/ws.rs`).** The WS now subscribes to ALL
+  `triggers[].entity`; a non-alarm source's inactive→active edge emits
+  `HaEvent::TriggerFired{entity_id, profile}` → `handle` opens a gated case (no-op
+  if one is already active). The alarm entity keeps the full `AlarmMode` machine.
+  The live atlas config has no `triggers:` block, so this path is inert there.
+- **Prompts + testing.** `live_instruction_camera` is parameterised by
+  `effective_profile` (hunt / vet-prowler / glance-for-obvious-danger); per-profile
+  seed guidance placeholders added to `seed.example.md`. A `--profile
+  <alarm|investigate|general>` override on `--once` exercises the gated/escalation
+  paths without real softer-trigger HA entities.
+
+## Resolved open questions (Phase 4b)
+
+- **HA trigger wiring + real-alarm trip:** softer sources are per-`triggers[]`
+  config entities; on escalation Argus DOES trip the real `alarm_control_panel`
+  (locked decision).
+- **Thresholds:** `General` budget = 4 ticks; `Investigate` silent window = 120 s
+  (a real perimeter-cooldown timer can replace the default later). Obvious-threat /
+  prowler keyword scans over the model's free-text observations.
+- **Klaxon on promotion:** YES — a promoted case fires the FULL alarm set including
+  the klaxon (locked decision; no voice+PD-only softer escalation).
+- **Cost shape:** `General` stays Sonnet-only + short — no Opus unless escalated.
+
+## Morning live-fire checklist (user present)
+
+- ⚠️ The real perimeter/front-door HA entities are **user-owned** — add them to a
+  `triggers:` block in atlas's `~/.config/argus/config.yaml` before any softer-path
+  live test.
+- A real escalation **trips `alarm_control_panel.shq_alarm`** → cascades the legacy
+  whole-house automations (kiosks 02–10, DOSA) + (when enabled) the klaxon. Do this
+  ONLY with the user present and the test posture understood.
+- Validate `--once --profile investigate` / `--profile general` against atlas
+  (needs `ANTHROPIC_API_KEY`) for a gated `CaseState` first (no Opus, fast close),
+  THEN a controlled softer-trigger fire, THEN a controlled escalation.
