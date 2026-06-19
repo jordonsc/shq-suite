@@ -23,7 +23,7 @@ use crate::case::{
     CaseStatus, Identification, Intruder, IntruderDelta, LiveAssessment, LocationDelta,
     LocationObservation, StillRef, ThreatLevel, TimelineKind,
 };
-use crate::config::Config;
+use crate::config::{Config, ResidentPhoto};
 use crate::ha::{HaEvent, RestClient};
 use crate::llm::{AnthropicClient, AssessRequest, ImageInput, Reasoning, Usage};
 use crate::state::AlarmMode;
@@ -83,16 +83,24 @@ enum Revert {
 
 /// The forensic (Opus) instruction — shared by the inline (`--once`) and the
 /// spawned (daemon) identification paths.
-const IDENTIFY_INSTRUCTION: &str = "This is the clearest still of a detected intruder. \
-    Produce a firm forensic identification: physical descriptors, distinguishing features, \
-    and a short dossier paragraph for the security station. ALSO write `spoken_summary` — a \
-    single short sentence (max ~18 words) suitable to be read aloud over a security speaker \
-    (sex, approx age, build, key clothing, one standout feature; no preamble). Also determine \
-    whether the person is armed — examine the hands and any held object CLOSELY (this is the \
-    clearest frame, your best chance to confirm or rule out a weapon the live pass was unsure \
-    about). Set `armed` true if they hold a weapon or any object plausibly consistent with one \
-    (blade, firearm, bat, stick, tool, or an elongated/pointed/metallic object) and name it in \
-    `weapon`, hedging if unsure. Anchor every claim on the image.";
+const IDENTIFY_INSTRUCTION: &str = "The LAST image is the clearest still of a detected subject \
+    (the camera frame, labelled \"Camera: ...\"). Any images labelled \"Resident reference\" are \
+    photos of KNOWN AUTHORISED RESIDENTS — compare the subject in the camera still against them. \
+    If the subject matches a resident reference photo BEYOND REASONABLE DOUBT, identify the person \
+    as that resident: say so in the descriptors/dossier, set `confidence` to reflect the match, and \
+    do NOT treat them as an intruder. A mere resemblance (similar build, hair, skin tone, or \
+    clothing) is NOT a match — when the match is uncertain, or the subject matches no reference \
+    photo, treat them as an intruder. Fail toward intruder. (If no \"Resident reference\" images are \
+    present, simply identify the subject as an unknown intruder.)\n\n\
+    Produce a firm forensic identification of the subject in the camera still: physical \
+    descriptors, distinguishing features, and a short dossier paragraph for the security station. \
+    ALSO write `spoken_summary` — a single short sentence (max ~18 words) suitable to be read aloud \
+    over a security speaker (sex, approx age, build, key clothing, one standout feature; no \
+    preamble). Also determine whether the person is armed — examine the hands and any held object \
+    CLOSELY (this is the clearest frame, your best chance to confirm or rule out a weapon the live \
+    pass was unsure about). Set `armed` true if they hold a weapon or any object plausibly \
+    consistent with one (blade, firearm, bat, stick, tool, or an elongated/pointed/metallic object) \
+    and name it in `weapon`, hedging if unsure. Anchor every claim on the images.";
 
 /// The result of a forensic (Opus) identification, delivered back to the engine's
 /// event loop over an mpsc so the Opus call runs CONCURRENTLY with the live loop
@@ -107,15 +115,26 @@ struct IdResult {
 
 /// Run one forensic identification call. Free function (no `&self`) so it can run
 /// inline OR inside a spawned task with cloned client + seed.
+///
+/// `residents` are the labelled resident reference photos (Opus-only) — PREPENDED
+/// to the request images (each as `"Resident reference: <name>"`) BEFORE the
+/// suspect still so the model can anchor a confident resident match. An empty
+/// slice leaves the request unchanged (the suspect still is the only image).
 async fn run_identify(
     opus: &AnthropicClient,
     seed: &str,
+    residents: &[ResidentPhoto],
     label: &str,
     jpeg: &[u8],
 ) -> (Result<Identification>, Option<Usage>) {
+    let mut images: Vec<ImageInput> = residents
+        .iter()
+        .map(|r| ImageInput::resident(&r.name, &r.jpeg))
+        .collect();
+    images.push(ImageInput::camera(label, jpeg));
     let req = AssessRequest {
         seed,
-        images: vec![ImageInput { label, jpeg }],
+        images,
         instruction: IDENTIFY_INSTRUCTION.to_string(),
         schema: Some(identification_schema()),
         max_tokens: ID_MAX_TOKENS,
@@ -185,6 +204,11 @@ pub struct Engine {
     sonnet: AnthropicClient,
     opus: AnthropicClient,
     seed: String,
+    /// Labelled resident reference photos, loaded into memory at startup. Attached
+    /// to the **Opus forensic ID** call ONLY (never the Sonnet live loop), prepended
+    /// to the suspect still so the model can anchor a confident resident match.
+    /// Empty (no `resident_photos:`, or none loaded) ⇒ the Opus call is unchanged.
+    resident_photos: Vec<ResidentPhoto>,
     /// Camera label → entity id, for mapping the model's `*_label` fields back.
     label_to_entity: HashMap<String, String>,
     /// Entity id → camera label. The model sometimes returns the entity id (it's
@@ -227,6 +251,7 @@ impl Engine {
         sonnet: AnthropicClient,
         opus: AnthropicClient,
         seed: String,
+        resident_photos: Vec<ResidentPhoto>,
         state_tx: watch::Sender<Option<CaseState>>,
     ) -> Self {
         let label_to_entity: HashMap<String, String> = cfg
@@ -259,6 +284,7 @@ impl Engine {
             sonnet,
             opus,
             seed,
+            resident_photos,
             label_to_entity,
             entity_to_label,
             label_to_zone,
@@ -708,7 +734,7 @@ impl Engine {
             async move {
                 let req = AssessRequest {
                     seed,
-                    images: vec![ImageInput { label, jpeg }],
+                    images: vec![ImageInput::camera(label, jpeg)],
                     instruction,
                     schema: Some(live_assessment_schema()),
                     max_tokens: LIVE_MAX_TOKENS,
@@ -1233,9 +1259,11 @@ impl Engine {
                 Some(tx) => {
                     let opus = self.opus.clone();
                     let seed = self.seed.clone();
+                    let residents = self.resident_photos.clone();
                     let case_id = active.state.case_id.clone();
                     tokio::spawn(async move {
-                        let (ident, usage) = run_identify(&opus, &seed, &label, &jpeg).await;
+                        let (ident, usage) =
+                            run_identify(&opus, &seed, &residents, &label, &jpeg).await;
                         let _ = tx
                             .send(IdResult {
                                 case_id,
@@ -1248,7 +1276,14 @@ impl Engine {
                 }
                 // `--once`: run inline so the printed CaseState is complete.
                 None => {
-                    let (ident, usage) = run_identify(&self.opus, &self.seed, &label, &jpeg).await;
+                    let (ident, usage) = run_identify(
+                        &self.opus,
+                        &self.seed,
+                        &self.resident_photos,
+                        &label,
+                        &jpeg,
+                    )
+                    .await;
                     if let Some(u) = &usage {
                         self.record_usage(u);
                     }

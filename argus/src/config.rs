@@ -53,6 +53,25 @@ pub struct Config {
     /// driven when `web` is also configured (the takeover URL is `web.public_base`).
     #[serde(default)]
     pub kiosks: Vec<KioskConfig>,
+    /// Labelled resident reference photos attached to the **Opus forensic ID**
+    /// call ONLY (never the high-frequency Sonnet live loop — that would break the
+    /// seed prompt-cache and inflate per-tick cost) so the model can anchor a
+    /// confident resident match and NOT flag them as an intruder. The real images
+    /// are private (live on atlas only, not the public repo); a missing/unreadable
+    /// file is logged + skipped at startup, never a hard error — so a fresh
+    /// checkout with no photos behaves exactly as before. Empty = no anchoring.
+    #[serde(default)]
+    pub resident_photos: Vec<ResidentPhotoConfig>,
+}
+
+/// One labelled resident reference photo (Opus forensic ID anchor). The `path`
+/// gets the same `${VAR}`/`~` expansion as the other config paths.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResidentPhotoConfig {
+    /// Resident name, used as the image label ("Resident reference: <name>").
+    pub name: String,
+    /// Path to the JPEG (env/`~` expanded), e.g. `~/.config/argus/residents/<name>.jpg`.
+    pub path: String,
 }
 
 /// The Phase 4 kiosk HUD server: serves the `argus/web/` app, the case stills,
@@ -426,6 +445,47 @@ impl Config {
         std::fs::read_to_string(&path)
             .with_context(|| format!("reading premises seed {}", path.display()))
     }
+
+    /// Load the configured resident reference photos into memory (name + JPEG
+    /// bytes) for the Opus forensic ID anchor. **Graceful absence is a correctness
+    /// property**: a missing/unreadable file is logged + skipped, never fatal — so
+    /// a fresh checkout with no photos behaves exactly as before. Returns only the
+    /// photos that loaded successfully (an empty `resident_photos:` ⇒ empty vec).
+    pub fn load_resident_photos(&self) -> Vec<ResidentPhoto> {
+        let mut out = Vec::with_capacity(self.resident_photos.len());
+        for rp in &self.resident_photos {
+            let path = expand_tilde(&rp.path);
+            match std::fs::read(&path) {
+                Ok(jpeg) => {
+                    tracing::info!(
+                        "loaded resident reference photo for {} ({} bytes) from {}",
+                        rp.name,
+                        jpeg.len(),
+                        path.display()
+                    );
+                    out.push(ResidentPhoto {
+                        name: rp.name.clone(),
+                        jpeg,
+                    });
+                }
+                Err(e) => tracing::warn!(
+                    "skipping resident reference photo for {} ({}): {e}",
+                    rp.name,
+                    path.display()
+                ),
+            }
+        }
+        out
+    }
+}
+
+/// A resident reference photo loaded into memory (the Opus forensic ID anchor).
+#[derive(Debug, Clone)]
+pub struct ResidentPhoto {
+    /// Resident name (used as the image label).
+    pub name: String,
+    /// Raw JPEG bytes.
+    pub jpeg: Vec<u8>,
 }
 
 /// `~/.config/argus/config.yaml` (mirrors nyx's `~/.config/shqd/`).

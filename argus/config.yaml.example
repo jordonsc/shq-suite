@@ -172,3 +172,18 @@ telemetry_entities: []
 # kiosks:
 #   - { ha_target: "kiosk03", dashboard_url: "http://athena/lovelace/kitchen" }
 #   - { ha_target: "kiosk04", dashboard_url: "http://athena/lovelace/bedroom" }
+
+# Resident reference photos (Phase 3 forensic anchoring). Each is attached to the
+# Opus forensic IDENTIFY call ONLY — NOT the high-frequency Sonnet live loop (that
+# would break the seed prompt-cache and inflate per-tick cost). They let Opus
+# anchor a confident resident match (→ NOT flagged as an intruder); the fail-toward-
+# intruder bias is preserved (a mere resemblance / uncertain match stays an
+# intruder). The real images are PRIVATE — they live on atlas only (under
+# ~/.config/argus/residents/), are NEVER committed to the public repo, and are
+# mirrored to shq-suite-config. A missing/unreadable file is logged + SKIPPED at
+# startup, never fatal — so a fresh checkout with no photos behaves exactly as
+# before (no extra images on the Opus call). Empty/absent = no anchoring.
+#
+# resident_photos:
+#   - { name: "Jordon",   path: "~/.config/argus/residents/jordon.jpg" }
+#   - { name: "Resident", path: "~/.config/argus/residents/resident.jpg" }

@@ -67,6 +67,16 @@ async fn main() -> Result<()> {
     let seed = cfg.load_seed().context("failed to load premises seed")?;
     info!("Loaded premises seed ({} bytes) from {}", seed.len(), cfg.seed_path);
 
+    // Resident reference photos for the Opus forensic ID anchor (Opus-only).
+    // Graceful absence: a missing/unreadable file is logged + skipped inside the
+    // loader, never fatal — so a fresh checkout with no photos behaves as before.
+    let resident_photos = cfg.load_resident_photos();
+    info!(
+        "Loaded {} of {} configured resident reference photo(s)",
+        resident_photos.len(),
+        cfg.resident_photos.len()
+    );
+
     let rest = RestClient::new(&cfg.ha.url, &cfg.ha.token)?;
     let sonnet = AnthropicClient::new(
         cfg.anthropic.api_key.clone(),
@@ -100,7 +110,7 @@ async fn main() -> Result<()> {
     let web_mode_rx = mode_tx.subscribe();
     let kiosks_mode_rx = mode_tx.subscribe();
 
-    let mut eng = Engine::new(cfg.clone(), rest, sonnet, opus, seed, state_tx);
+    let mut eng = Engine::new(cfg.clone(), rest, sonnet, opus, seed, resident_photos, state_tx);
 
     if cli.once {
         eng.run_once().await?;
