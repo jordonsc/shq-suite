@@ -61,6 +61,23 @@ cameras:
 
 alarm_entity: "alarm_control_panel.shq_alarm"
 
+# Trigger profiles (Phase 4a — tiered response). Each source maps an HA entity to
+# the posture a case opened by it takes:
+#   alarm       → confirmed intrusion: full immediate outputs (klaxon/voice/PD/kiosk)
+#   investigate → perimeter activity while secured: GATED (silent) until escalated
+#   general     → benign doorstep approach: GATED, fast/shallow triage
+# OMIT `triggers` (or leave it empty) and the `alarm_entity` above is synthesised
+# into a single `alarm`-profile source — i.e. exactly today's behaviour. The softer
+# sources below are USER-OWNED placeholders (the real perimeter/front-door entities
+# are private + wired at test time in Phase 4b); the gate stays dormant until then.
+# triggers:
+#   - entity: "alarm_control_panel.shq_alarm"
+#     profile: alarm
+#   - entity: "binary_sensor.perimeter_activity"   # e.g. a person/vehicle template group
+#     profile: investigate
+#   - entity: "binary_sensor.front_door_approach"  # e.g. porch motion / doorbell approach
+#     profile: general
+
 # Optional: the HA entity whose state is the human location that tripped the alarm
 # (e.g. set by an "Alarm Sensors" automation to area_name(trigger.entity_id)). Read
 # once at case open to name the location in the spoken breach line. Omit = generic.

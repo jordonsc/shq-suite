@@ -21,7 +21,7 @@ use tracing::{error, info, warn};
 use crate::case::{
     default_case_base, identification_schema, live_assessment_schema, CaseDir, CaseState,
     CaseStatus, Identification, Intruder, IntruderDelta, LiveAssessment, LocationDelta,
-    LocationObservation, StillRef, ThreatLevel, TimelineKind,
+    LocationObservation, StillRef, ThreatLevel, TimelineKind, TriggerProfile,
 };
 use crate::config::{Config, ResidentPhoto};
 use crate::ha::{HaEvent, RestClient};
@@ -535,7 +535,16 @@ impl Engine {
         let base = default_case_base()?;
         let dir = CaseDir::create(&base, &case_id, now, alarm_entity)
             .context("creating case dir")?;
-        let mut state = CaseState::new(case_id.clone(), now);
+        // Resolve the trigger profile for the firing entity (Phase 4a). Today the
+        // only source is the alarm entity → `Alarm` → `Elevated`, so this is
+        // behaviour-identical; the softer profiles are wired in Phase 4b.
+        let profile = self
+            .cfg
+            .trigger_profile_map()
+            .get(alarm_entity)
+            .copied()
+            .unwrap_or(TriggerProfile::Alarm);
+        let mut state = CaseState::new(case_id.clone(), now, profile);
         // Read the human location that tripped the alarm (set by the HA "Alarm
         // Sensors" automation) so the spoken breach line can name it.
         state.trigger_location = self.read_trigger_location().await;
@@ -544,6 +553,7 @@ impl Engine {
             case_id = %case_id,
             dir = %dir.root().display(),
             trigger_location = ?state.trigger_location,
+            trigger_profile = ?profile,
             "case opened"
         );
 

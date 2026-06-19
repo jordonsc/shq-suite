@@ -150,6 +150,18 @@ async fn route_event(
     voice_gen: &AtomicU64,
     pd: Option<&PagerDuty>,
 ) {
+    // ── Output gate (Phase 4a, DORMANT) ──────────────────────────────────────
+    // A GATED case (a softer `Investigate`/`General` posture) suppresses ALL
+    // outward channels — voice, klaxon, PagerDuty — until a Phase-4b promotion
+    // raises its `effective_profile` to `Alarm`. The `Escalated` milestone is the
+    // promotion edge itself, so it is always let through (4b speaks the breach
+    // line / fires the first page off it). No gated case opens today (every
+    // trigger is the alarm → `Alarm`), so this is inert in 4a — but it preserves
+    // the invariant the moment the softer triggers are wired.
+    if state.gated() && event.kind != TimelineKind::Escalated {
+        return;
+    }
+
     // ── Voice channel: gate → queued speech (zero or more lines) ─────────────
     if let Some(tx) = speech_tx {
         let generation = voice_gen.load(Ordering::SeqCst);

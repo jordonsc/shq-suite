@@ -26,6 +26,41 @@ use serde_json::{json, Value};
 /// Bumped if the on-disk / broadcast shape changes incompatibly.
 pub const SCHEMA_VERSION: u32 = 1;
 
+// ───────────────────────────── Trigger profiles ─────────────────────────────
+
+/// Why Argus was woken, which selects the case's initial posture and — crucially
+/// — **whether its outputs are gated** until Argus confirms a threat. Designed in
+/// `specs/argus/07-trigger-profiles.md`. **Phase 4a lays the rails only**: every
+/// real trigger today is the house alarm → `Alarm`, so the softer profiles exist
+/// but are not yet exercised, and the gate is dormant.
+///
+/// `#[serde(default)]` to `Alarm` so an old journal (no `trigger_profile` field)
+/// deserialises to today's full-posture behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerProfile {
+    /// Confirmed intrusion (the house alarm) — full immediate outputs. Today's
+    /// behaviour; the others are added beside it.
+    #[default]
+    Alarm,
+    /// Perimeter activity while secured — a gated, silent assessment that only
+    /// escalates to outputs if Argus concludes a real threat (Phase 4b).
+    Investigate,
+    /// A benign doorstep approach — a gated, fast/shallow triage (Phase 4b).
+    General,
+}
+
+impl TriggerProfile {
+    /// The threat level a fresh case of this profile opens at. `Alarm` assumes an
+    /// intrusion in progress (`Elevated`); the gated profiles start at `Info`.
+    pub fn initial_threat(self) -> ThreatLevel {
+        match self {
+            TriggerProfile::Alarm => ThreatLevel::Elevated,
+            TriggerProfile::Investigate | TriggerProfile::General => ThreatLevel::Info,
+        }
+    }
+}
+
 // ───────────────────────────── CaseState (the contract) ─────────────────────
 
 /// The single source of truth for an alarm episode. Serialised to the broadcast
@@ -39,6 +74,16 @@ pub struct CaseState {
     /// One-line human situation summary (latest), from the live model.
     pub summary: String,
     pub threat_level: ThreatLevel,
+    /// How the case opened (which trigger source woke Argus). Drives the initial
+    /// threat + posture. `#[serde(default)]` → `Alarm` for back-compat with
+    /// pre-4a journals.
+    #[serde(default)]
+    pub trigger_profile: TriggerProfile,
+    /// The case's CURRENT posture. Equals `trigger_profile` at open; Phase 4b's
+    /// promotion raises a gated case to `Alarm` (escalation only ever moves up).
+    /// The output gate keys off THIS, not `trigger_profile`.
+    #[serde(default)]
+    pub effective_profile: TriggerProfile,
     /// Human location that tripped the alarm (e.g. "Garage", "Entry"), read once
     /// at case open from the configured trigger-location entity. Drives the spoken
     /// breach line. `None` if no such entity is configured / set.
@@ -182,6 +227,11 @@ pub enum TimelineKind {
     /// A person was seen to be armed / a weapon or threatening object appeared.
     /// Material milestone: re-pages the security station and speaks a firm line.
     WeaponDetected,
+    /// A gated (`Investigate`/`General`) case was **promoted** to `Alarm` — Argus
+    /// concluded a real threat. From this milestone the outputs ungate and flow
+    /// (the gate in `out::route_event` lets `Escalated` itself through). **Phase
+    /// 4a defines the variant only**; the promotion that emits it is Phase 4b.
+    Escalated,
     BestStillUpgraded,
     ThreatLevelChanged,
     SecurityStationNotified,
@@ -194,13 +244,18 @@ pub enum TimelineKind {
 }
 
 impl CaseState {
-    pub fn new(case_id: String, started_at: DateTime<Utc>) -> Self {
+    /// Open a fresh case for the given trigger `profile`. The profile selects the
+    /// initial `threat_level` (`Alarm` → `Elevated`; the gated profiles → `Info`)
+    /// and seeds both `trigger_profile` and `effective_profile`.
+    pub fn new(case_id: String, started_at: DateTime<Utc>, profile: TriggerProfile) -> Self {
         Self {
             case_id,
             started_at,
             status: CaseStatus::Triggered,
             summary: "Alarm triggered; assessment starting.".to_string(),
-            threat_level: ThreatLevel::Elevated,
+            threat_level: profile.initial_threat(),
+            trigger_profile: profile,
+            effective_profile: profile,
             trigger_location: None,
             locations: Vec::new(),
             intruders: Vec::new(),
@@ -224,6 +279,14 @@ impl CaseState {
     /// Find a mutable intruder by stable id.
     pub fn intruder_mut(&mut self, id: &str) -> Option<&mut Intruder> {
         self.intruders.iter_mut().find(|i| i.id == id)
+    }
+
+    /// True while the case's outputs are **gated** — its `effective_profile` is a
+    /// softer (non-`Alarm`) posture, so voice/klaxon/PagerDuty/kiosk-takeover are
+    /// suppressed until a Phase-4b promotion raises it to `Alarm`. An `Alarm` case
+    /// (the only kind that opens today) is never gated.
+    pub fn gated(&self) -> bool {
+        self.effective_profile != TriggerProfile::Alarm
     }
 }
 
@@ -452,4 +515,65 @@ pub fn default_case_base() -> Result<PathBuf> {
     let dirs = directories::ProjectDirs::from("", "", "argus")
         .context("cannot determine data directory")?;
     Ok(dirs.data_dir().to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pre-4a journal has NO `trigger_profile`/`effective_profile` fields. It
+    /// must deserialise with BOTH defaulting to `Alarm` — i.e. an existing case
+    /// behaves exactly as in 0.27.0 (full-posture, never gated).
+    #[test]
+    fn old_journal_without_profile_deserialises_to_alarm() {
+        let now = Utc::now();
+        let json = json!({
+            "case_id": "case-20260101T000000Z",
+            "started_at": now,
+            "status": "triggered",
+            "summary": "Alarm triggered; assessment starting.",
+            "threat_level": "elevated",
+            "locations": [],
+            "intruders": [],
+            "timeline": [],
+            "updated_at": now,
+            "schema_version": SCHEMA_VERSION,
+        });
+        let state: CaseState =
+            serde_json::from_value(json).expect("legacy journal must still deserialise");
+        assert_eq!(state.trigger_profile, TriggerProfile::Alarm);
+        assert_eq!(state.effective_profile, TriggerProfile::Alarm);
+        assert!(!state.gated(), "an Alarm case is never gated");
+    }
+
+    /// A round-trip through serde preserves an explicit non-default profile, and a
+    /// gated case reports `gated() == true`.
+    #[test]
+    fn profile_round_trips_and_drives_gating() {
+        let mut state =
+            CaseState::new("case-test".to_string(), Utc::now(), TriggerProfile::Investigate);
+        assert_eq!(state.threat_level, ThreatLevel::Info);
+        assert!(state.gated());
+
+        let s = serde_json::to_string(&state).unwrap();
+        // The snake_case rename must be on the wire.
+        assert!(s.contains("\"trigger_profile\":\"investigate\""));
+        let back: CaseState = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.trigger_profile, TriggerProfile::Investigate);
+        assert_eq!(back.effective_profile, TriggerProfile::Investigate);
+        assert!(back.gated());
+
+        // Promotion to Alarm (the Phase-4b posture) ungates.
+        state.effective_profile = TriggerProfile::Alarm;
+        assert!(!state.gated());
+    }
+
+    /// `Alarm` opens at `Elevated` (today's behaviour); the gated profiles at `Info`.
+    #[test]
+    fn alarm_profile_opens_elevated() {
+        let s = CaseState::new("c".to_string(), Utc::now(), TriggerProfile::Alarm);
+        assert_eq!(s.threat_level, ThreatLevel::Elevated);
+        assert_eq!(s.trigger_profile, TriggerProfile::Alarm);
+        assert!(!s.gated());
+    }
 }

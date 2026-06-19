@@ -243,11 +243,15 @@ fn custom_details(state: &CaseState, offsite: Option<&OffsiteConfig>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::case::CaseState;
+    use crate::case::{CaseState, TriggerProfile};
     use chrono::Utc;
 
     fn case() -> CaseState {
-        let mut s = CaseState::new("case-20260618T120000Z".to_string(), Utc::now());
+        let mut s = CaseState::new(
+            "case-20260618T120000Z".to_string(),
+            Utc::now(),
+            TriggerProfile::Alarm,
+        );
         s.summary = "Person at the garage side door, forcing entry.".to_string();
         s
     }

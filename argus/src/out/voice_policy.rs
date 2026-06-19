@@ -143,10 +143,15 @@ pub fn lines_for(event: &TimelineEvent, state: &CaseState) -> Vec<SpokenLine> {
         // Threat-level changes (announcing "critical" sounds like panic),
         // best-still upgrades, per-subject detection, security-station marker,
         // operator acknowledgement, and standdown/cleared all stay silent.
+        //
+        // `Escalated` (a Phase-4b gated→Alarm promotion) is SILENT in 4a — 4b can
+        // wire a "Security breach detected…" breach line here at promotion. Kept
+        // silent now so the scaffolding never speaks on its own.
         TimelineKind::ThreatLevelChanged
         | TimelineKind::BestStillUpgraded
         | TimelineKind::SecurityStationNotified
         | TimelineKind::IntruderDetected
+        | TimelineKind::Escalated
         | TimelineKind::Acknowledged
         | TimelineKind::Standdown
         | TimelineKind::Cleared => Vec::new(),
@@ -168,7 +173,7 @@ mod tests {
     }
 
     fn case() -> CaseState {
-        CaseState::new("case-test".to_string(), Utc::now())
+        CaseState::new("case-test".to_string(), Utc::now(), crate::case::TriggerProfile::Alarm)
     }
 
     fn intruder(id: &str, descriptors: &str, armed: bool, weapon: Option<&str>) -> Intruder {

@@ -218,14 +218,17 @@ async fn run_daemon(
 
     let ws_url = ha::websocket_url(&cfg.ha.url);
     let token = cfg.ha.token.clone();
-    let alarm_entity = cfg.alarm_entity.clone();
+    // The HA WS still subscribes to the single primary alarm entity in 4a
+    // (multi-source firing is 4b). For the legacy config this is exactly
+    // `cfg.alarm_entity`, so the subscription is unchanged.
+    let alarm_entity = cfg.primary_alarm_entity();
     tokio::spawn(async move {
         ha::ws::run(ws_url, token, alarm_entity, tx).await;
     });
 
     info!(
         "Watching {} for trigger transitions; press Ctrl-C to stop",
-        cfg.alarm_entity
+        cfg.primary_alarm_entity()
     );
 
     // Run the engine; cancel on Ctrl-C.

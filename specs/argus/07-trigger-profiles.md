@@ -1,7 +1,11 @@
 # Phase 7 — Trigger Profiles (tiered response)
 
-> Sub-spec of the [Argus master plan](./00-master.md). **Status: 📋 DESIGN COMPLETE
-> — M1 SCOPE, pending implementation.** **Promoted into M1** (2026-06-19): the
+> Sub-spec of the [Argus master plan](./00-master.md). **Status: 🟡 4a LANDED
+> (scaffolding, behaviour-identical), 4b PENDING.** Phase 4a (argus 0.28.0) lays the
+> rails — `TriggerProfile` + per-source config + the dormant output/kiosk gate, all
+> defaulting to `Alarm` so an existing case is byte-for-byte unchanged. The
+> escalation policy, softer-trigger firing, trip-real-alarm, and profile-parameterised
+> prompts are **Phase 4b**. **Promoted into M1** (2026-06-19): the
 > tiered response is no longer a deferred M2 idea but a first-class M1 deliverable.
 > Supersedes the parked "Trigger TYPES `[alert, investigate]`" open finding in
 > [`06-refinements.md`](./06-refinements.md) and the M2 "perimeter-security" note —

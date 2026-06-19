@@ -38,10 +38,18 @@ enum Target {
     Dashboard,
 }
 
-/// The HUD is shown whenever there's a case (incl. the cleared/AUTHORISED dwell)
-/// or the alarm is arming/armed; otherwise the dashboard.
+/// The HUD is shown whenever there's a NON-GATED case (incl. the cleared/AUTHORISED
+/// dwell) or the alarm is arming/armed; otherwise the dashboard.
+///
+/// **Gate (Phase 4a, dormant):** a GATED case (a softer `Investigate`/`General`
+/// posture) must NOT take over the kiosk — it is treated as "no case" here, so the
+/// kiosk stays on its dashboard while Argus assesses silently. The mode-driven
+/// standby panes (arming/armed/triggered/authorised) are independent of any case
+/// and are unaffected — a real alarm still flips the kiosk via the mode regardless.
+/// No gated case opens today, so this is inert in 4a.
 fn desired_target(case: &Option<CaseState>, mode: AlarmMode) -> Target {
-    if case.is_some()
+    let active_case = case.as_ref().is_some_and(|c| !c.gated());
+    if active_case
         || matches!(
             mode,
             AlarmMode::Arming | AlarmMode::Armed | AlarmMode::Triggered | AlarmMode::Authorised
@@ -126,5 +134,50 @@ async fn navigate(rest: &RestClient, device_id: &str, url: &str) {
     match rest.call_service("shq_display", "navigate", data).await {
         Ok(()) => info!(device_id, url, "kiosks: navigate ok"),
         Err(e) => warn!(device_id, url, error = %e, "kiosks: navigate failed"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::case::TriggerProfile;
+    use chrono::Utc;
+
+    fn case(profile: TriggerProfile) -> Option<CaseState> {
+        Some(CaseState::new("case-test".to_string(), Utc::now(), profile))
+    }
+
+    #[test]
+    fn alarm_case_takes_over_kiosk() {
+        // Today's behaviour: an Alarm case (disarmed mode in --once, or triggered)
+        // drives the HUD takeover. Unchanged by 4a.
+        assert!(desired_target(&case(TriggerProfile::Alarm), AlarmMode::Disarmed) == Target::Hud);
+        assert!(desired_target(&None, AlarmMode::Triggered) == Target::Hud);
+    }
+
+    #[test]
+    fn gated_case_does_not_take_over() {
+        // A gated (Investigate/General) case must NOT flip the kiosk while it
+        // assesses silently — it is treated as "no case" with no active mode.
+        assert!(
+            desired_target(&case(TriggerProfile::Investigate), AlarmMode::Disarmed)
+                == Target::Dashboard
+        );
+        assert!(
+            desired_target(&case(TriggerProfile::General), AlarmMode::Disarmed)
+                == Target::Dashboard
+        );
+    }
+
+    #[test]
+    fn mode_driven_panes_are_independent_of_a_gated_case() {
+        // The standby/alarm panes ride the alarm MODE, not the case — a gated case
+        // present during a real arm/trigger still shows the HUD via the mode.
+        assert!(
+            desired_target(&case(TriggerProfile::Investigate), AlarmMode::Armed) == Target::Hud
+        );
+        assert!(
+            desired_target(&case(TriggerProfile::General), AlarmMode::Triggered) == Target::Hud
+        );
     }
 }

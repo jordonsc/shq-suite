@@ -6,9 +6,13 @@
 
 use std::path::PathBuf;
 
+use std::collections::HashMap;
+
 use anyhow::{anyhow, Context, Result};
 use directories::{BaseDirs, ProjectDirs};
 use serde::Deserialize;
+
+use crate::case::TriggerProfile;
 
 /// Top-level Argus configuration (`config.yaml`).
 #[derive(Debug, Clone, Deserialize)]
@@ -19,8 +23,19 @@ pub struct Config {
     pub seed_path: String,
     /// Cameras Argus captures each assessment tick.
     pub cameras: Vec<CameraConfig>,
-    /// The HA alarm entity Argus subscribes to.
+    /// The HA alarm entity Argus subscribes to. This is the **legacy single
+    /// trigger** — still the only one the live atlas config sets, and still the
+    /// `Alarm`-profile source. When `triggers` is empty it is synthesised into a
+    /// single `Alarm` trigger (see [`Config::trigger_sources`]).
     pub alarm_entity: String,
+    /// Per-source trigger profiles (Phase 4a). Each entry maps an HA entity to the
+    /// [`TriggerProfile`] a case opened by it should take. EMPTY (the default, and
+    /// the live atlas config today) ⇒ back-compat: a single `{ entity:
+    /// alarm_entity, profile: Alarm }` is synthesised, so behaviour is identical to
+    /// pre-4a. The softer (`investigate`/`general`) sources are wired at test time
+    /// (Phase 4b); 4a only carries the config shape.
+    #[serde(default)]
+    pub triggers: Vec<TriggerSourceConfig>,
     /// Optional HA entity whose state is the human location that tripped the alarm
     /// (e.g. `input_text.alarm_trigger_room`, set by the existing HA "Alarm
     /// Sensors" automation to `area_name(trigger.entity_id)`). Read once at case
@@ -62,6 +77,19 @@ pub struct Config {
     /// checkout with no photos behaves exactly as before. Empty = no anchoring.
     #[serde(default)]
     pub resident_photos: Vec<ResidentPhotoConfig>,
+}
+
+/// One watched trigger source, tagged with the [`TriggerProfile`] a case opened
+/// by it should take (Phase 4a). The house alarm is `Alarm`; a perimeter group is
+/// `Investigate`; a front-door approach is `General`. An omitted `profile`
+/// defaults to `Alarm`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TriggerSourceConfig {
+    /// The HA entity whose transition opens a case.
+    pub entity: String,
+    /// The profile a case from this source takes. Default `Alarm`.
+    #[serde(default)]
+    pub profile: TriggerProfile,
 }
 
 /// One labelled resident reference photo (Opus forensic ID anchor). The `path`
@@ -437,6 +465,45 @@ impl Config {
         let cfg: Config = serde_yaml::from_str(&expanded)
             .with_context(|| format!("parsing config {}", path.display()))?;
         Ok(cfg)
+    }
+
+    /// The effective trigger sources (Phase 4a). If `triggers` is configured it is
+    /// used verbatim; otherwise the legacy single `alarm_entity` is synthesised
+    /// into one `Alarm` source — so the live atlas config (single `alarm_entity`,
+    /// no `triggers`) keeps working byte-for-byte as before.
+    pub fn trigger_sources(&self) -> Vec<TriggerSourceConfig> {
+        if self.triggers.is_empty() {
+            vec![TriggerSourceConfig {
+                entity: self.alarm_entity.clone(),
+                profile: TriggerProfile::Alarm,
+            }]
+        } else {
+            self.triggers.clone()
+        }
+    }
+
+    /// Map of trigger entity → its [`TriggerProfile`] (from [`trigger_sources`]).
+    /// An entity not in the map (e.g. a stray event) defaults to `Alarm` at the
+    /// call site. With the legacy config this is exactly
+    /// `{ alarm_entity: Alarm }`.
+    ///
+    /// [`trigger_sources`]: Config::trigger_sources
+    pub fn trigger_profile_map(&self) -> HashMap<String, TriggerProfile> {
+        self.trigger_sources()
+            .into_iter()
+            .map(|t| (t.entity, t.profile))
+            .collect()
+    }
+
+    /// The primary `Alarm`-profile entity — the single alarm panel the HA WS
+    /// subscription still filters on in 4a (multi-source firing is 4b). Falls back
+    /// to the legacy `alarm_entity` if no source is explicitly tagged `Alarm`.
+    pub fn primary_alarm_entity(&self) -> String {
+        self.trigger_sources()
+            .into_iter()
+            .find(|t| t.profile == TriggerProfile::Alarm)
+            .map(|t| t.entity)
+            .unwrap_or_else(|| self.alarm_entity.clone())
     }
 
     /// Read the premises seed referenced by `seed_path` (env/`~` expanded).
