@@ -45,6 +45,9 @@ for this when reading a still — it is a common source of false positives:
   reflection there is off the **tail-light** optics, and a front/rear mix-up
   derails make/model identification. Where a bay has a habitual parking
   orientation, the seed states it (see the vehicle whitelist).
+- **Most cameras may be PTZ (pan/tilt/zoom) and repositionable**, so the framing
+  is not fixed — rely on named landmarks, not a fixed field of view. Record per
+  camera which are **fixed** vs **PTZ**, and any default/home view a PTZ rests at.
 
 ## Camera → location map
 
@@ -55,6 +58,20 @@ for this when reading a still — it is a common source of false positives:
 |---------------|----------|--------------|----------------|
 | `camera.<example>_high_resolution_channel` | `<room/area>` | `<IR illuminator / colour-night / none>` | `<field of view, typical contents>` |
 | … | … | … | … |
+
+## Intrusion vectors & what's at stake
+
+> For each external entry point / approach, note how an intruder is first caught
+> on camera and **what they can reach or sabotage** there. This drives intent and
+> threat-level judgement — a person at a power/network/utility point or breaching
+> a door is more serious than one merely in view of the perimeter.
+
+- `<entry point — e.g. garage / front door / side gate / rear slider / pet door>` —
+  `<which camera catches it first; any blind spot>` — `<what's at stake: power,
+  network, security kit, vehicles, the route into the house>`.
+- `<known blind spots, and what an intruder could reach unseen>`.
+- `<any automated perimeter detection or pet-access systems, and how they behave
+  when the alarm is armed>`.
 
 ## Known residents (whitelist)
 

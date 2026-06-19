@@ -377,11 +377,28 @@ fn expand_tilde(path: &str) -> PathBuf {
 /// Expand `${VAR}` references from the environment. Errors on an unterminated
 /// `${` or a referenced variable that is not set, so a missing secret fails
 /// loudly at startup rather than sending an empty token.
+///
+/// YAML comments are skipped: a `#` at line start or preceded by whitespace
+/// begins a comment, and `${...}` inside it is left verbatim (so a literal
+/// `${VAR}` in a comment doesn't get treated as a missing env var and abort
+/// startup). A `#` not preceded by whitespace (e.g. a URL fragment) is not a
+/// comment.
 fn expand_env(input: &str) -> Result<String> {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
+    let mut in_comment = false;
+    let mut prev_ws = true; // line start counts as "preceded by whitespace"
     while let Some(c) = chars.next() {
-        if c == '$' && chars.peek() == Some(&'{') {
+        if c == '\n' {
+            out.push(c);
+            in_comment = false;
+            prev_ws = true;
+            continue;
+        }
+        if !in_comment && c == '#' && prev_ws {
+            in_comment = true;
+        }
+        if !in_comment && c == '$' && chars.peek() == Some(&'{') {
             chars.next(); // consume '{'
             let mut name = String::new();
             let mut closed = false;
@@ -398,8 +415,10 @@ fn expand_env(input: &str) -> Result<String> {
             let value = std::env::var(&name)
                 .map_err(|_| anyhow!("environment variable {name} (referenced in config) is not set"))?;
             out.push_str(&value);
+            prev_ws = false;
         } else {
             out.push(c);
+            prev_ws = c.is_whitespace();
         }
     }
     Ok(out)
