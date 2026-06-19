@@ -41,8 +41,16 @@ pub enum ControlCommand {
 
 /// Cap on stored best stills per intruder.
 const MAX_BEST_STILLS: usize = 5;
-/// Confidence improvement required before saving a fresh best still / re-running Opus.
-const CONF_IMPROVE: f32 = 0.1;
+/// Frame-quality (`id_quality`) improvement required before grabbing a fresh best
+/// still + re-running the Opus forensic pass on a clearer shot.
+const QUALITY_IMPROVE: f32 = 0.12;
+/// The forensic identification is SPOKEN (and re-paged) once an intruder's
+/// confidence first reaches this — so the announced profile is a solid one, not a
+/// guess off a first-glimpse frame. Below it, the forensic pass still firms up the
+/// record/dossier silently. Validated against live runs: a real intruder sits
+/// ~0.9+, while a distant passer-by / false figure sits ~0.3, so 0.5 cleanly
+/// separates the two (a lower bar risks announcing a vague profile for the latter).
+const ID_SPEAK_CONF: f32 = 0.5;
 /// Sonnet live-loop output budget (compact JSON).
 const LIVE_MAX_TOKENS: u32 = 1500;
 /// Opus forensic output budget (descriptors + dossier + adaptive thinking).
@@ -115,9 +123,14 @@ struct ActiveCase {
     next_subject: u32,
     /// Next still file index.
     next_still: u64,
-    /// Confidence at which each intruder's newest still was saved (for the
-    /// "only upgrade on a meaningful improvement" heuristic).
-    still_conf: HashMap<String, f32>,
+    /// Best frame-quality (`id_quality`) at which each intruder's forensic still
+    /// was last grabbed — so we only re-profile when a meaningfully CLEARER shot
+    /// appears (not on a generic-confidence wobble).
+    still_quality: HashMap<String, f32>,
+    /// Intruder ids whose identification has already been SPOKEN (+ re-paged) —
+    /// the announced profile fires once, on the first sufficiently-confident
+    /// forensic result, not on every re-run.
+    id_spoken: HashSet<String>,
     /// Intruder ids with an Opus forensic pass currently IN FLIGHT (spawned, not
     /// yet returned) — prevents queueing a second concurrent identify for the same
     /// person while one is running.
@@ -132,6 +145,15 @@ struct ActiveCase {
     /// Ticks attempted so far for this case (drives the full-sweep cadence: tick
     /// 0 is the baseline full sweep, then `full_sweep_every` re-sweeps).
     tick_count: u64,
+    /// Zones (room/area names, lower-cased keys) already announced as "Intruder in
+    /// <zone>." this case — so each zone is announced at most once. Seeded with the
+    /// alarm's trigger zone at case open so the initial location is excluded.
+    announced_zones: HashSet<String>,
+    /// Whether the "initial" zone (the one excluded from movement announcements)
+    /// has been pinned. True from case open when a trigger location was known;
+    /// otherwise the FIRST zone an intruder is seen in becomes the initial one
+    /// (suppressed), and subsequent fresh zones are announced.
+    initial_zone_recorded: bool,
 }
 
 /// Running daily token usage for the optional cap.
@@ -154,6 +176,10 @@ pub struct Engine {
     /// in the seed's camera map) where a label is expected; this normalises it
     /// back to the label so still-lookups (keyed by label) match.
     entity_to_label: HashMap<String, String>,
+    /// Camera label → zone (room/area) name, for intruder-movement announcements.
+    /// Defaults to the label itself when a camera has no explicit `zone`; the two
+    /// outdoor-living cameras (and any other shared view) map to one zone.
+    label_to_zone: HashMap<String, String>,
     state_tx: watch::Sender<Option<CaseState>>,
     active: Option<ActiveCase>,
     daily: DailyUsage,
@@ -187,6 +213,20 @@ impl Engine {
             .iter()
             .map(|c| (c.entity.clone(), c.label.clone()))
             .collect();
+        let label_to_zone: HashMap<String, String> = cfg
+            .cameras
+            .iter()
+            .map(|c| {
+                let zone = c
+                    .zone
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|z| !z.is_empty())
+                    .unwrap_or(&c.label)
+                    .to_string();
+                (c.label.clone(), zone)
+            })
+            .collect();
         Self {
             cfg,
             rest,
@@ -195,6 +235,7 @@ impl Engine {
             seed,
             label_to_entity,
             entity_to_label,
+            label_to_zone,
             state_tx,
             active: None,
             daily: DailyUsage {
@@ -366,16 +407,32 @@ impl Engine {
             "case opened"
         );
 
+        // Seed the movement-announcement state: the trigger zone (where the alarm
+        // tripped) is excluded from "Intruder in <zone>." lines — the breach line
+        // already names it. If the trigger location is unknown, the first zone an
+        // intruder is seen in becomes the (suppressed) initial zone instead.
+        let mut announced_zones = HashSet::new();
+        let initial_zone_recorded = match state.trigger_location.as_deref() {
+            Some(t) if !t.trim().is_empty() => {
+                announced_zones.insert(zone_key(t));
+                true
+            }
+            _ => false,
+        };
+
         let mut active = ActiveCase {
             state,
             dir,
             next_subject: 1,
             next_still: 1,
-            still_conf: HashMap::new(),
+            still_quality: HashMap::new(),
+            id_spoken: HashSet::new(),
             identifying: HashSet::new(),
             weapon_still: HashSet::new(),
             last_activity: now,
             tick_count: 0,
+            announced_zones,
+            initial_zone_recorded,
         };
         self.persist_and_broadcast(&mut active)?;
         self.active = Some(active);
@@ -462,8 +519,17 @@ impl Engine {
         // cameras with recent motion (plus any tracking an intruder), so the
         // live loop stays responsive instead of re-sending every camera.
         let lc = &self.cfg.loop_config;
-        let full = active.tick_count == 0
+        let base_full = active.tick_count == 0
             || (lc.full_sweep_every > 0 && active.tick_count % lc.full_sweep_every as u64 == 0);
+        // While actively tracking an intruder (someone on the roster, seen within
+        // the active window), assess EVERY camera each tick — don't let motion-
+        // gating hold back the room an intruder has just walked into (that gate +
+        // the periodic-sweep interval was the main lag in room-change detection).
+        // Cost is acceptable during a live intrusion; it reverts to motion-gating
+        // once the case goes quiet (decays off Critical).
+        let actively_tracking = !active.state.intruders.is_empty()
+            && (now - active.last_activity).num_seconds() < DECAY_ELEVATED_SECS;
+        let full = base_full || actively_tracking;
         let cameras = if full {
             self.cfg.cameras.clone()
         } else {
@@ -531,14 +597,17 @@ impl Engine {
         });
         let completions = futures_util::future::join_all(calls).await;
 
-        let mut results: Vec<LiveAssessment> = Vec::new();
+        // Keep each assessment tied to the camera it came from — the per-camera
+        // intruder sightings drive the zone-movement announcement (see below)
+        // BEFORE the merge collapses them to a single best-view location.
+        let mut labelled: Vec<(String, LiveAssessment)> = Vec::new();
         let mut summed = Usage::default();
         for (label, res) in completions {
             match res {
                 Ok(completion) => {
                     summed.add(&completion.usage);
                     match completion.parse::<LiveAssessment>() {
-                        Ok(a) => results.push(a),
+                        Ok(a) => labelled.push((label, a)),
                         Err(e) => warn!("parsing live assessment for {label} failed: {e:#}"),
                     }
                 }
@@ -546,7 +615,7 @@ impl Engine {
             }
         }
         self.record_usage(&summed);
-        if results.is_empty() {
+        if labelled.is_empty() {
             warn!("no usable camera assessments this tick; skipping merge");
             let close = self.decay_threat(active, now);
             self.persist_and_broadcast(active)?;
@@ -554,8 +623,23 @@ impl Engine {
             return Ok(close);
         }
 
+        // Zones an intruder was seen in THIS tick, keyed off each camera's own
+        // sighting (first detection, any confidence) rather than the reconciled
+        // best-view location — so a room change is announced the moment a frame
+        // shows the intruder there, not once that camera becomes the dominant view.
+        let mut zones_seen: Vec<String> = Vec::new();
+        for (label, a) in &labelled {
+            if !a.intruders.is_empty() {
+                let zone = self.zone_for_label(label);
+                if !zones_seen.contains(&zone) {
+                    zones_seen.push(zone);
+                }
+            }
+        }
+
         // Merge the per-camera assessments into one delta the existing machinery
         // consumes unchanged.
+        let results: Vec<LiveAssessment> = labelled.into_iter().map(|(_, a)| a).collect();
         let live = merge_camera_assessments(results);
 
         // Was a person seen this tick? Drives activity (threat ratchet + decay).
@@ -566,6 +650,9 @@ impl Engine {
 
         // 4. Merge the delta into CaseState (does NOT touch threat level).
         self.merge_live(active, live, full, now);
+        // Announce intruder movement into a fresh zone (off this tick's per-camera
+        // sightings — earliest reliable signal).
+        self.announce_zone_entries(active, &zones_seen, now);
         if active.state.status == CaseStatus::Triggered {
             active.state.status = CaseStatus::Assessing;
         }
@@ -821,6 +908,7 @@ impl Engine {
         for d in live.intruders {
             if let Some(existing) = active.state.intruder_mut(&d.id) {
                 existing.confidence = d.confidence;
+                existing.id_quality = d.id_quality;
                 existing.location = self.to_label_opt(d.location);
                 existing.activity = d.activity;
                 // Don't let the fast loop clobber the firmer Opus descriptors.
@@ -864,6 +952,7 @@ impl Engine {
                     id: id.clone(),
                     descriptors: d.descriptors,
                     confidence: d.confidence,
+                    id_quality: d.id_quality,
                     location: self.to_label_opt(d.location),
                     activity: d.activity,
                     armed: d.armed,
@@ -880,6 +969,48 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// Announce intruder movement into a fresh zone. `zones_seen` are the zones an
+    /// intruder was sighted in THIS tick (one per camera that saw them, deduped) —
+    /// the earliest signal, taken before the per-camera assessments are merged to a
+    /// single best-view location. The first time a zone appears that hasn't been
+    /// announced (and isn't the excluded initial/trigger zone) push an
+    /// `IntruderEnteredZone` milestone — the voice gate renders it "Intruder in
+    /// <zone>.". Zone-level dedup, so several intruders entering one zone speak once.
+    fn announce_zone_entries(
+        &self,
+        active: &mut ActiveCase,
+        zones_seen: &[String],
+        now: chrono::DateTime<Utc>,
+    ) {
+        for display in zones_seen {
+            let key = zone_key(display);
+            if key.is_empty() || active.announced_zones.contains(&key) {
+                continue;
+            }
+            active.announced_zones.insert(key);
+            // With no known trigger location, the first observed zone IS the
+            // initial location → record + suppress it; announce the rest.
+            if !active.initial_zone_recorded {
+                active.initial_zone_recorded = true;
+                continue;
+            }
+            active.state.push_event(
+                now,
+                TimelineKind::IntruderEnteredZone,
+                format!("Intruder entered {display}."),
+            );
+        }
+    }
+
+    /// The zone (room/area) a camera `label` watches — its configured `zone`, or
+    /// the label itself when unset.
+    fn zone_for_label(&self, label: &str) -> String {
+        self.label_to_zone
+            .get(label)
+            .cloned()
+            .unwrap_or_else(|| label.to_string())
     }
 
     /// Push a `WeaponDetected` milestone for `id`, naming the weapon if known.
@@ -914,25 +1045,29 @@ impl Engine {
             if active.identifying.contains(&intruder.id) {
                 continue;
             }
-            // Pick a frame for the forensic pass. The live model often leaves
-            // best_camera null on early ticks, which used to stall identification;
-            // fall back to the intruder's current location, then any person-present
-            // camera we captured, so Opus starts on the FIRST detection.
+            // Pick the CLEAREST frame for the forensic pass: `best_camera` now
+            // tracks the highest-`id_quality` view (set in the merge). The live
+            // model often leaves it null on early ticks, so fall back to the
+            // intruder's current location, then any person-present camera, so Opus
+            // still starts on the FIRST detection.
             let Some(label) = pick_still_label(intruder, stills, &active.state.locations) else {
                 continue;
             };
             let Some(jpeg) = stills.get(&label) else {
                 continue;
             };
-            let last = active.still_conf.get(&intruder.id).copied();
-            let improved = match last {
+            // (Re)profile when the FRAME got meaningfully clearer than the one we
+            // last profiled — chase a better picture rather than a confidence
+            // wobble. First sighting always profiles (so the record fills fast).
+            let last = active.still_quality.get(&intruder.id).copied();
+            let clearer = match last {
                 None => true,
-                Some(prev) => intruder.confidence >= prev + CONF_IMPROVE,
+                Some(prev) => intruder.id_quality >= prev + QUALITY_IMPROVE,
             };
             // Always capture a still the first time someone is seen armed, so the
-            // weapon frame reaches the kiosk + Opus even if confidence was flat.
+            // weapon frame reaches the kiosk + Opus even if the frame was no clearer.
             let weapon_capture = intruder.armed && !active.weapon_still.contains(&intruder.id);
-            if improved || weapon_capture {
+            if clearer || weapon_capture {
                 if weapon_capture {
                     active.weapon_still.insert(intruder.id.clone());
                 }
@@ -961,7 +1096,7 @@ impl Engine {
             if let Some(intruder) = active.state.intruder_mut(&id) {
                 intruder.best_stills.insert(0, still_ref);
                 intruder.best_stills.truncate(MAX_BEST_STILLS);
-                active.still_conf.insert(id.clone(), intruder.confidence);
+                active.still_quality.insert(id.clone(), intruder.id_quality);
             }
             active.state.push_event(
                 now,
@@ -1036,8 +1171,8 @@ impl Engine {
 
     /// Merge an `Identification` into intruder `id`: firm descriptors/dossier,
     /// latch armed/weapon (emitting `WeaponDetected` on the OFF→ON edge), push the
-    /// `IntruderIdentified` milestone, and ratchet the threat to Critical on a
-    /// fresh weapon confirmation.
+    /// `IntruderIdentified` milestone ONCE (on the first identification), and
+    /// ratchet the threat to Critical on a fresh weapon confirmation.
     fn apply_identification(
         &self,
         active: &mut ActiveCase,
@@ -1047,6 +1182,13 @@ impl Engine {
     ) {
         let mut newly_armed = false;
         let mut weapon_for_event: Option<String> = None;
+        // The forensic pass re-runs as clearer stills arrive (firming up
+        // descriptors). The `IntruderIdentified` milestone — which drives the
+        // spoken profile + the PagerDuty page — fires ONCE per intruder, and only
+        // once the identification is solid (`confidence >= ID_SPEAK_CONF`), so the
+        // announced profile isn't a guess off a first-glimpse frame. Every pass
+        // still updates the record (descriptors/dossier/best-still) silently.
+        let confidence;
         if let Some(intruder) = active.state.intruder_mut(id) {
             intruder.descriptors = ident.descriptors;
             intruder.dossier = Some(ident.dossier);
@@ -1056,6 +1198,7 @@ impl Engine {
             }
             intruder.confidence = intruder.confidence.max(ident.confidence);
             intruder.identified = true;
+            confidence = intruder.confidence;
             // The forensic pass can be what first confirms a weapon a grainy live
             // frame missed. Latch armed ON; never clear it.
             if ident.armed {
@@ -1069,11 +1212,14 @@ impl Engine {
         } else {
             return; // intruder gone (shouldn't happen mid-case)
         }
-        active.state.push_event(
-            now,
-            TimelineKind::IntruderIdentified,
-            format!("{id} identified: {}", ident.distinguishing_features),
-        );
+        // Announce (+ page) the first time we have a confident-enough profile.
+        if confidence >= ID_SPEAK_CONF && active.id_spoken.insert(id.to_string()) {
+            active.state.push_event(
+                now,
+                TimelineKind::IntruderIdentified,
+                format!("{id} identified: {}", ident.distinguishing_features),
+            );
+        }
         if newly_armed {
             Self::push_weapon_event(active, id, weapon_for_event.as_deref(), now);
             // A forensic weapon confirmation is fresh activity → ratchet to Critical.
@@ -1158,10 +1304,11 @@ fn merge_camera_assessments(results: Vec<LiveAssessment>) -> LiveAssessment {
 /// preserving order of first appearance. Within an id group:
 /// - `armed` = OR (any camera that saw them armed wins);
 /// - `weapon` = first non-empty weapon, preferring one from an armed sighting;
-/// - `confidence` = MAX;
+/// - `confidence` = MAX; `id_quality` = MAX (best frame for ID anywhere this tick);
 /// - `descriptors` = from the highest-confidence sighting;
-/// - `location`/`best_camera_label`/`activity` = from the highest-confidence
-///   sighting (`best_camera_label` preferring a non-null one in the group).
+/// - `location`/`activity` = from the highest-confidence sighting;
+/// - `best_camera_label` = the camera of the highest-`id_quality` sighting (so the
+///   forensic pass profiles on the CLEAREST view), falling back to any non-null one.
 fn merge_intruders(results: &[LiveAssessment]) -> Vec<IntruderDelta> {
     let mut order: Vec<String> = Vec::new();
     let mut groups: HashMap<String, Vec<IntruderDelta>> = HashMap::new();
@@ -1185,23 +1332,31 @@ fn merge_intruders(results: &[LiveAssessment]) -> Vec<IntruderDelta> {
             .expect("group is non-empty");
         let armed = group.iter().any(|d| d.armed);
         let confidence = group.iter().map(|d| d.confidence).fold(f32::MIN, f32::max);
+        let id_quality = group.iter().map(|d| d.id_quality).fold(f32::MIN, f32::max);
         // Prefer a weapon from an armed sighting; else any non-empty weapon.
         let weapon = group
             .iter()
             .filter(|d| d.armed)
             .find_map(|d| non_empty(&d.weapon))
             .or_else(|| group.iter().find_map(|d| non_empty(&d.weapon)));
-        // best_camera_label: prefer a non-null one anywhere in the group, else the
-        // best sighting's (which may be null).
-        let best_camera_label = group
+        // best_camera_label: the camera with the CLEAREST view of this person (max
+        // id_quality) so the forensic pass profiles on the best shot; fall back to
+        // its reported location, then any non-null best_camera in the group.
+        let clearest = group
             .iter()
-            .find_map(|d| d.best_camera_label.clone())
-            .or_else(|| best.best_camera_label.clone());
+            .max_by(|a, b| a.id_quality.total_cmp(&b.id_quality))
+            .expect("group is non-empty");
+        let best_camera_label = clearest
+            .best_camera_label
+            .clone()
+            .or_else(|| clearest.location.clone())
+            .or_else(|| group.iter().find_map(|d| d.best_camera_label.clone()));
 
         out.push(IntruderDelta {
             id,
             descriptors: best.descriptors.clone(),
             confidence,
+            id_quality,
             location: best.location.clone(),
             activity: best.activity.clone(),
             best_camera_label,
@@ -1218,6 +1373,13 @@ fn non_empty(s: &Option<String>) -> Option<String> {
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .map(str::to_string)
+}
+
+/// Normalise a zone name to a comparison key (trimmed, lower-cased) so the
+/// trigger zone seeded from HA's area name and a camera's configured zone match
+/// despite case/whitespace differences.
+fn zone_key(zone: &str) -> String {
+    zone.trim().to_lowercase()
 }
 
 /// Ensure the subject counter is at least `n` (used when the model coins ids).

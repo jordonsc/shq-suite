@@ -114,6 +114,12 @@ pub struct Intruder {
     pub descriptors: String,
     /// 0.0–1.0 identification confidence (latest).
     pub confidence: f32,
+    /// 0.0–1.0 frame-quality-for-identification of this intruder's latest view
+    /// (face/build clear, in focus, close, well-lit). Drives which still feeds the
+    /// forensic pass and when to re-profile on a clearer shot. Distinct from
+    /// `confidence`.
+    #[serde(default)]
+    pub id_quality: f32,
     /// Current camera label.
     pub location: Option<String>,
     /// Current activity.
@@ -166,6 +172,12 @@ pub struct TimelineEvent {
 pub enum TimelineKind {
     CaseOpened,
     IntruderDetected,
+    /// An intruder was seen in a ZONE (room/area) not yet announced this case —
+    /// the intruder has moved into fresh territory. Drives a terse spoken
+    /// "Intruder in <area>." line. The alarm's initial trigger location is
+    /// excluded (it is seeded as already-announced at case open). Zone-level
+    /// dedup: announced once per zone regardless of how many intruders enter it.
+    IntruderEnteredZone,
     IntruderIdentified,
     /// A person was seen to be armed / a weapon or threatening object appeared.
     /// Material milestone: re-pages the security station and speaks a firm line.
@@ -247,6 +259,10 @@ pub struct IntruderDelta {
     pub id: String,
     pub descriptors: String,
     pub confidence: f32,
+    /// 0.0–1.0 suitability of THIS frame for identification (face/build visible,
+    /// in focus, close, well-lit) — distinct from `confidence`. Drives best-still
+    /// selection + when to (re)run the forensic pass.
+    pub id_quality: f32,
     pub location: Option<String>,
     pub activity: Option<String>,
     /// Which camera label currently has the clearest view of this person.
@@ -311,13 +327,14 @@ pub fn live_assessment_schema() -> Value {
                         "id": { "type": "string", "description": "Reuse an id from the supplied roster for the same person; coin subject-N for a new one." },
                         "descriptors": { "type": "string", "description": "Build/clothing/hair/markings — only what the image supports." },
                         "confidence": { "type": "number", "description": "0.0-1.0 confidence this is a real, identifiable person." },
+                        "id_quality": { "type": "number", "description": "0.0-1.0: how good THIS frame is for IDENTIFYING the person — 1.0 = face and build clearly visible, in focus, close, well-lit; low = far away, blurred, back turned, heavily occluded, or dark. Judge the FRAME's usefulness for an ID, separately from `confidence`." },
                         "location": { "type": ["string", "null"], "description": "Current camera label, or null." },
                         "activity": { "type": ["string", "null"], "description": "What they are doing, or null." },
                         "best_camera_label": { "type": ["string", "null"], "description": "Camera label with the clearest current view of this person, or null." },
                         "armed": { "type": "boolean", "description": "True if holding/carrying a weapon OR an object plausibly consistent with one (blade, firearm, bat, stick, tool, or an elongated/pointed/metallic object). Lean toward flagging during an active intrusion; only a clearly-recognised benign object (phone, remote, cup) is not a weapon." },
                         "weapon": { "type": ["string", "null"], "description": "Name of the weapon if armed (e.g. \"kitchen knife\"); hedge if unsure (e.g. \"possible knife\", \"elongated object, possibly a blade\"); else null." }
                     },
-                    "required": ["id", "descriptors", "confidence", "location", "activity", "best_camera_label", "armed", "weapon"]
+                    "required": ["id", "descriptors", "confidence", "id_quality", "location", "activity", "best_camera_label", "armed", "weapon"]
                 }
             },
             "threats": {

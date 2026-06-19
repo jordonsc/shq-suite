@@ -377,6 +377,14 @@ pub struct CameraConfig {
     pub entity: String,
     /// Human label included in the prompt, e.g. `Garage`.
     pub label: String,
+    /// The room/area this camera watches, for intruder-movement announcements
+    /// ("Intruder in <zone>."). Multiple cameras can share a zone — e.g. the two
+    /// `Outdoor Living` cameras both map to `Backyard` — so a person crossing
+    /// between them is announced once. ABSENT = the zone defaults to the camera
+    /// `label` (the 1:1 common case). Align zone names with the HA area names the
+    /// trigger-location entity reports, so the initial trigger zone is excluded.
+    #[serde(default)]
+    pub zone: Option<String>,
     /// The camera's activity `binary_sensor`s (its `_motion` + `_person_detected`).
     /// On a motion-gated tick the camera is included iff any of these is active
     /// (per [`crate::ha::RestClient::sensor_active`]). EMPTY = the camera can't be

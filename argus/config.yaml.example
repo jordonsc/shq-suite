@@ -23,6 +23,13 @@ seed_path: "~/.config/argus/seed.md"
 cameras:
   - entity: "camera.garage_camera_high_resolution_channel"
     label: "Garage"                     # human label included in the prompt
+    # zone: "Garage"                    # room/area for "Intruder in <zone>." movement
+                                        # announcements; omit = defaults to `label`.
+                                        # Cameras sharing a zone (e.g. the Outdoor
+                                        # Living pair → "Backyard", below) announce
+                                        # once. Match zone names to the HA area names
+                                        # the trigger-location entity reports, so the
+                                        # initial trigger zone is excluded.
     # Binary sensors that gate whether this camera is re-assessed on a
     # non-baseline tick (OR'd). Empty/absent = the camera can't be gated and is
     # assessed every tick.
@@ -43,6 +50,14 @@ cameras:
   #     - "binary_sensor.front_yard_camera_person_detected"
   #     - "binary_sensor.front_yard_camera_vehicle_detected"
   #     - "binary_sensor.front_yard_camera_animal_detected"
+  # The two outdoor-living cameras overlap on one area: give them a SHARED `zone`
+  # so a person crossing between them is announced once ("Intruder in Backyard.").
+  # - entity: "camera.outdoor_living_left_high_resolution_channel"
+  #   label: "Outdoor Living Left"
+  #   zone: "Backyard"
+  # - entity: "camera.outdoor_living_right_high_resolution_channel"
+  #   label: "Outdoor Living Right"
+  #   zone: "Backyard"
 
 alarm_entity: "alarm_control_panel.shq_alarm"
 

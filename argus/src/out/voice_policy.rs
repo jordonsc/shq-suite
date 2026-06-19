@@ -95,6 +95,23 @@ pub fn lines_for(event: &TimelineEvent, state: &CaseState) -> Vec<SpokenLine> {
             ));
             out
         }
+        // ── Intruder movement: terse room-to-room tracking ─────────────────
+        TimelineKind::IntruderEnteredZone => {
+            // Detail is "Intruder entered <zone>." — recover the zone and speak the
+            // tracking line. Falls back to the whole detail if the prefix is absent.
+            let zone = event
+                .detail
+                .trim()
+                .strip_prefix("Intruder entered ")
+                .unwrap_or(event.detail.trim())
+                .trim_end_matches('.')
+                .trim();
+            if zone.is_empty() {
+                Vec::new()
+            } else {
+                vec![SpokenLine::new(format!("Intruder in {zone}."))]
+            }
+        }
         TimelineKind::WeaponDetected => {
             // The event detail is "<id> is armed[: <weapon>]" — pull the subject id,
             // render it as "Intruder N", and name the weapon from current state.
@@ -159,6 +176,7 @@ mod tests {
             id: id.to_string(),
             descriptors: descriptors.to_string(),
             confidence: 0.9,
+            id_quality: 0.8,
             location: None,
             activity: None,
             armed,
@@ -232,6 +250,24 @@ mod tests {
         s2.trigger_location = Some("Garage".to_string());
         let located = lines_for(&ev(TimelineKind::CaseOpened, "opened"), &s2);
         assert_eq!(located[0].text, "Security breach detected in Garage.");
+    }
+
+    #[test]
+    fn intruder_entered_zone_speaks_terse_tracking_line() {
+        let s = case();
+        let lines = lines_for(&ev(TimelineKind::IntruderEnteredZone, "Intruder entered Backyard."), &s);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, "Intruder in Backyard.");
+    }
+
+    #[test]
+    fn intruder_entered_zone_tolerates_bare_detail() {
+        // If the detail isn't the expected sentence, fall back to its content.
+        let s = case();
+        let lines = lines_for(&ev(TimelineKind::IntruderEnteredZone, "Kitchen"), &s);
+        assert_eq!(lines[0].text, "Intruder in Kitchen.");
+        // Empty detail stays silent rather than speaking "Intruder in .".
+        assert!(lines_for(&ev(TimelineKind::IntruderEnteredZone, ""), &s).is_empty());
     }
 
     #[test]

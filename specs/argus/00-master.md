@@ -24,7 +24,7 @@ layer on top.
 | 1 | **Kiosk HUD rendering** | **Vector chrome** (SVG/CSS/Canvas) themed by a CSS custom property. `alarm.png` (red) and `authorised.png` (green) are **the same parametric frame** in two hues — built as one component, `--hud: crimson \| emerald`. The `docs/concept/*.png` are **spec only**, never baked backgrounds. Camera stills/mugshots are the only raster content, dropped into the drawn frame. Ships as a web app the kiosks display. |
 | 2 | **Model strategy** | **Tiered, both Anthropic.** `claude-sonnet-4-6` ($3/$15) for the high-frequency live *what/where* loop; `claude-opus-4-8` ($5/$25) for forensic *who* identification on best stills (high-res 2576px vision + strongest reasoning) and the security-station dossier. Premises **seed** prompt is `cache_control`-cached per model (caches are model-scoped, 5-min TTL kept warm by the running loop → ~90%-off reads). **Fable 5 rejected** (2× Opus price + safety classifiers risk false-positive refusals on security-adjacent prompts). Rust has no official Anthropic SDK → **raw HTTP** (`reqwest`) against `/v1/messages`. |
 | 3 | **Controller host** | **`atlas`** (`192.168.1.5`, the HA + RAG server, UniFi Buffer-1 power). **Implication: `atlas` is x86_64 Ubuntu, NOT RPi ARM64** — Argus is a **native `cargo build --release` + systemd service**, *not* a `cross`/Podman RPi cross-compile like nyx/overwatch/dosa. HA API calls are localhost (low-latency stills). Tradeoff: adds load to the SPOF. |
-| 4 | **M1 scope** | **All four capabilities**: (a) kiosk takeover + HUD, (b) LLM assessment loop, (c) Overwatch positive-only intimidation voice, (d) PagerDuty security station. |
+| 4 | **M1 scope** | **All four capabilities**: (a) kiosk takeover + HUD, (b) LLM assessment loop, (c) Overwatch positive-only intimidation voice, (d) PagerDuty security station. **+ Trigger profiles** (promoted into M1 2026-06-19): a tiered response keyed on *why* Argus was woken — `Alarm` / `Investigate` / `General` (Phase 7). |
 
 ## Architecture
 
@@ -119,9 +119,13 @@ alarm_control_panel.shq_alarm ──triggered──► Home Assistant (atlas)
 | 3 | [`03-outputs.md`](./03-outputs.md) | Overwatch **positive-only** voice + PagerDuty trigger/resolve with the dossier | ✅ Implemented & shape-verified (2026-06-18), build warning-free, 9 unit tests pass — tonic 0.11 voice client (proto symlinked), pure positive-only gate, PagerDuty Events v2 (`build_event`/`send` split), `out::run` timeline-diff wiring (independent voice + PD channels). **Live-fire deferred** (no real klaxon/page — residence asleep); owed: Overwatch reachable + real `PAGERDUTY_ROUTING_KEY` |
 | 4 | [`04-kiosk-hud.md`](./04-kiosk-hud.md) | Vector HUD web app + kiosk takeover via nyx + live `CaseState`/stills push | ✅ Implemented & shape-verified (2026-06-18), build warning-free — axum `/alarm`+`/stills/:id`+`/kiosk` WS server + the vector crimson/emerald HUD (`argus/web/`, `?demo=1` harness) + `shq_display.navigate` takeover. **Live takeover deferred** (asleep) + blocked on a nyx wake/kill-Chronos change; visual sign-off deferred to a human |
 | 5 | [`05-ha-component-docs.md`](./05-ha-component-docs.md) | `argus` HA component (status + arm/ack), deploy tool, docs, private seed | ✅ Implemented (2026-06-18), Rust build warning-free + Python compiles — HA `argus` component (status sensors + ack/standdown buttons over a `/control` WS on the web port), control→engine channel (`ControlCommand`, `TimelineKind::Acknowledged`), native `deploy` `argus` target, cross-project docs. **Real premises seed still OWED** (private, needs the user) |
+| 6 | [`06-refinements.md`](./06-refinements.md) | Post-M1 live-hardening + deployment log (NOT a feature phase — the running record of fixes since M1, plus the **containerisation** of Argus on atlas) | 🔧 Active log — argus **0.22.2**, containerised on atlas (ledger `shq-suite-0004`). Read first for current state + the TEST posture |
+| 7 | [`07-trigger-profiles.md`](./07-trigger-profiles.md) | **Trigger profiles** — tiered response (`Alarm` / `Investigate` / `General`) keyed on the trigger; output-gating + escalation for the softer signals | 📋 Design complete, **M1 scope** (promoted 2026-06-19) — NOT yet implemented |
 
-Phases are **strictly ordered** — each consumes the prior phase's output. The **`CaseState` schema
-defined in Phase 2 is the central contract** that Phases 3 and 4 render.
+Phases 1–5 are **strictly ordered** — each consumes the prior phase's output. The
+**`CaseState` schema defined in Phase 2 is the central contract** that Phases 3 and 4
+render; Phase 7 extends it (a `trigger_profile` field + output gating). Phase 6 is a
+log, not a feature phase.
 
 ## Reading guide for a fresh agent picking up Phase N
 
@@ -134,6 +138,17 @@ defined in Phase 2 is the central contract** that Phases 3 and 4 render.
 5. The relevant existing component's `CLAUDE.md` (`nyx/`, `overwatch/`, `home-assistant/`).
 
 ## Project status
+
+**2026-06-19 — UPDATE.** M1 phases 1–5 are live-validated end-to-end against the
+**real** alarm + Overwatch; argus is now **0.22.2**, **containerised on atlas**
+(rootless Podman + systemd Quadlet, ledger `shq-suite-0004`). A large post-M1
+hardening pass (per-camera fan-out, threat ratchet, blocking voice, intruder-movement
+zone announcements, quality-aware forensic ID) is logged in
+[`06-refinements.md`](./06-refinements.md) — **read it first** for current state + the
+deliberate TEST posture the house is in. **M1 scope was extended** with the **trigger
+profiles** ([`07-trigger-profiles.md`](./07-trigger-profiles.md), design complete,
+pending build). Remaining M1 to-do: live kiosk-display test, PagerDuty integration,
+trigger-profile build. Branch `argus-design-specs`, committed — not yet pushed.
 
 **2026-06-18 — ALL PHASES (1, 2, 2a, 3, 4, 5) IMPLEMENTED & COMMITTED** on branch
 **`argus-design-specs`** (not yet pushed). `cargo build --release` warning-free

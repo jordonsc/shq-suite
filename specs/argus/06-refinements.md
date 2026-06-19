@@ -6,7 +6,8 @@
 > The whole pipeline (real alarm → location-aware voice breach → per-camera
 > assessment → weapon detection → forensic ID → sequential speech → standdown) has
 > been validated live against the **real** Overwatch + alarm. See ledger
-> `shq-suite-0002`.
+> `shq-suite-0002`. Argus is now at **0.22.0**, **containerised on atlas** (rootless
+> Podman + systemd Quadlet, ledger `shq-suite-0004`) — see the version history below.
 
 ## ⚠️ CURRENT HOUSE POSTURE — TEST MODE (left deliberately, must restore later)
 
@@ -115,17 +116,66 @@ clean standdown on disarm. Threat **held Critical** the whole time (ratchet).
 - **0.19.0 — activity-adaptive cadence.** Once the case is quiet ≥180s (decayed off
   Critical), the loop eases to `slow_cadence_secs` (30s); fresh activity snaps it
   back to 6s.
+- **0.20.0 — intruder-movement zone announcements.** A terse "Intruder in
+  `<zone>`." is spoken the first time an intruder is seen in a fresh room/area. A
+  *zone* is a new optional `CameraConfig.zone` (defaults to the camera `label`), so
+  cameras can share one — the two `Outdoor Living` cameras both map to `Backyard`
+  (the only real overlap; everything else is 1:1). `merge_live →
+  announce_zone_entries` derives the milestone (`TimelineKind::IntruderEnteredZone`)
+  from each intruder's location; dedup is **zone-level**
+  (`ActiveCase.announced_zones`). The **initial trigger zone is excluded** — seeded
+  as already-announced at case open from `trigger_location` (compared
+  case-insensitively, so zone names must match the HA area names
+  `input_text.alarm_trigger_room` reports); if no trigger location is known the
+  first observed zone is suppressed as the de-facto initial. Voice-only (no extra
+  PagerDuty page). The live config on atlas needs the `Backyard` zone added to the
+  two outdoor-living cameras for the overlap-collapse to take effect.
+- **CONTAINERISED + systemd on atlas (ledger `shq-suite-0004`).** Argus now runs ON
+  atlas as a rootless Podman container via a systemd `--user` Quadlet unit
+  (`argus.container`), mirroring atlas's qdrant/rag-serve. Multi-stage `Containerfile`
+  (~109 MB), `Network=host`, config/seed/secrets + case journal bind-mounted
+  (`HOME=/root` ⇒ byte-identical to native), `argus.env` EnvironmentFile, boot-
+  persistent via linger. Deploy/redeploy: `argus/deploy-container.sh`. The old
+  Valerie shell daemon was stopped (cutover). Test posture on atlas: `klaxon_enabled:
+  false`, `voice_volume: 0.4` (voice level 4).
+- **0.21.0 — live-test refinements (movement latency + identify-once).** First live
+  test of the containerised stack succeeded; two quirks fixed: (1) **room-change
+  announcements lagged ~20 s** because they keyed off the intruder's reconciled
+  best-view location — now they fire off the **per-camera sighting** for the tick
+  (`zones_seen`, before the merge), and while `actively_tracking` (intruder on roster
+  + recent activity) the loop forces a **full sweep every tick** so a newly-entered
+  room isn't motion-gated out. Floor is now ~one cadence + LLM (~6–11 s); sensor
+  propagation is the irreducible part. (2) **Identification was verbalised twice** —
+  the Opus pass re-runs as stills improve and each completion re-emitted
+  `IntruderIdentified`. Now edge-triggered: spoken profile + PD page fire ONCE per
+  intruder; later passes firm up descriptors silently.
+- **0.22.0 — quality-aware forensic frame selection (snappier + better ID).** The
+  live Sonnet output now scores each frame's fitness for identification
+  (`id_quality`, 0–1, distinct from `confidence`). `merge_intruders` points
+  `best_camera` at the highest-`id_quality` view so the Opus pass profiles on the
+  CLEAREST frame (a clearer frame is also faster + more confident for Opus); the
+  re-profile trigger switched from "+0.1 confidence" to "id_quality beats the last
+  profiled frame by `QUALITY_IMPROVE` (0.12)" — chasing a better picture. The spoken
+  identification is additionally gated on `confidence >= ID_SPEAK_CONF` (0.5) so the
+  announced profile is solid, not a first-glimpse guess (sub-threshold passes still
+  fill the record/dossier silently). Opus always profiles at least once on first
+  detection — quality steers WHICH frame + WHEN to re-run, it never withholds the
+  pass.
 
 ## Open findings / next steps (for the fresh-context continuation)
 
 - **Resident reference photos** (was refinement #2) — attach resident photos to the
   Opus identify (and maybe the live) call to anchor recognition. Store privately
   (shq-suite-config / not the public repo). Design + build pending.
-- **Trigger TYPES `[alert, investigate]`** (was refinement #3, pulls parked M2
-  perimeter-security forward): `alert` = current path; `investigate` = analyse then
-  optionally self-escalate (person on external cams while the house is inactive,
-  `timer.perimeter_security_cooldown`). A trigger-type carried into the case; in
-  `investigate`, outputs are gated until Argus concludes a real threat.
+- **Trigger PROFILES `[Alarm, Investigate, General]`** — **PROMOTED TO M1**
+  (2026-06-19) and expanded from two types to three; full design in
+  [`07-trigger-profiles.md`](./07-trigger-profiles.md). `Alarm` = current path
+  (intrusion assumed, outputs immediate); `Investigate` = perimeter security smart
+  pre-alarm (are residents in danger / only non-residents? outputs GATED until Argus
+  self-escalates); `General` = benign trigger e.g. front-door approach (fast, shallow
+  check for obvious threats — balaclava/weapon — then escalate or stand down quickly).
+  The profile is carried into the case (`CaseState.trigger_profile`) and gates the
+  outputs for the two softer profiles until promotion. Pending build.
 - **Out-of-band klaxon-stop** — with blocking verbalise, a standdown's klaxon-off
   can wait behind a playing line (≤ its length). For real-klaxon use, route the
   klaxon-stop off the serial speech worker so disarm silences it immediately.

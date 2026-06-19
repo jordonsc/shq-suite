@@ -1,0 +1,39 @@
+# Argus — multi-stage container build (native x86_64, runs rootless on atlas).
+#
+# BUILD CONTEXT = the repo root (shq-suite/), NOT argus/. The proto used by the
+# Overwatch gRPC client is a relative symlink:
+#   argus/proto/voice.proto -> ../../overwatch/proto/voice.proto
+# so both trees must be in the context for it to resolve. Build with:
+#   podman build -f argus/Containerfile -t localhost/argus:latest <context>
+# where <context> contains argus/ and overwatch/proto/ (deploy-container.sh
+# rsyncs exactly that minimal tree to atlas and builds there).
+#
+# Runtime config/seed/data are NOT baked in — they are bind-mounted by the
+# Quadlet unit (argus.container) to mirror the native ~/.config + ~/.local/share
+# layout, so the same binary behaves identically containerised or native.
+
+# ── build stage ──────────────────────────────────────────────────────────────
+FROM docker.io/library/rust:1-slim-bookworm AS build
+# protoc is required at build time by build.rs (tonic-build compiles voice.proto).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+# Copy both trees preserving the layout the proto symlink depends on.
+COPY argus/ argus/
+COPY overwatch/proto/ overwatch/proto/
+WORKDIR /build/argus
+RUN cargo build --release
+
+# ── runtime stage ────────────────────────────────────────────────────────────
+FROM docker.io/library/debian:bookworm-slim AS runtime
+# ca-certificates for outbound HTTPS (Anthropic API; S3 when offsite is enabled).
+# reqwest is rustls-with-webpki-roots, but ship the system roots too for aws-sdk.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /build/argus/target/release/argus /usr/local/bin/argus
+# The HUD web/ assets sit next to the binary so web.dir's default ("web", resolved
+# relative to the binary) just works if the `web:` block is enabled in config.
+COPY --from=build /build/argus/web/ /usr/local/bin/web/
+ENTRYPOINT ["/usr/local/bin/argus"]

@@ -1,0 +1,41 @@
+# Quadlet unit for Argus — the AI alarm assessment daemon. Rootless Podman, run
+# as a systemd --user service (the shq/atlas convention, same as qdrant/rag-serve).
+#
+# Deploy to:  ~/.config/containers/systemd/argus.container   on `atlas`
+# then:       systemctl --user daemon-reload && systemctl --user start argus.service
+# (deploy-container.sh does this end to end.)
+#
+# Auto-starts on boot via lingering (sudo loginctl enable-linger <user> — already
+# enabled on atlas for qdrant/rag-serve).
+#
+# Network=host: Argus reaches HA on the host (localhost:8123), the Overwatch voice
+# RPi over the LAN (gRPC), and binds the HUD/control server (:8770) directly —
+# rootless containers can't otherwise reach the host LAN. Secrets come from the
+# env file; config.yaml + seed.md + the case journal are bind-mounted so the
+# containerised run is byte-identical to the native one (HOME=/root makes the
+# config's `~/.config/argus/...` paths resolve onto the mounts).
+
+[Unit]
+Description=Argus AI alarm assessment daemon
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=localhost/argus:latest
+ContainerName=argus
+Network=host
+Environment=HOME=/root
+Environment=RUST_LOG=argus=info
+# HA_TOKEN / ANTHROPIC_API_KEY / HA_URL (+ optional PAGERDUTY_ROUTING_KEY, AWS keys).
+EnvironmentFile=%h/.config/argus/argus.env
+# Config + private seed (read-only) at the path the config's `~` expands to.
+Volume=%h/.config/argus:/root/.config/argus:ro
+# Case journal (events, stills, dossiers) — the durable record + S3 upload queue.
+Volume=%h/.local/share/argus:/root/.local/share/argus:rw
+
+[Service]
+Restart=always
+TimeoutStartSec=120
+
+[Install]
+WantedBy=default.target
