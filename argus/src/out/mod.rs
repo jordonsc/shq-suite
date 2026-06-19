@@ -171,7 +171,10 @@ async fn route_event(
         }
     }
 
-    // ── PagerDuty channel: trigger on material change, resolve on standdown ──
+    // ── PagerDuty channel — the full incident lifecycle (stable dedup_key=case_id):
+    //   trigger (CaseOpened) → update (re-trigger on a material change, same
+    //   dedup_key, so the open incident reflects the latest dossier) → acknowledge
+    //   (operator ack via the Phase-5 control WS) → resolve (standdown / cleared).
     if let Some(pd) = pd {
         match event.kind {
             // Material changes → (re)send a trigger with the latest dossier.
@@ -181,6 +184,10 @@ async fn route_event(
             | TimelineKind::WeaponDetected
             | TimelineKind::ThreatLevelChanged => {
                 pd.trigger(state, Some(offsite)).await;
+            }
+            // Operator acknowledged → move the open incident to ACKNOWLEDGED.
+            TimelineKind::Acknowledged => {
+                pd.acknowledge(state).await;
             }
             TimelineKind::Standdown | TimelineKind::Cleared => {
                 pd.resolve(state).await;

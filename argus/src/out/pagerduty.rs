@@ -5,6 +5,8 @@
 //! - **`trigger`** on case open, and re-sent (same dedup_key) on a *material
 //!   change* (new intruder, `intruder_identified`, threat escalation) so the
 //!   open incident always reflects the latest dossier.
+//! - **`acknowledge`** (same dedup_key) when an operator acknowledges via the
+//!   Phase-5 control WS — moves the open incident to ACKNOWLEDGED without closing it.
 //! - **`resolve`** (same dedup_key) on standdown / cleared.
 //!
 //! `payload.severity` derives from [`ThreatLevel::pagerduty_severity`];
@@ -34,6 +36,7 @@ const ENQUEUE_URL: &str = "https://events.pagerduty.com/v2/enqueue";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Trigger,
+    Acknowledge,
     Resolve,
 }
 
@@ -41,6 +44,7 @@ impl Action {
     fn as_str(self) -> &'static str {
         match self {
             Action::Trigger => "trigger",
+            Action::Acknowledge => "acknowledge",
             Action::Resolve => "resolve",
         }
     }
@@ -54,8 +58,8 @@ pub struct EventBody {
     pub routing_key: String,
     pub event_action: &'static str,
     pub dedup_key: String,
-    /// Only present on `trigger` (PagerDuty ignores `payload` on `resolve`, but
-    /// omitting it keeps the resolve body minimal and unambiguous).
+    /// Only present on `trigger` (PagerDuty ignores `payload` on `acknowledge`/
+    /// `resolve`, but omitting it keeps those bodies minimal and unambiguous).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload: Option<Payload>,
 }
@@ -104,8 +108,9 @@ impl PagerDuty {
                 severity: state.threat_level.pagerduty_severity(),
                 custom_details: custom_details(state, offsite),
             }),
-            // resolve: dedup_key alone closes the incident.
-            Action::Resolve => None,
+            // acknowledge/resolve: dedup_key alone moves the incident (ack) or
+            // closes it (resolve). PagerDuty ignores `payload` on both.
+            Action::Acknowledge | Action::Resolve => None,
         };
         EventBody {
             routing_key: self.routing_key.clone(),
@@ -157,6 +162,14 @@ impl PagerDuty {
     /// Convenience: build + send a `trigger` for the current state.
     pub async fn trigger(&self, state: &CaseState, offsite: Option<&OffsiteConfig>) {
         let body = self.build_event(state, Action::Trigger, offsite);
+        self.send(&body).await;
+    }
+
+    /// Convenience: build + send an `acknowledge` for the case (operator ack via
+    /// the control WS). Same minimal shape as `resolve` — routing_key + dedup_key,
+    /// no payload — it just moves the open incident to ACKNOWLEDGED.
+    pub async fn acknowledge(&self, state: &CaseState) {
+        let body = self.build_event(state, Action::Acknowledge, None);
         self.send(&body).await;
     }
 
@@ -269,6 +282,19 @@ mod tests {
             v["payload"]["custom_details"]["evidence_s3_prefix"],
             "s3://shq-argus-cases/cases/case-20260618T120000Z/"
         );
+    }
+
+    #[test]
+    fn acknowledge_body_has_no_payload() {
+        let pd = PagerDuty::new("ROUTING_KEY_PLACEHOLDER".to_string(), "argus@atlas".to_string());
+        let body = pd.build_event(&case(), Action::Acknowledge, None);
+        assert_eq!(body.event_action, "acknowledge");
+        // Same stable dedup_key as trigger/resolve → moves the SAME incident.
+        assert_eq!(body.dedup_key, "case-20260618T120000Z");
+        assert!(body.payload.is_none());
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["event_action"], "acknowledge");
+        assert!(v.get("payload").is_none(), "acknowledge omits payload");
     }
 
     #[test]
