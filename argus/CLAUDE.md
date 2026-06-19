@@ -28,8 +28,9 @@ build --release` + systemd, **not** a `cross`/Podman RPi build like nyx/overwatc
 > atlas) is captured in
 > [`specs/argus/06-refinements.md`](../specs/argus/06-refinements.md) — read it
 > first for the current state + the TEST-POSTURE (incl. Overwatch voice MUTED for the
-> session).** **Next M1
-> build: trigger profiles** (`Alarm`/`Investigate`/`General` tiered response) —
+> session).** **The remaining roadmap (M1/M2/M3) is the structured task list in
+> [`specs/argus/00-master.md` § Milestone task lists](../specs/argus/00-master.md#milestone-task-lists).**
+> **Next M1 build: trigger profiles** (`Alarm`/`Investigate`/`General` tiered response) —
 > design complete in
 > [`specs/argus/07-trigger-profiles.md`](../specs/argus/07-trigger-profiles.md),
 > not yet implemented.

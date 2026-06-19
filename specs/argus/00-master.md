@@ -150,9 +150,10 @@ logic moved off HA into Argus**, HUD redesign) is logged in
 deliberate TEST posture the house is in (incl. Overwatch voice MUTED for the session).
 **M1 scope was extended** with the **trigger profiles**
 ([`07-trigger-profiles.md`](./07-trigger-profiles.md), design complete, pending build).
-Remaining M1 to-do: PagerDuty integration, trigger-profile build, migrate kiosks 02–10
-off the HA alarm automations onto Argus (only kiosk11 is on Argus today). Branch
-`argus-design-specs`, committed — not yet pushed.
+Remaining M1 / M2 / M3 work is the structured roadmap in
+[§ Milestone task lists](#milestone-task-lists) below (M1: PagerDuty live-fire, trigger-profile
+build, kiosk 02–10 migration, klaxon-volume ducking, resident photos, the Argus–Nyx link).
+Branch `argus-design-specs`, committed — not yet pushed.
 
 **2026-06-18 — ALL PHASES (1, 2, 2a, 3, 4, 5) IMPLEMENTED & COMMITTED** on branch
 **`argus-design-specs`** (not yet pushed). `cargo build --release` warning-free
@@ -182,5 +183,64 @@ authoring pass (floor plan, camera→room map, camera imaging/IR night-vision
 metadata, resident/vehicle whitelist + reference images, escalation policy) into
 `shq-suite-config`/wiki — the quality ceiling for every assessment. The public
 repo ships only `argus/seed.example.md`. **nyx prerequisite:** `shq_display.navigate`
-must wake + kill-Chronos for the kiosk takeover to show on sleeping/clock kiosks.
-**M2:** LTE out-of-band egress so a WAN cut can't defeat offsite replication.
+must wake + kill-Chronos for the kiosk takeover to show on sleeping/clock kiosks (the
+technical dependency behind the M1 **Argus–Nyx link** task).
+
+## Milestone task lists
+
+The canonical Argus roadmap. Phases 1–6 delivered the M1 **core loop** (live-validated,
+containerised on atlas); the lists below are the **remaining** work, grouped by milestone.
+Status: ✅ done · 🔧 partial / in-progress · 📋 designed, not built · 🆕 new, not started.
+
+### M1 — functioning prototype
+The full working flow for a functioning prototype. The four core capabilities are already
+live; these complete it.
+
+* 🆕 **Reduce klaxon volume when verbalising** — duck the klaxon while a line plays, built
+  into Overwatch. (Today the klaxon only *stops* out-of-band on disarm, 0.24.0; it does not
+  duck during speech.)
+* 🔧 **PagerDuty flow: create, update and close alerts** — Phase 3 ([`03-outputs.md`](./03-outputs.md))
+  implements Events v2 trigger/resolve + re-page on `WeaponDetected`; owed: a real
+  `PAGERDUTY_ROUTING_KEY` + live-fire, plus the explicit acknowledge/update path.
+* 📋 **Trigger profiles** (`Alarm` / `Investigate` / `General`) — design complete in
+  [`07-trigger-profiles.md`](./07-trigger-profiles.md), not yet built.
+* 📋 **Resident reference photos** — attach resident photos to the Opus identify (and maybe
+  the live) call to anchor recognition; store privately (shq-suite-config, not the public
+  repo). Also the main lever left on the weapon/identity ceiling; the richer
+  `authorised: bool`-per-person model is the related `CaseState` schema option. Design + build pending.
+* 🔧 **Kiosk monopolisation via Argus (remove the current approach)** — Argus drives the
+  takeover on kiosk11 today; migrate kiosks 02–10 off the HA alarm automations onto Argus,
+  then retire the HA-driven path.
+* 🆕 **Argus–Nyx link** — depends on the nyx `shq_display.navigate` wake + kill-Chronos
+  prerequisite:
+  - wake the screen when switching alarm mode
+  - allow normal Nyx screen blank (clock / off) while armed
+  - force the screen on while in alarm mode
+
+**M1 open question:** Argus **replacing vs augmenting** the legacy
+`script.alarm_trigger_actions` (the production-model decision — see
+[`06-refinements.md`](./06-refinements.md) TEST POSTURE).
+
+### M2 — productisation
+Productisation toward an enterprise-level solution. Argus becomes its own product, out of
+the shq-suite.
+
+* **S3 live push** — the Phase 2a local journal / upload queue already exists
+  ([`02a-case-resilience.md`](./02a-case-resilience.md)); the actual offsite replication
+  (bucket + write-only IAM) is **deferred from M1 to here**.
+* **Event database** — durable store of incidents / cases.
+* **User accounts & a web interface** for browsing incidents (consider a `js_web` tenant for this).
+* **Update the "SHQ Display" HA integration:**
+  - gets bundled into Argus
+  - displays become device-orientated
+  - device auto-discovery
+* **LTE out-of-band egress** so a WAN cut can't defeat offsite replication.
+
+### M3 — commercial product
+Commercial product offering.
+
+* Argus product website (`js_web`).
+* Commercial rollout strategy.
+* Legal.
+* DR (disaster recovery).
+* Security review (preferably Fable).

@@ -224,10 +224,17 @@ clean standdown on disarm. Threat **held Critical** the whole time (ratchet).
 
 ## Open findings / next steps (for the fresh-context continuation)
 
-- **Resident reference photos** (was refinement #2) — attach resident photos to the
+> The **canonical milestone roadmap** is
+> [`00-master.md` § Milestone task lists](./00-master.md#milestone-task-lists). The notes
+> below are the design rationale behind those tasks (milestone tags in brackets), plus the
+> findings already resolved by the live-hardening pass.
+
+- **Resident reference photos** [M1] (was refinement #2) — attach resident photos to the
   Opus identify (and maybe the live) call to anchor recognition. Store privately
-  (shq-suite-config / not the public repo). Design + build pending.
-- **Trigger PROFILES `[Alarm, Investigate, General]`** — **PROMOTED TO M1**
+  (shq-suite-config / not the public repo). The richer `authorised: bool`-per-person model
+  (vs the current exclude-from-intruders approach) is the related `CaseState` schema
+  option. Design + build pending.
+- **Trigger PROFILES `[Alarm, Investigate, General]`** [M1] — **PROMOTED TO M1**
   (2026-06-19) and expanded from two types to three; full design in
   [`07-trigger-profiles.md`](./07-trigger-profiles.md). `Alarm` = current path
   (intrusion assumed, outputs immediate); `Investigate` = perimeter security smart
@@ -236,17 +243,16 @@ clean standdown on disarm. Threat **held Critical** the whole time (ratchet).
   check for obvious threats — balaclava/weapon — then escalate or stand down quickly).
   The profile is carried into the case (`CaseState.trigger_profile`) and gates the
   outputs for the two softer profiles until promotion. Pending build.
-- **Out-of-band klaxon-stop** — with blocking verbalise, a standdown's klaxon-off
-  can wait behind a playing line (≤ its length). For real-klaxon use, route the
-  klaxon-stop off the serial speech worker so disarm silences it immediately.
+- **Klaxon volume during speech** [M1, Overwatch] — the klaxon-**stop** is now ✅ resolved
+  (0.24.0 stops it out-of-band, off the serial speech worker, so disarm silences it
+  immediately). The remaining task is **ducking the klaxon volume while a line plays** so
+  the verbalised lines are intelligible over it.
 - **Weapon perception is still the ceiling** — per-camera fan-out + hard prompts got
   it firing reliably (e.g. "possible knife"), but a small blade at camera distance
-  can still read as a phone/LEGO. Resident photos + a possible weapon-focused crop
-  pass are future levers.
-- **Production model decision** (see TEST POSTURE above): Argus replacing vs
-  augmenting the legacy `script.alarm_trigger_actions`.
-- `authorised: bool`-per-person richer model (vs the current exclude-from-intruders
-  approach) remains a noted `CaseState` schema option.
+  can still read as a phone/LEGO. Resident photos [M1] + a possible weapon-focused crop
+  pass (future lever) are the levers.
+- **Production model decision** [M1 open question] (see TEST POSTURE above): Argus replacing
+  vs augmenting the legacy `script.alarm_trigger_actions`.
 
 ## Housekeeping
 
