@@ -32,6 +32,11 @@ EnvironmentFile=%h/.config/argus/argus.env
 Volume=%h/.config/argus:/root/.config/argus:ro
 # Case journal (events, stills, dossiers) — the durable record + S3 upload queue.
 Volume=%h/.local/share/argus:/root/.local/share/argus:rw
+# HUD web assets, served from web.dir (default "web", resolved next to the binary).
+# Mounted from the host so the frontend can be updated (rsync + reload) WITHOUT
+# rebuilding the image. The image also COPYs web/ as a self-contained fallback if
+# this mount is absent.
+Volume=%h/.config/argus/web:/usr/local/bin/web:ro
 
 [Service]
 Restart=always

@@ -6,8 +6,11 @@
 > The whole pipeline (real alarm → location-aware voice breach → per-camera
 > assessment → weapon detection → forensic ID → sequential speech → standdown) has
 > been validated live against the **real** Overwatch + alarm. See ledger
-> `shq-suite-0002`. Argus is now at **0.22.0**, **containerised on atlas** (rootless
-> Podman + systemd Quadlet, ledger `shq-suite-0004`) — see the version history below.
+> `shq-suite-0002`. Argus is now at **0.24.0**, **containerised on atlas** (rootless
+> Podman + systemd Quadlet, ledger `shq-suite-0004`), with the **kiosk HUD takeover
+> LIVE-FIRED on kiosk11** (alarm-mode arming/armed/triggered/authorised panes + 15s
+> green dwell) and the **disarm logic moved off HA into Argus** — see the version
+> history below.
 
 ## ⚠️ CURRENT HOUSE POSTURE — TEST MODE (left deliberately, must restore later)
 
@@ -30,9 +33,21 @@ To restore production:
    `script.alarm_trigger_actions` voice/klaxon/PD, or run alongside it? (We disabled
    the legacy output to avoid a double klaxon; the lighting scene + legacy PD also
    went with it.) This is a design decision for M2.
+5. **Overwatch voice is MUTED on atlas (session of 2026-06-19 PM):** the
+   `~/.config/argus/config.yaml` `overwatch:` key was renamed (→ no voice channel
+   spawns) so trigger-testing stays silent (people sleeping). Restore from
+   `~/.config/argus/config.yaml.voicebak`, or rename the key back, + restart. **While
+   muted the Argus disarm voice + klaxon-off are DORMANT** (the outputs consumer isn't
+   spawned) — verify them once voice is back.
+6. **HA "Alarm Disarmed" automation** had its `overwatch.verbalise "Security
+   disarmed"` action removed (now Argus's job). Backup: `/tmp/alarm_disarmed.bak.json`.
+   The redundant HA klaxon-off (`script.alarm_stand_down`) is intentionally LEFT as a
+   safety net until Argus's klaxon control is live-verified.
 
-A live Argus daemon (0.19.0, voice-only) is currently **running** on atlas under
-the user shell (not yet a systemd service) watching `alarm_control_panel.shq_alarm`.
+**Argus now runs CONTAINERISED on atlas** (systemd `--user` Quadlet, `argus.service`)
+watching `alarm_control_panel.shq_alarm` — the old Valerie shell daemon was retired.
+**kiosk11** (720×1280 portrait, `idle_mode: off`, registered in HA `shq_display`) is
+the live takeover test subject.
 
 ## Live-testing harness
 
@@ -161,6 +176,51 @@ clean standdown on disarm. Threat **held Critical** the whole time (ratchet).
   fill the record/dossier silently). Opus always profiles at least once on first
   detection — quality steers WHICH frame + WHEN to re-run, it never withholds the
   pass.
+- **0.22.2 — `ID_SPEAK_CONF` validated at 0.5.** From the live journal a real
+  intruder sits ~0.9+ while a distant passer-by/false figure sits ~0.3, so 0.5
+  cleanly separates them (a 0.4 build was tried + reverted). Comment records the why.
+- **HUD redesign (frontend, `web/`).** Live-tuned on kiosk11 (a real 720×1280
+  PORTRAIT kiosk — the HUD is portrait-first): SHQ wordmark (was BLACKROSE), local
+  clock in all modes, removed top/bottom crosshair circles, ~3× camera caption,
+  landscape subject panels, big single-line situation feed packed top (`align-content:
+  start`), radar trail now FOLLOWS the sweep line, threat badge clears the corner
+  brackets. The feed "status" is a short controlled enum (`feedStatus()` —
+  `Intrusion in progress`/`All clear`, extensible for trigger profiles) not the
+  free-text LLM summary (which overflowed). Flexbox `min-width:0` fixes fixed the
+  right-edge overflow. **Main pane is intruder-centric** (`pickPrimaryView`): it
+  follows the latest intruder (location/activity/best still), never a stray camera
+  note (e.g. the garage's parked car). Web is now served from a **bind-mount**
+  (`~/.config/argus/web`) so frontend tweaks are an rsync + reload, no image rebuild.
+- **0.23.0 — alarm-mode takeover + standby panes (Phase 4 LIVE-FIRED).** Argus now
+  watches the WHOLE alarm state machine, not just `triggered`. New `state::AlarmMode`
+  {Disarmed, Arming, Armed, Triggered}; the HA WS emits `AlarmModeChanged`; the engine
+  broadcasts the mode on a new `watch<AlarmMode>` channel + opens/closes the case as
+  before. The kiosk-takeover consumer + the `/kiosk` WS now consume BOTH the case and
+  the mode: **arming/armed flip the kiosk to the HUD standby pane** (a `{type:"system",
+  mode}` WS frame the HUD renders), `triggered` shows the alarm pane, all on ONE
+  `/alarm` URL (no reload between states). **Live-fired on kiosk11** (idle_mode off →
+  no nyx/Chronos blocker): arm → ARMING → SYSTEM ARMED → (trigger) alarm pane →
+  (disarm) revert, all validated against the real alarm. Engine reads the alarm state
+  once at startup so an already-armed alarm shows immediately.
+- **0.23.1 — 15s AUTHORISED dwell on every disarm.** On disarm the HUD holds a green
+  "AUTHORISED / all clear" for 15s, then reverts to dashboard. Post-incident shows the
+  green cleared `CaseState`; a no-incident disarm (armed→disarmed) broadcasts a
+  transient `AlarmMode::Authorised` → a green "ACCESS GRANTED" system pane. Engine
+  `revert_pending: (Instant, Revert)` services both (ClearCase → broadcast `None`;
+  ToDisarmed → broadcast `Disarmed`); a fresh case/arm cancels it. Verified live: the
+  green held exactly 15.0s (journal 08:19:50 clear → 08:20:05 revert).
+- **0.24.0 — disarm voice moved into Argus + main-pane intruder fix.** Argus took the
+  disarm logic off HA: on the active→disarmed mode edge the outputs consumer (a) stops
+  the klaxon **out-of-band** (direct `SetAlarm(false)`, not behind the serial speech
+  worker — fixes the long-noted klaxon-stop-waits-behind-a-line issue), (b) **flushes
+  queued intruder lines** via a generation counter (`VoiceMsg::Speak{generation}`; the
+  worker skips stale lines — the in-flight clip can't be stopped, Overwatch has no
+  interrupt, but everything behind it is dropped), (c) announces **"Alarm standing
+  down."** The HA "Alarm Disarmed" automation had its `overwatch.verbalise "Security
+  disarmed"` action removed (DOSA-restore + kiosk02–10 dashboard kept; backup at
+  `/tmp/alarm_disarmed.bak.json`). The redundant HA klaxon-off (`script.alarm_stand_down`)
+  is LEFT as a safety net until Argus's klaxon control is live-verified. Plus the
+  main-pane intruder-centric fix (see HUD redesign above).
 
 ## Open findings / next steps (for the fresh-context continuation)
 

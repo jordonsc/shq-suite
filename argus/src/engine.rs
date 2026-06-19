@@ -26,6 +26,7 @@ use crate::case::{
 use crate::config::Config;
 use crate::ha::{HaEvent, RestClient};
 use crate::llm::{AnthropicClient, AssessRequest, ImageInput, Reasoning, Usage};
+use crate::state::AlarmMode;
 
 /// A command from the Phase 5 control surface (the HA component over the
 /// `/control` WS) into the engine. Delivered over a dedicated mpsc the engine's
@@ -65,6 +66,20 @@ const DECAY_ELEVATED_SECS: i64 = 180;
 const DECAY_LOW_SECS: i64 = 600;
 /// - ≥ this → auto-close the Argus case (1 hour of no activity).
 const AUTO_CLOSE_SECS: i64 = 3600;
+
+/// Hold the green AUTHORISED state on the HUD this long after a disarm before
+/// reverting to standby / dashboard (both the post-incident and no-incident
+/// disarm paths use it).
+const AUTHORISED_DWELL_SECS: u64 = 15;
+
+/// What the authorised-dwell timer does when it elapses.
+#[derive(Debug, Clone, Copy)]
+enum Revert {
+    /// Post-incident: drop the cleared case off the broadcast (HUD → standby).
+    ClearCase,
+    /// No-incident disarm: revert the transient `Authorised` mode to `Disarmed`.
+    ToDisarmed,
+}
 
 /// The forensic (Opus) instruction — shared by the inline (`--once`) and the
 /// spawned (daemon) identification paths.
@@ -192,6 +207,17 @@ pub struct Engine {
     /// not already consumed by this — so a slow tick fires the next one promptly,
     /// and only a fast tick gets padded.
     last_tick_duration: Duration,
+    /// Broadcasts the coarse alarm mode (disarmed/arming/armed/triggered) for the
+    /// kiosk HUD + takeover — even when there is no case. `None` in `--once`.
+    mode_tx: Option<watch::Sender<AlarmMode>>,
+    /// The last real alarm mode seen (from `from_ha`), to detect a disarm that
+    /// came from an armed/arming/triggered state (→ show AUTHORISED) vs a
+    /// startup/idle disarmed (→ nothing).
+    prev_mode: Option<AlarmMode>,
+    /// When set, the green AUTHORISED state is being held on the HUD; at this
+    /// instant the dwell elapses and the engine reverts per [`Revert`]. Cancelled
+    /// by any fresh alarm activity (new case / arming / armed).
+    revert_pending: Option<(tokio::time::Instant, Revert)>,
 }
 
 impl Engine {
@@ -244,6 +270,23 @@ impl Engine {
             },
             id_tx: None,
             last_tick_duration: Duration::ZERO,
+            mode_tx: None,
+            prev_mode: None,
+            revert_pending: None,
+        }
+    }
+
+    /// Wire the alarm-mode broadcast channel (daemon only). The HUD + kiosk
+    /// takeover consume it so arming/armed shows the standby pane even with no
+    /// active case.
+    pub fn set_mode_tx(&mut self, mode_tx: watch::Sender<AlarmMode>) {
+        self.mode_tx = Some(mode_tx);
+    }
+
+    /// Broadcast the current alarm mode to the HUD/takeover (no-op in `--once`).
+    fn broadcast_mode(&self, mode: AlarmMode) {
+        if let Some(tx) = &self.mode_tx {
+            let _ = tx.send(mode);
         }
     }
 
@@ -262,6 +305,21 @@ impl Engine {
         // shared-state locking.
         let (id_tx, mut id_rx) = mpsc::channel::<IdResult>(64);
         self.id_tx = Some(id_tx);
+
+        // Seed the initial alarm mode: `state_changed` only fires on CHANGES, so
+        // query the alarm's current state once at startup (an already-armed alarm
+        // should show the standby pane immediately; an already-triggered one opens
+        // a case). Best-effort — a failure just means we wait for the first event.
+        match self.rest.state(&self.cfg.alarm_entity).await {
+            Ok(Some(s)) => {
+                let mode = AlarmMode::from_ha(&s);
+                let entity_id = self.cfg.alarm_entity.clone();
+                self.handle(HaEvent::AlarmModeChanged { entity_id, mode }).await;
+            }
+            Ok(None) => {}
+            Err(e) => warn!("could not read initial alarm state: {e:#}"),
+        }
+
         loop {
             if self.active.is_some() {
                 // Target a fixed FRAME PERIOD: wait only the part of the cadence the
@@ -284,6 +342,10 @@ impl Engine {
                     }
                 }
             } else {
+                // The authorised-dwell timer (if armed): when it elapses, revert the
+                // HUD off the green AUTHORISED state. `pending()` (never resolves)
+                // when no dwell.
+                let dwell = self.revert_pending.map(|(t, _)| t);
                 tokio::select! {
                     maybe = rx.recv() => match maybe {
                         Some(ev) => self.handle(ev).await,
@@ -293,6 +355,24 @@ impl Engine {
                     // Drain any late forensic result that lands after standdown
                     // (dropped as stale inside the handler).
                     Some(res) = id_rx.recv() => self.handle_identification(res),
+                    _ = async move {
+                        match dwell {
+                            Some(t) => tokio::time::sleep_until(t).await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {
+                        if let Some((_, kind)) = self.revert_pending.take() {
+                            match kind {
+                                // Post-incident: drop the cleared case (HUD → standby).
+                                Revert::ClearCase => if self.active.is_none() {
+                                    let _ = self.state_tx.send(None);
+                                },
+                                // No-incident: revert the green to disarmed standby.
+                                Revert::ToDisarmed => self.broadcast_mode(AlarmMode::Disarmed),
+                            }
+                            info!("authorised dwell elapsed; HUD reverts");
+                        }
+                    }
                 }
             }
         }
@@ -313,21 +393,53 @@ impl Engine {
 
     async fn handle(&mut self, ev: HaEvent) {
         match ev {
-            HaEvent::AlarmTriggered { entity_id } => {
-                if self.active.is_some() {
-                    return; // already running a case
-                }
-                if let Err(e) = self.open_case(&entity_id).await {
-                    error!("failed to open case: {e:#}");
-                    return;
-                }
-                if let Err(e) = self.tick().await {
-                    error!("first assessment tick failed: {e:#}");
-                }
-            }
-            HaEvent::AlarmCleared { .. } => {
-                if self.active.is_some() {
-                    self.standdown().await;
+            HaEvent::AlarmModeChanged { entity_id, mode } => {
+                let prev = self.prev_mode;
+                self.prev_mode = Some(mode);
+                match mode {
+                    AlarmMode::Triggered => {
+                        self.revert_pending = None; // fresh incident supersedes any dwell
+                        self.broadcast_mode(mode);
+                        if self.active.is_some() {
+                            return; // already running a case
+                        }
+                        if let Err(e) = self.open_case(&entity_id).await {
+                            error!("failed to open case: {e:#}");
+                            return;
+                        }
+                        if let Err(e) = self.tick().await {
+                            error!("first assessment tick failed: {e:#}");
+                        }
+                    }
+                    AlarmMode::Arming | AlarmMode::Armed => {
+                        self.revert_pending = None; // arming/armed supersedes any dwell
+                        self.broadcast_mode(mode);
+                    }
+                    AlarmMode::Disarmed => {
+                        if self.active.is_some() {
+                            // Post-incident disarm: standdown holds the green
+                            // CaseState for the dwell (sets `revert_pending`).
+                            self.broadcast_mode(mode);
+                            self.standdown().await;
+                        } else if matches!(
+                            prev,
+                            Some(AlarmMode::Arming | AlarmMode::Armed | AlarmMode::Triggered)
+                        ) {
+                            // No-incident disarm (e.g. armed → disarmed): show the
+                            // green AUTHORISED "all clear" for the dwell, then revert.
+                            self.broadcast_mode(AlarmMode::Authorised);
+                            self.revert_pending = Some((
+                                tokio::time::Instant::now()
+                                    + Duration::from_secs(AUTHORISED_DWELL_SECS),
+                                Revert::ToDisarmed,
+                            ));
+                            info!("disarmed (no incident); showing AUTHORISED for the dwell");
+                        } else {
+                            // Startup-disarmed / already idle → plain standby.
+                            self.broadcast_mode(mode);
+                        }
+                    }
+                    AlarmMode::Authorised => {} // engine-internal; never from HA
                 }
             }
         }
@@ -390,6 +502,8 @@ impl Engine {
     }
 
     async fn open_case(&mut self, alarm_entity: &str) -> Result<()> {
+        // A new incident cancels any pending authorised-dwell revert.
+        self.revert_pending = None;
         let now = Utc::now();
         let case_id = format!("case-{}", now.format("%Y%m%dT%H%M%SZ"));
         let base = default_case_base()?;
@@ -484,6 +598,14 @@ impl Engine {
             error!("failed to write dossier: {e:#}");
         }
         info!(case_id = %active.state.case_id, "case cleared");
+        // Hold the green AUTHORISED state (the cleared CaseState) on the HUD for
+        // the dwell, then the run loop broadcasts `None` (HUD → standby, kiosks
+        // restore). `--once` has no run loop, so the dwell is never serviced there
+        // (harmless).
+        self.revert_pending = Some((
+            tokio::time::Instant::now() + Duration::from_secs(AUTHORISED_DWELL_SECS),
+            Revert::ClearCase,
+        ));
     }
 
     /// One assessment cycle: capture → Sonnet live loop → merge → best stills →

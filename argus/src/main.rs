@@ -92,12 +92,21 @@ async fn main() -> Result<()> {
     let web_rx = state_tx.subscribe();
     let kiosks_rx = state_tx.subscribe();
 
+    // Alarm-mode broadcast: arming/armed drive the HUD standby pane + the kiosk
+    // takeover even with no active case. Subscribed before the sender moves into
+    // the engine (the HUD WS + the takeover consumer each take a receiver).
+    let (mode_tx, _mode_rx) = watch::channel::<state::AlarmMode>(state::AlarmMode::Disarmed);
+    let outputs_mode_rx = mode_tx.subscribe();
+    let web_mode_rx = mode_tx.subscribe();
+    let kiosks_mode_rx = mode_tx.subscribe();
+
     let mut eng = Engine::new(cfg.clone(), rest, sonnet, opus, seed, state_tx);
 
     if cli.once {
         eng.run_once().await?;
         return Ok(());
     }
+    eng.set_mode_tx(mode_tx);
 
     if cfg.offsite.enabled {
         let offsite_cfg = cfg.offsite.clone();
@@ -142,7 +151,7 @@ async fn main() -> Result<()> {
     });
     if voice.is_some() || pagerduty.is_some() {
         info!("Spawning Phase 3 outputs consumer (voice + PagerDuty)");
-        tokio::spawn(out::run(outputs_rx, voice, pagerduty, cfg.offsite.clone()));
+        tokio::spawn(out::run(outputs_rx, outputs_mode_rx, voice, pagerduty, cfg.offsite.clone()));
     }
 
     // Phase 5 control channel: the `/control` WS (on the Phase 4 HUD server)
@@ -162,7 +171,7 @@ async fn main() -> Result<()> {
         let case_base = case::default_case_base()?;
         info!(bind = %web_cfg.bind, "Spawning Phase 4 HUD server (+ Phase 5 /control WS)");
         let public_base = web_cfg.public_base.clone();
-        tokio::spawn(web::serve(web_cfg, web_rx, case_base, control_tx.clone()));
+        tokio::spawn(web::serve(web_cfg, web_rx, web_mode_rx, case_base, control_tx.clone()));
 
         if !cfg.kiosks.is_empty() {
             // The takeover consumer drives HA directly, so it needs its own
@@ -171,6 +180,7 @@ async fn main() -> Result<()> {
             info!(kiosks = cfg.kiosks.len(), "Spawning Phase 4 kiosk-takeover consumer");
             tokio::spawn(out::kiosks::run(
                 kiosks_rx,
+                kiosks_mode_rx,
                 cfg.kiosks.clone(),
                 kiosk_rest,
                 public_base,

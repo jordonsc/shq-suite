@@ -49,6 +49,7 @@ use tracing::{debug, info, warn};
 use crate::case::{CaseState, CaseStatus};
 use crate::config::WebConfig;
 use crate::engine::ControlCommand;
+use crate::state::AlarmMode;
 use crate::version;
 
 /// Shared server state: the case broadcast receiver (cloned per WS connection),
@@ -58,6 +59,9 @@ use crate::version;
 #[derive(Clone)]
 struct AppState {
     rx: watch::Receiver<Option<CaseState>>,
+    /// Alarm mode (arming/armed/disarmed/triggered) — the `/kiosk` WS sends a
+    /// `system` frame from this when there is no active case (standby pane).
+    mode_rx: watch::Receiver<AlarmMode>,
     case_base: Arc<PathBuf>,
     control_tx: mpsc::Sender<ControlCommand>,
 }
@@ -69,6 +73,7 @@ struct AppState {
 pub async fn serve(
     cfg: WebConfig,
     rx: watch::Receiver<Option<CaseState>>,
+    mode_rx: watch::Receiver<AlarmMode>,
     case_base: PathBuf,
     control_tx: mpsc::Sender<ControlCommand>,
 ) {
@@ -85,6 +90,7 @@ pub async fn serve(
 
     let state = AppState {
         rx,
+        mode_rx,
         case_base: Arc::new(case_base),
         control_tx,
     };
@@ -136,42 +142,64 @@ fn resolve_web_dir(dir: &str) -> PathBuf {
     p
 }
 
-/// `GET /kiosk` → WebSocket. Push the current `CaseState` on connect, then the
-/// full `CaseState` on every change.
+/// `GET /kiosk` → WebSocket. Push the HUD frame on connect, then on every change
+/// to either the case or the alarm mode. The frame is the full `CaseState` when a
+/// case is active; otherwise a compact `system` frame (the alarm mode) so the HUD
+/// renders the standby pane (arming/armed) instead of a generic idle.
 async fn kiosk_ws(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
-    ws.on_upgrade(move |socket| kiosk_socket(socket, state.rx.clone()))
+    ws.on_upgrade(move |socket| kiosk_socket(socket, state.rx.clone(), state.mode_rx.clone()))
 }
 
-async fn kiosk_socket(mut socket: WebSocket, mut rx: watch::Receiver<Option<CaseState>>) {
-    // Send the current state immediately (or `null` if no active case).
-    let current = rx.borrow_and_update().clone();
-    if send_state(&mut socket, &current).await.is_err() {
+async fn kiosk_socket(
+    mut socket: WebSocket,
+    mut rx: watch::Receiver<Option<CaseState>>,
+    mut mode_rx: watch::Receiver<AlarmMode>,
+) {
+    // Send the current frame immediately.
+    let case = rx.borrow_and_update().clone();
+    let mode = *mode_rx.borrow_and_update();
+    if send_frame(&mut socket, &case, mode).await.is_err() {
         return;
     }
 
-    // Push on every subsequent change until the client drops or the channel closes.
+    // Push on every change to EITHER channel until the client drops.
     loop {
-        if rx.changed().await.is_err() {
-            debug!("kiosk WS: broadcast closed; dropping connection");
-            break;
+        tokio::select! {
+            changed = rx.changed() => if changed.is_err() {
+                debug!("kiosk WS: case broadcast closed; dropping connection");
+                break;
+            },
+            changed = mode_rx.changed() => if changed.is_err() {
+                debug!("kiosk WS: mode broadcast closed; dropping connection");
+                break;
+            },
         }
-        let state = rx.borrow_and_update().clone();
-        if send_state(&mut socket, &state).await.is_err() {
+        // Clone/copy out of the guards before the await.
+        let case = rx.borrow().clone();
+        let mode = *mode_rx.borrow();
+        if send_frame(&mut socket, &case, mode).await.is_err() {
             debug!("kiosk WS: client gone; dropping connection");
             break;
         }
     }
 }
 
-/// Serialise `Option<CaseState>` (the full object, or the literal `null`) and
-/// send it as a WS text frame.
-async fn send_state(socket: &mut WebSocket, state: &Option<CaseState>) -> Result<(), ()> {
-    let json = match serde_json::to_string(state) {
-        Ok(j) => j,
-        Err(e) => {
-            warn!(error = %e, "kiosk WS: failed to serialise CaseState");
-            return Ok(()); // skip this update, keep the connection
-        }
+/// Send the HUD frame: the full `CaseState` when a case is present, else a
+/// `system` frame carrying the alarm mode (the HUD renders the standby pane).
+async fn send_frame(
+    socket: &mut WebSocket,
+    case: &Option<CaseState>,
+    mode: AlarmMode,
+) -> Result<(), ()> {
+    let json = match case {
+        Some(c) => match serde_json::to_string(c) {
+            Ok(j) => j,
+            Err(e) => {
+                warn!(error = %e, "kiosk WS: failed to serialise CaseState");
+                return Ok(()); // skip this update, keep the connection
+            }
+        },
+        None => json!({ "type": "system", "mode": mode.as_str() }).to_string(),
     };
     socket.send(Message::Text(json)).await.map_err(|_| ())
 }

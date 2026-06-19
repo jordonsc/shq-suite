@@ -18,7 +18,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, error, info, warn};
 
-use crate::state::{AlarmState, AlarmTracker, Transition};
+use crate::state::{AlarmMode, AlarmTracker};
 
 type WsRead = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 
@@ -28,13 +28,10 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// Events surfaced from the HA WebSocket stream.
 #[derive(Debug, Clone)]
 pub enum HaEvent {
-    /// The alarm entity transitioned **into** `triggered` — open a case.
-    AlarmTriggered { entity_id: String },
-    /// The alarm entity transitioned **out of** `triggered` — stand down.
-    AlarmCleared {
-        #[allow(dead_code)]
-        entity_id: String,
-    },
+    /// The alarm entity's coarse mode changed (edge only). The engine maps this to
+    /// the case lifecycle (open on `triggered`, stand down on leaving it) AND
+    /// broadcasts the mode for the kiosk HUD (arming/armed → standby pane).
+    AlarmModeChanged { entity_id: String, mode: AlarmMode },
 }
 
 /// Connect, authenticate, subscribe, and forward alarm-trigger transitions over
@@ -143,20 +140,14 @@ async fn handle_message(
     let new_state = data["new_state"]["state"].as_str().unwrap_or("unknown");
     debug!("{alarm_entity} state_changed → {new_state}");
 
-    let event = match tracker.update(AlarmState::from_ha(new_state)) {
-        Some(Transition::IntoTriggered) => {
-            info!("{alarm_entity} transitioned to triggered");
-            HaEvent::AlarmTriggered {
-                entity_id: alarm_entity.to_string(),
-            }
-        }
-        Some(Transition::OutOfTriggered) => {
-            info!("{alarm_entity} left triggered ({new_state})");
-            HaEvent::AlarmCleared {
-                entity_id: alarm_entity.to_string(),
-            }
-        }
-        None => return,
+    let mode = match tracker.update(AlarmMode::from_ha(new_state)) {
+        Some(m) => m,
+        None => return, // same-mode repeat (attribute-only change)
+    };
+    info!("{alarm_entity} mode → {} ({new_state})", mode.as_str());
+    let event = HaEvent::AlarmModeChanged {
+        entity_id: alarm_entity.to_string(),
+        mode,
     };
     if tx.send(event).await.is_err() {
         warn!("event channel closed; dropping alarm transition");

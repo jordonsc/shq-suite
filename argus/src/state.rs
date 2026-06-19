@@ -1,45 +1,62 @@
-//! Coarse alarm-state tracking for the HA WS edge detection.
+//! Alarm-mode tracking for the HA WS edge detection.
 //!
-//! Argus only needs the **edges** of the HA alarm: into `triggered` (open a
-//! case) and out of `triggered` (stand the case down). The rich case state
-//! machine (`Triggered → Assessing → Standdown → Cleared`) lives on `CaseState`
-//! in [`crate::case`]; this type just turns a stream of HA `state_changed`
-//! events into those two transitions.
+//! Argus distinguishes the coarse alarm modes so it can both run the case state
+//! machine (open on `triggered`, stand down on leaving it) AND drive the kiosk
+//! HUD for the *non*-incident modes (arming / armed show the standby pane; only
+//! the change-edges are surfaced so attribute-only `state_changed` repeats are
+//! ignored). The rich case machine (`Triggered → Assessing → Standdown →
+//! Cleared`) lives on `CaseState` in [`crate::case`].
 
-/// The alarm states Argus distinguishes for edge detection.
+/// The coarse alarm modes Argus distinguishes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AlarmState {
-    /// Any non-triggered HA alarm state (disarmed, armed_*, pending, arming, …).
+pub enum AlarmMode {
+    /// Disarmed / off (or unknown/unavailable — anything that isn't armed).
     Disarmed,
-    /// The HA alarm is in `triggered`.
+    /// Counting down to armed (the exit delay).
+    Arming,
+    /// Armed (any `armed_*`), incl. `pending` (the entry delay before a trigger).
+    Armed,
+    /// `triggered` — an incident; the engine opens a case.
     Triggered,
+    /// Transient UI-only state: the green AUTHORISED "all clear" shown for a few
+    /// seconds after a disarm that had no incident (never produced by `from_ha`;
+    /// broadcast by the engine, then it reverts to `Disarmed`).
+    Authorised,
 }
 
-impl AlarmState {
-    /// Map a raw `alarm_control_panel` state string to our coarse enum.
+impl AlarmMode {
+    /// Map a raw `alarm_control_panel` state string to our coarse mode.
     pub fn from_ha(state: &str) -> Self {
-        if state == "triggered" {
-            AlarmState::Triggered
-        } else {
-            AlarmState::Disarmed
+        match state {
+            "triggered" => AlarmMode::Triggered,
+            "arming" => AlarmMode::Arming,
+            // entry delay — still armed; the case only opens on `triggered`.
+            "pending" => AlarmMode::Armed,
+            "armed_away" | "armed_home" | "armed_night" | "armed_custom_bypass"
+            | "armed_vacation" => AlarmMode::Armed,
+            // disarmed / unknown / unavailable / anything else
+            _ => AlarmMode::Disarmed,
+        }
+    }
+
+    /// The wire string sent to the HUD (`system` frame `mode`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AlarmMode::Disarmed => "disarmed",
+            AlarmMode::Arming => "arming",
+            AlarmMode::Armed => "armed",
+            AlarmMode::Triggered => "triggered",
+            AlarmMode::Authorised => "authorised",
         }
     }
 }
 
-/// An edge worth acting on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Transition {
-    /// Entered `triggered` — open a case.
-    IntoTriggered,
-    /// Left `triggered` — stand the case down.
-    OutOfTriggered,
-}
-
-/// Tracks the last-seen alarm state so only **edges** fire (not repeats, e.g. a
-/// triggered→triggered attribute-only `state_changed`).
+/// Tracks the last-seen mode so only **edges** fire (not attribute-only repeats).
+/// The first observation of any mode fires (so a startup query / first event
+/// surfaces the current mode); thereafter only changes fire.
 #[derive(Debug, Default)]
 pub struct AlarmTracker {
-    last: Option<AlarmState>,
+    last: Option<AlarmMode>,
 }
 
 impl AlarmTracker {
@@ -47,21 +64,13 @@ impl AlarmTracker {
         Self { last: None }
     }
 
-    /// Record a newly-observed state. Returns `Some(transition)` only on an edge
-    /// into or out of `Triggered`; `None` for same-state repeats. The very first
-    /// observation of `Triggered` fires `IntoTriggered`; the first observation
-    /// of a non-triggered state does **not** fire (we never saw a trigger to
-    /// stand down).
-    pub fn update(&mut self, new: AlarmState) -> Option<Transition> {
-        let transition = match (self.last, new) {
-            (Some(AlarmState::Triggered), AlarmState::Triggered) => None,
-            (_, AlarmState::Triggered) => Some(Transition::IntoTriggered),
-            (Some(AlarmState::Triggered), AlarmState::Disarmed) => {
-                Some(Transition::OutOfTriggered)
-            }
-            (_, AlarmState::Disarmed) => None,
-        };
+    /// Record a newly-observed mode. Returns `Some(mode)` on a change (incl. the
+    /// first observation), `None` for a same-mode repeat.
+    pub fn update(&mut self, new: AlarmMode) -> Option<AlarmMode> {
+        if self.last == Some(new) {
+            return None;
+        }
         self.last = Some(new);
-        transition
+        Some(new)
     }
 }

@@ -8,11 +8,10 @@
 //! - **`pagerduty`** (Phase 3): the security-station dossier (Events v2).
 //!
 //! [`run`] is the Phase 3 wiring: it subscribes to the `watch<Option<CaseState>>`
-//! broadcast, **diffs the timeline** across updates (a per-case cursor on timeline
-//! length), and routes each NEW [`crate::case::TimelineEvent`] to two INDEPENDENT
-//! channels — voice and PagerDuty. A failure in one never blocks the other (each
-//! logs and continues). Speech is serialised through a single voice worker so
-//! milestones don't talk over each other.
+//! broadcast (timeline diff → voice/PagerDuty) AND the `watch<AlarmMode>` broadcast
+//! so it can run the **disarm** actions Argus took over from HA: on a disarm it
+//! stops the klaxon out-of-band (not behind the speech queue), flushes any queued
+//! intruder lines, and announces "Alarm standing down."
 
 pub mod kiosks;
 pub mod offsite;
@@ -21,43 +20,51 @@ pub mod voice;
 pub mod voice_policy;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info};
 
 use crate::case::{CaseState, TimelineKind};
 use crate::config::OffsiteConfig;
+use crate::state::AlarmMode;
 use pagerduty::PagerDuty;
 use voice::VoiceClient;
 
-/// Spawned in daemon mode only. Subscribes to the case broadcast and drives the
-/// voice + PagerDuty outputs off new timeline events.
+/// A message to the serial voice worker. `Speak` carries the `generation` it was
+/// queued in: a disarm bumps the generation, so any line still queued from before
+/// the disarm is skipped (the queue is "flushed" without playing).
+enum VoiceMsg {
+    Speak { text: String, generation: u64 },
+    Alarm(bool),
+}
+
+/// Spawned in daemon mode only. Subscribes to the case broadcast and the alarm-mode
+/// broadcast, and drives the voice + PagerDuty outputs.
 ///
-/// - `voice` / `pd` are `None` when the respective config is absent (the channel
-///   is then simply not driven).
-/// - `offsite` is passed (clone of config) so the PagerDuty dossier can embed the
-///   deterministic S3 case prefix without any runtime S3 call.
-///
-/// Voice and PagerDuty are driven purely off the timeline diff: the gate
-/// ([`voice_policy::lines_for`]) decides what (if anything) is spoken per event,
-/// and material events re-`trigger` PagerDuty with the latest dossier. The
-/// `intruder_identified` milestone is where the intruder *profile* reaches the
-/// security station (PagerDuty `custom_details`); the speaker only states it was
-/// sent.
+/// - `voice` / `pd` are `None` when the respective config is absent.
+/// - `offsite` (clone of config) lets the PagerDuty dossier embed the deterministic
+///   S3 case prefix without a runtime S3 call.
 pub async fn run(
     mut rx: watch::Receiver<Option<CaseState>>,
+    mut mode_rx: watch::Receiver<AlarmMode>,
     voice: Option<VoiceClient>,
     pd: Option<PagerDuty>,
     offsite: OffsiteConfig,
 ) {
-    // Serialise speech through one worker so lines don't overlap. The gate is
-    // pure; pacing/queueing lives here. A small bounded queue drops nothing under
-    // normal milestone rates (a handful of events per case).
-    let speech_tx = voice.as_ref().map(|vc| spawn_voice_worker(vc.clone()));
+    // Speech is serialised through one worker so lines don't overlap. A monotonic
+    // generation lets a disarm flush queued-but-unplayed lines (the worker skips
+    // any `Speak` whose generation is older than the current one).
+    let voice_gen = Arc::new(AtomicU64::new(0));
+    let speech_tx = voice
+        .as_ref()
+        .map(|vc| spawn_voice_worker(vc.clone(), voice_gen.clone()));
 
-    // Per-case cursor: how many timeline events we have already routed. Diffing
-    // against `timeline.len()` yields the new tail each update.
+    // Per-case cursor: how many timeline events we have already routed.
     let mut cursors: HashMap<String, usize> = HashMap::new();
+    // Track the alarm mode so we fire the disarm actions on the active→disarmed edge.
+    let mut prev_mode = *mode_rx.borrow();
 
     info!(
         voice = speech_tx.is_some(),
@@ -66,30 +73,70 @@ pub async fn run(
     );
 
     loop {
-        if rx.changed().await.is_err() {
-            debug!("outputs: broadcast closed; exiting");
-            break;
+        tokio::select! {
+            // ── Case stream: route new timeline events ───────────────────────
+            changed = rx.changed() => {
+                if changed.is_err() {
+                    debug!("outputs: case broadcast closed; exiting");
+                    break;
+                }
+                let state = match rx.borrow_and_update().clone() {
+                    Some(s) => s,
+                    None => continue, // no active case
+                };
+                let cursor = cursors.entry(state.case_id.clone()).or_insert(0);
+                let already = *cursor;
+                let total = state.timeline.len();
+                if total > already {
+                    for idx in already..total {
+                        route_event(&state.timeline[idx], &state, &offsite,
+                                    speech_tx.as_ref(), &voice_gen, pd.as_ref()).await;
+                    }
+                    *cursor = total;
+                }
+            }
+            // ── Alarm mode: disarm actions (klaxon off + flush + standdown) ──
+            changed = mode_rx.changed() => {
+                if changed.is_err() {
+                    debug!("outputs: mode broadcast closed; exiting");
+                    break;
+                }
+                let mode = *mode_rx.borrow_and_update();
+                let was_active = matches!(
+                    prev_mode,
+                    AlarmMode::Arming | AlarmMode::Armed | AlarmMode::Triggered
+                );
+                let now_disarmed = matches!(mode, AlarmMode::Disarmed | AlarmMode::Authorised);
+                prev_mode = mode;
+                if was_active && now_disarmed {
+                    standdown_voice(voice.as_ref(), speech_tx.as_ref(), &voice_gen).await;
+                }
+            }
         }
-        // Clone out of the watch guard quickly so we don't hold the lock across awaits.
-        let state = match rx.borrow_and_update().clone() {
-            Some(s) => s,
-            None => continue, // no active case
-        };
+    }
+}
 
-        let cursor = cursors.entry(state.case_id.clone()).or_insert(0);
-        let already = *cursor;
-        let total = state.timeline.len();
-        if total <= already {
-            // No new timeline events (e.g. a tick that only refreshed locations).
-            continue;
-        }
-
-        // Route each NEW event through both channels.
-        for idx in already..total {
-            let event = &state.timeline[idx];
-            route_event(event, &state, &offsite, speech_tx.as_ref(), pd.as_ref()).await;
-        }
-        *cursor = total;
+/// Disarm handling Argus took over from HA: stop the klaxon immediately
+/// (out-of-band, so it can't wait behind a blocking `Verbalise`), flush any queued
+/// intruder lines (bump the generation), then announce the standdown.
+async fn standdown_voice(
+    voice: Option<&VoiceClient>,
+    speech_tx: Option<&mpsc::Sender<VoiceMsg>>,
+    voice_gen: &AtomicU64,
+) {
+    // 1. Klaxon off — direct, not via the serial worker (which may be mid-clip).
+    if let Some(v) = voice {
+        v.set_alarm(false).await;
+    }
+    // 2. Flush queued speech: anything queued before now is skipped by the worker.
+    let generation = voice_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    // 3. Announce the standdown (tagged with the fresh generation so it survives).
+    if let Some(tx) = speech_tx {
+        let _ = tx.try_send(VoiceMsg::Speak {
+            text: "Alarm standing down.".to_string(),
+            generation,
+        });
+        info!("outputs: disarm — klaxon off, queue flushed, standdown announced");
     }
 }
 
@@ -99,23 +146,28 @@ async fn route_event(
     event: &crate::case::TimelineEvent,
     state: &CaseState,
     offsite: &OffsiteConfig,
-    speech_tx: Option<&mpsc::Sender<String>>,
+    speech_tx: Option<&mpsc::Sender<VoiceMsg>>,
+    voice_gen: &AtomicU64,
     pd: Option<&PagerDuty>,
 ) {
     // ── Voice channel: gate → queued speech (zero or more lines) ─────────────
     if let Some(tx) = speech_tx {
+        let generation = voice_gen.load(Ordering::SeqCst);
         for line in voice_policy::lines_for(event, state) {
             // Bounded, non-blocking: if the queue is somehow full we drop rather
             // than stall the loop (speech is best-effort intimidation, not record).
-            if tx.try_send(line.text).is_err() {
+            if tx
+                .try_send(VoiceMsg::Speak { text: line.text, generation })
+                .is_err()
+            {
                 debug!("outputs: voice queue full; dropped a line");
             }
         }
-        // The klaxon is bound to case lifecycle, not a spoken line:
-        match event.kind {
-            TimelineKind::CaseOpened => queue_alarm(tx, true),
-            TimelineKind::Standdown | TimelineKind::Cleared => queue_alarm(tx, false),
-            _ => {}
+        // Klaxon ON rides the case open. Klaxon OFF is handled out-of-band by the
+        // disarm path (`standdown_voice`), NOT here, so a stop can't wait behind a
+        // playing line.
+        if event.kind == TimelineKind::CaseOpened {
+            let _ = tx.try_send(VoiceMsg::Alarm(true));
         }
     }
 
@@ -139,33 +191,27 @@ async fn route_event(
     }
 }
 
-/// Queue a klaxon control on the same serial channel as speech (so a stop doesn't
-/// race a spoken line). We tunnel it as a sentinel string the worker recognises.
-fn queue_alarm(tx: &mpsc::Sender<String>, on: bool) {
-    let cmd = if on { ALARM_ON } else { ALARM_OFF };
-    let _ = tx.try_send(cmd.to_string());
-}
-
-const ALARM_ON: &str = "\u{0}alarm:on";
-const ALARM_OFF: &str = "\u{0}alarm:off";
-
-/// Spawn the single voice worker. It owns the `VoiceClient` and processes the
-/// queue serially: alarm sentinels drive `SetAlarm`, everything else is spoken.
-/// Serial processing is the pacing guarantee (no overlapping `Verbalise`).
-fn spawn_voice_worker(client: VoiceClient) -> mpsc::Sender<String> {
-    let (tx, mut rx) = mpsc::channel::<String>(32);
+/// Spawn the single voice worker. It owns the `VoiceClient` and processes the queue
+/// serially (the pacing guarantee — no overlapping `Verbalise`). A `Speak` whose
+/// `generation` is older than the current one is SKIPPED — that's how a disarm
+/// flushes intruder lines still sitting in the queue.
+fn spawn_voice_worker(client: VoiceClient, voice_gen: Arc<AtomicU64>) -> mpsc::Sender<VoiceMsg> {
+    let (tx, mut rx) = mpsc::channel::<VoiceMsg>(32);
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            match msg.as_str() {
-                ALARM_ON => client.set_alarm(true).await,
-                ALARM_OFF => client.set_alarm(false).await,
-                line => {
+            match msg {
+                VoiceMsg::Alarm(on) => client.set_alarm(on).await,
+                VoiceMsg::Speak { text, generation } => {
+                    // Skip lines flushed by a disarm (queued before the dwell bumped
+                    // the generation). The currently-playing clip can't be stopped
+                    // mid-flight, but everything queued behind it is dropped.
+                    if generation < voice_gen.load(Ordering::SeqCst) {
+                        continue;
+                    }
                     // `verbalise` requests blocking playback (`await_playback=true`),
-                    // so this RPC only returns after Overwatch finishes PLAYING the
-                    // clip — not just after synthesis. The serial worker therefore
-                    // paces itself naturally and lines never overlap; no local timing
-                    // estimate is needed.
-                    client.verbalise(line).await;
+                    // so this RPC returns only after Overwatch finishes PLAYING the
+                    // clip — the serial worker paces itself, no timing estimate.
+                    client.verbalise(&text).await;
                 }
             }
         }

@@ -1,50 +1,64 @@
 //! Phase 4 — kiosk takeover orchestration.
 //!
-//! A `watch` consumer that flips every configured wall kiosk to the HUD on the
-//! first `CaseState` of a case, and back to its dashboard when the case clears.
-//! It renders `CaseState` lifecycle into `shq_display.navigate` HA service calls
-//! — it does NOT call the LLM, and it does not touch the HUD's WS push (that's
-//! the web server's job; this only points Chrome at `/alarm`).
+//! A consumer that flips every configured wall kiosk to the Argus HUD whenever
+//! the alarm warrants it, and back to its dashboard otherwise. It renders the
+//! `(case, alarm-mode)` pair into `shq_display.navigate` HA service calls — it
+//! does NOT call the LLM, and it does not touch the HUD's WS push (that's the web
+//! server's job; this only points Chrome at `/alarm` or the dashboard).
 //!
-//! Lifecycle (per `case_id`, deduped so we navigate at most once each way):
-//! - **Takeover** on the first state of a new case (status `triggered` /
-//!   `assessing`): navigate every kiosk → `<public_base>/alarm`.
-//! - **Restore** on `cleared`: navigate every kiosk → its `dashboard_url`.
-//!   (`standdown` is the disarm edge but not terminal; we restore on the
-//!   terminal `cleared` so the AUTHORISED/green state has been shown first.)
+//! Desired kiosk target:
+//! - **HUD** (`<public_base>/alarm`) when a case is present (triggered → assessing
+//!   → cleared/AUTHORISED, held by the engine's authorised-dwell) OR the alarm is
+//!   `arming`/`armed` (the standby pane). The HUD CONTENT (standby vs alarm vs
+//!   green) is driven entirely by the `/kiosk` WS — the URL is the same `/alarm`
+//!   for all of them, so arming→triggered→cleared needs NO re-navigation.
+//! - **Dashboard** otherwise (disarmed, no case). The engine drops the cleared
+//!   case off the broadcast after the dwell, which lands us here → restore.
 //!
 //! ## nyx DEPENDENCY (flagged — see 04-kiosk-hud.md Deviations)
 //! A bare `shq_display.navigate` only issues a CDP `Page.navigate`. It does NOT
-//! wake a sleeping kiosk (backlight off) and does NOT kill a Chronos clock
-//! overlay (which sits *above* Chrome on `idle_mode: clock` kiosks) — so on
-//! those kiosks the takeover would be invisible. nyx's `wake`/`set_display true`
-//! is what SIGKILLs Chronos + restores the backlight (see `nyx/CLAUDE.md` and
-//! ledger `shq-suite-0001`). The clean fix is a small nyx change so `navigate`
-//! IMPLIES wake+overlay-kill; until then a `wake` must precede the `navigate`.
-//! That nyx change / the wake call is NOT yet wired here (no `shq_display.wake`
-//! service exists today) — documented as the remaining work.
+//! wake a sleeping kiosk nor kill a Chronos clock overlay (`idle_mode: clock`), so
+//! on those kiosks the takeover would be invisible until nyx gains a wake/overlay-
+//! kill on navigate. Kiosks with `idle_mode: off` are unaffected.
 
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use crate::case::{CaseState, CaseStatus};
+use crate::case::CaseState;
 use crate::config::KioskConfig;
 use crate::ha::RestClient;
+use crate::state::AlarmMode;
 
-/// What we last did for the current case, so we navigate at most once each way.
+/// Where the kiosks should currently point.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Phase {
-    /// Kiosks flipped to the HUD.
-    TakenOver,
-    /// Kiosks returned to their dashboards.
-    Restored,
+enum Target {
+    /// The Argus HUD (`/alarm`).
+    Hud,
+    /// Each kiosk's own dashboard.
+    Dashboard,
+}
+
+/// The HUD is shown whenever there's a case (incl. the cleared/AUTHORISED dwell)
+/// or the alarm is arming/armed; otherwise the dashboard.
+fn desired_target(case: &Option<CaseState>, mode: AlarmMode) -> Target {
+    if case.is_some()
+        || matches!(
+            mode,
+            AlarmMode::Arming | AlarmMode::Armed | AlarmMode::Triggered | AlarmMode::Authorised
+        )
+    {
+        Target::Hud
+    } else {
+        Target::Dashboard
+    }
 }
 
 /// Spawned in daemon mode only (and only when `web` is configured + `kiosks` is
-/// non-empty). Owns its own `watch` receiver + a `RestClient` for the service
+/// non-empty). Owns its own `watch` receivers + a `RestClient` for the service
 /// calls. Failures are logged, never fatal.
 pub async fn run(
-    mut rx: watch::Receiver<Option<CaseState>>,
+    mut case_rx: watch::Receiver<Option<CaseState>>,
+    mut mode_rx: watch::Receiver<AlarmMode>,
     kiosks: Vec<KioskConfig>,
     rest: RestClient,
     public_base: String,
@@ -56,43 +70,34 @@ pub async fn run(
         "kiosks: Phase 4 takeover consumer started"
     );
 
-    // Per-case dedup: the case id we are currently driving + which way we last
-    // navigated. A new case id resets the phase.
-    let mut active_case: Option<String> = None;
-    let mut phase: Option<Phase> = None;
+    // What the kiosks currently show. Assume they boot on their dashboards; we
+    // navigate only when the desired target actually changes.
+    let mut current = Target::Dashboard;
 
     loop {
-        if rx.changed().await.is_err() {
-            warn!("kiosks: broadcast closed; exiting");
-            break;
-        }
-        let state = match rx.borrow_and_update().clone() {
-            Some(s) => s,
-            None => continue,
+        // Recompute + navigate on a change to EITHER channel.
+        let desired = {
+            let case = case_rx.borrow();
+            let mode = *mode_rx.borrow();
+            desired_target(&case, mode)
         };
-
-        // New case → reset the dedup so the next branch can take over.
-        if active_case.as_deref() != Some(state.case_id.as_str()) {
-            active_case = Some(state.case_id.clone());
-            phase = None;
+        if desired != current {
+            match desired {
+                Target::Hud => takeover(&rest, &kiosks, &alarm_url).await,
+                Target::Dashboard => restore(&rest, &kiosks).await,
+            }
+            current = desired;
         }
 
-        match state.status {
-            CaseStatus::Triggered | CaseStatus::Assessing => {
-                if phase != Some(Phase::TakenOver) {
-                    takeover(&rest, &kiosks, &alarm_url).await;
-                    phase = Some(Phase::TakenOver);
-                }
-            }
-            CaseStatus::Cleared => {
-                if phase != Some(Phase::Restored) {
-                    restore(&rest, &kiosks).await;
-                    phase = Some(Phase::Restored);
-                }
-            }
-            // Standdown is the disarm edge but not terminal — hold the HUD up
-            // (the AUTHORISED state renders here) until `cleared` restores.
-            CaseStatus::Standdown => {}
+        tokio::select! {
+            changed = case_rx.changed() => if changed.is_err() {
+                warn!("kiosks: case broadcast closed; exiting");
+                break;
+            },
+            changed = mode_rx.changed() => if changed.is_err() {
+                warn!("kiosks: mode broadcast closed; exiting");
+                break;
+            },
         }
     }
 }

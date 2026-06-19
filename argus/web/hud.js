@@ -33,7 +33,6 @@
     headline: $("headline"),
     emblem: $("emblem"),
     timer: $("timer"),
-    timerSub: $("timerSub"),
     clearance: $("clearance"),
     panel: $("panel"),
     camview: $("camview"),
@@ -72,7 +71,8 @@
     const g = $("crosshairs");
     // mid-edge registration marks + a few interior ones (as in the concept)
     const marks = [
-      [500, 70], [500, VBH - 70],        // top / bottom centre
+      // top/bottom centre marks removed — they collided with the timer and the
+      // situation feed (the circle made both hard to read).
       [60, 889], [940, 889],             // left / right centre
       [260, 620], [740, 620],            // interior pair
       [260, 1160], [740, 1160],
@@ -146,14 +146,18 @@
       const R = Math.hypot(w, h);
       const wedge = 0.55; // radians
 
+      // Trail FOLLOWS the leading line: the wedge sits BEHIND the sweep (angles
+      // ang-wedge .. ang), brightest at the line and fading out into the tail —
+      // so the fade trails the radial line rather than running ahead of it.
+      const frac = wedge / (Math.PI * 2);
       const grad = ctx.createConicGradient
-        ? ctx.createConicGradient(ang, cx, cy)
+        ? ctx.createConicGradient(ang - wedge, cx, cy)
         : null;
       const c = hue();
       if (grad) {
-        grad.addColorStop(0, hexA(c, 0.0));
-        grad.addColorStop(wedge / (Math.PI * 2), hexA(c, 0.0));
-        grad.addColorStop(0.0001, hexA(c, 0.22));
+        grad.addColorStop(0, hexA(c, 0.0));                       // tail: transparent
+        grad.addColorStop(Math.min(0.999, frac), hexA(c, 0.22));  // at the line: bright
+        grad.addColorStop(Math.min(1, frac + 0.0001), hexA(c, 0.0));
         ctx.fillStyle = grad;
       } else {
         // fallback: draw a triangular wedge
@@ -161,7 +165,7 @@
       }
       ctx.beginPath();
       ctx.moveTo(cx, cy);
-      ctx.arc(cx, cy, R, ang, ang + wedge);
+      ctx.arc(cx, cy, R, ang - wedge, ang);
       ctx.closePath();
       ctx.fill();
 
@@ -191,20 +195,10 @@
   }
 
   /* =========================================================================
-     3. ELAPSED TIMER — counts since started_at (or wall clock when idle)
+     3. CLOCK — local wall-clock time, shown in ALL modes.
      ========================================================================= */
-  let startedAt = null; // Date | null
   function tickTimer() {
-    if (startedAt) {
-      const s = Math.max(0, Math.floor((Date.now() - startedAt.getTime()) / 1000));
-      const hh = String(Math.floor(s / 3600)).padStart(2, "0");
-      const mm = String(Math.floor((s % 3600) / 60)).padStart(2, "0");
-      const ss = String(s % 60).padStart(2, "0");
-      els.timer.textContent = `${hh}:${mm}:${ss}`;
-    } else {
-      const d = new Date();
-      els.timer.textContent = d.toTimeString().slice(0, 8);
-    }
+    els.timer.textContent = new Date().toTimeString().slice(0, 8);
   }
   setInterval(tickTimer, 1000);
 
@@ -388,10 +382,19 @@
   let typingTimer = 0;
 
   function eventKey(ev) { return `${ev.at}|${ev.kind}|${ev.detail}`; }
-  const MAX_FEED = 7;
+  const MAX_FEED = 5;
+
+  // The feed "status" beside SITUATION FEED is a SHORT controlled enum (not the
+  // free-text LLM summary, which is unpredictable length and overflows). Keeps the
+  // header layout fixed. Future trigger profiles branch the active case here
+  // (Investigate -> "Investigating…", General -> "Assessing…").
+  function feedStatus(cs) {
+    if (!cs || cs.status === "cleared") return "All clear";
+    return "Intrusion in progress";
+  }
 
   function renderTicker(caseState) {
-    els.tkSummary.textContent = caseState ? (caseState.summary || "") : "All sectors nominal.";
+    els.tkSummary.textContent = feedStatus(caseState);
 
     if (!caseState || !caseState.timeline) return;
     const feed = els.tickerFeed;
@@ -410,9 +413,9 @@
       const li = document.createElement("li");
       const key = eventKey(ev);
       const time = fmtTime(ev.at);
-      const kind = (ev.kind || "").replace(/_/g, " ").toUpperCase();
+      // Time + detail only — one clean line per event. The KIND label was dropped:
+      // it's redundant with the detail text and ate the width on a portrait kiosk.
       li.innerHTML = `<span class="tf-time">${time}</span>` +
-        `<span class="tf-kind">${escapeHtml(kind)}</span>` +
         `<span class="tf-text"></span>`;
       const textEl = li.querySelector(".tf-text");
       if (key === newestFreshKey) {
@@ -439,13 +442,49 @@
 
   /* =========================================================================
      8. MAIN RENDER — single entry point for WS + demo
+        Payload is a CaseState, a {type:"system"} alarm-mode frame, or null.
      ========================================================================= */
-  function render(caseState) {
+  // Mode-specific copy for the standby pane (arming/armed/disarmed). The HUD shows
+  // this when the alarm is up but there is no incident yet.
+  const SYS = {
+    arming:     { state: "standby",    hl: "ARMING",       clr: "ARMING",  s1: "ARMING",          s2: "SECURING PERIMETER · STAND CLEAR", status: "Arming…" },
+    armed:      { state: "standby",    hl: "SYSTEM ARMED", clr: "ARMED",   s1: "SYSTEM ARMED",    s2: "ALL SECTORS NOMINAL · STANDBY",    status: "All clear" },
+    // green all-clear shown for a few seconds after any disarm
+    authorised: { state: "authorised", hl: "AUTHORISED",   clr: "GRANTED", s1: "ACCESS GRANTED",  s2: "ALL CLEAR · STAND DOWN",           status: "All clear" },
+    triggered:  { state: "standby",    hl: "ALARM",        clr: "ALARM",   s1: "ALARM",           s2: "ASSESSING…",                       status: "Intrusion in progress" },
+    disarmed:   { state: "standby",    hl: "STANDBY",      clr: "OFF",     s1: "SYSTEM DISARMED", s2: "ALL SECTORS NOMINAL",              status: "All clear" },
+  };
+
+  function renderSystem(sys) {
+    const m = SYS[sys.mode] || SYS.armed;
+    // Theme per mode (steel standby, or emerald for authorised); clear any alarm
+    // pulse/sweep overrides.
+    root.setAttribute("data-state", m.state);
+    setEmblem(m.state);
+    root.style.removeProperty("--pulse-rate");
+    root.style.removeProperty("--pulse-alpha");
+    root.style.removeProperty("--sweep-rate");
+    els.headline.textContent = m.hl;
+    els.clearance.textContent = m.clr;
+    els.standby.hidden = false;
+    els.camview.style.display = "none";
+    els.intruders.style.display = "none";
+    reconcileIntruders([]);
+    seenEvents.clear();
+    els.tickerFeed.replaceChildren();
+    els.tkSummary.textContent = m.status;
+    const sb1 = els.standby.querySelector(".sb-1");
+    const sb2 = els.standby.querySelector(".sb-2");
+    if (sb1) sb1.textContent = m.s1;
+    if (sb2) sb2.textContent = m.s2;
+  }
+
+  function render(data) {
+    if (data && data.type === "system") { renderSystem(data); return; }
+    const caseState = data;
     applyTheme(caseState);
 
     if (!caseState) {
-      startedAt = null;
-      els.timerSub.textContent = "SYSTEM TIME";
       els.standby.hidden = false;
       els.camview.style.display = "none";
       els.intruders.style.display = "none";
@@ -458,24 +497,59 @@
     els.standby.hidden = true;
     els.camview.style.display = "";
     els.intruders.style.display = "";
-    els.timerSub.textContent = "ELAPSED";
-    startedAt = caseState.started_at ? new Date(caseState.started_at) : new Date();
-    tickTimer();
 
-    // primary camera = latest location's most recent still, or best intruder still
-    const loc = pickPrimaryLocation(caseState);
-    els.camLoc.textContent = loc ? (loc.label || loc.camera || "CAMERA") : "—";
-    els.camAct.textContent = loc ? (loc.activity || "") : "";
-
-    const mainStillId = pickMainStill(caseState, loc);
-    if (els.camPhText) els.camPhText.textContent = loc ? "ACQUIRING" : "NO SIGNAL";
-    loadStill(els.camImg, (show) => { els.camPlaceholder.hidden = !show; }, mainStillId);
+    // The main pane tracks the INTRUDER, not generic camera chatter — so it shows
+    // the latest intruder-level activity (location/activity/best still), never an
+    // unrelated camera note (e.g. the garage's parked car).
+    const view = pickPrimaryView(caseState);
+    els.camLoc.textContent = view ? (view.label || "CAMERA") : "—";
+    els.camAct.textContent = view ? (view.activity || "") : "";
+    if (els.camPhText) els.camPhText.textContent = view ? "ACQUIRING" : "NO SIGNAL";
+    loadStill(els.camImg, (show) => { els.camPlaceholder.hidden = !show; }, view && view.stillId);
 
     els.camRec.style.visibility =
       (caseState.status === "cleared") ? "hidden" : "visible";
 
     reconcileIntruders(caseState.intruders);
     renderTicker(caseState);
+  }
+
+  function stillTime(i) {
+    const s = i.best_stills && i.best_stills[0];
+    return s ? new Date(s.captured_at || 0).getTime() : 0;
+  }
+
+  // The primary view = the most relevant INTRUDER (the latest intruder-level
+  // activity), so the main pane follows the threat — not whatever camera last had
+  // something to say. Ranking: currently-located first, then armed, then highest
+  // confidence, then most recent best still. Only with NO intruders do we fall
+  // back to a person-present location.
+  function pickPrimaryView(cs) {
+    const intruders = cs.intruders || [];
+    if (intruders.length) {
+      const i = intruders.slice().sort((a, b) => {
+        const al = a.location || a.best_camera ? 1 : 0;
+        const bl = b.location || b.best_camera ? 1 : 0;
+        if (al !== bl) return bl - al;
+        if (!!b.armed !== !!a.armed) return (b.armed ? 1 : 0) - (a.armed ? 1 : 0);
+        const ac = clamp01(a.confidence), bc = clamp01(b.confidence);
+        if (bc !== ac) return bc - ac;
+        return stillTime(b) - stillTime(a);
+      })[0];
+      return {
+        label: i.location || i.best_camera || "TRACKING",
+        activity: i.activity || "",
+        stillId: i.best_stills && i.best_stills[0] && i.best_stills[0].id,
+      };
+    }
+    // No intruders (rare in alarm mode) — fall back to a person-present camera.
+    const loc = pickPrimaryLocation(cs);
+    if (!loc) return null;
+    return {
+      label: loc.label || loc.camera || "CAMERA",
+      activity: loc.activity || "",
+      stillId: pickMainStill(cs, loc),
+    };
   }
 
   function pickPrimaryLocation(cs) {

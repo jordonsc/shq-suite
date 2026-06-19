@@ -43,10 +43,16 @@ echo "==> Building localhost/argus:latest on atlas"
 "${SSH[@]}" "podman build -f $BUILD_DIR/argus/Containerfile -t localhost/argus:latest $BUILD_DIR"
 
 echo "==> Installing the Quadlet unit + ensuring runtime dirs"
-"${SSH[@]}" 'mkdir -p ~/.config/containers/systemd ~/.config/argus ~/.local/share/argus'
+"${SSH[@]}" 'mkdir -p ~/.config/containers/systemd ~/.config/argus ~/.config/argus/web ~/.local/share/argus'
 rsync -az -e "$RSYNC_RSH" \
     "$REPO_ROOT/argus/argus.container" \
     "$TARGET:.config/containers/systemd/argus.container"
+
+# The HUD web assets are served from a bind-mount (~/.config/argus/web), so the
+# frontend can be updated without rebuilding the image. Sync the current web/.
+echo "==> Syncing HUD web assets (bind-mount source)"
+rsync -az --delete -e "$RSYNC_RSH" \
+    "$REPO_ROOT/argus/web/" "$TARGET:.config/argus/web/"
 
 echo "==> Preflight: config + secrets present?"
 "${SSH[@]}" '

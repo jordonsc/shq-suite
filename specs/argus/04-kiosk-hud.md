@@ -3,7 +3,16 @@
 > Sub-spec of [Argus master plan](./00-master.md). Depends on **Phase 2** (`CaseState` channel +
 > still files) and reuses **nyx** for the takeover.
 >
-> **Status: ✅ IMPLEMENTED & SHAPE-VERIFIED (2026-06-18), build warning-free.**
+> **Status: ✅ IMPLEMENTED + LIVE-FIRED on kiosk11 (2026-06-19).** Evolved well
+> beyond the original spec — the takeover is now driven by the WHOLE alarm machine
+> (arming/armed/triggered/authorised), the `/kiosk` WS carries a `CaseState` OR a
+> `{type:"system",mode}` frame, there's a 15s green AUTHORISED dwell on disarm, and
+> the HUD was redesigned + tuned on the real (720×1280 portrait) kiosk. **The
+> authoritative current behaviour is in
+> [`06-refinements.md`](./06-refinements.md)** (0.23.0/0.23.1/0.24.0 + HUD redesign) —
+> trust it over this spec where they differ. Original spec status note follows:
+>
+> **(2026-06-18) ✅ IMPLEMENTED & SHAPE-VERIFIED, build warning-free.**
 > axum HTTP/WS server (`/alarm`, `/stills/:id`, `/kiosk` WS pushing `CaseState`)
 > + the vector sci-fi HUD web app (`argus/web/`, one parametric crimson/emerald
 > frame, intruder cards, ticker, radar sweep, `?demo=1` offline harness) +
