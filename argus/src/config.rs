@@ -21,6 +21,12 @@ pub struct Config {
     pub cameras: Vec<CameraConfig>,
     /// The HA alarm entity Argus subscribes to.
     pub alarm_entity: String,
+    /// Optional HA entity whose state is the human location that tripped the alarm
+    /// (e.g. `input_text.alarm_trigger_room`, set by the existing HA "Alarm
+    /// Sensors" automation to `area_name(trigger.entity_id)`). Read once at case
+    /// open to drive the spoken breach line. Absent = the breach line is generic.
+    #[serde(default)]
+    pub trigger_location_entity: Option<String>,
     /// The assessment-loop cadence + guardrails (Phase 2).
     #[serde(default)]
     pub loop_config: LoopConfig,
@@ -119,9 +125,18 @@ pub struct OverwatchConfig {
     /// AWS Polly voice id for `Verbalise` (default "Amy").
     #[serde(default = "default_voice_id")]
     pub voice_id: String,
-    /// Volume 0.0–1.0 for both the klaxon and spoken lines.
-    #[serde(default = "default_volume")]
-    pub volume: f32,
+    /// Whether to sound the klaxon (`SetAlarm`) at all. `false` = voice-only
+    /// (Argus still speaks, but never starts the siren) — useful for testing
+    /// without distressing pets/neighbours. Default `true`.
+    #[serde(default = "default_true")]
+    pub klaxon_enabled: bool,
+    /// Klaxon (`SetAlarm`) volume 0.0–1.0. The klaxon is LOUD — set low for
+    /// testing. Real-incident value is ~0.9.
+    #[serde(default = "default_klaxon_volume")]
+    pub klaxon_volume: f32,
+    /// Spoken-line (`Verbalise`) volume 0.0–1.0. Real-incident value is ~1.0.
+    #[serde(default = "default_voice_volume")]
+    pub voice_volume: f32,
 }
 
 fn default_overwatch_port() -> u16 {
@@ -136,7 +151,15 @@ fn default_voice_id() -> String {
     "Amy".to_string()
 }
 
-fn default_volume() -> f32 {
+fn default_true() -> bool {
+    true
+}
+
+fn default_klaxon_volume() -> f32 {
+    0.9
+}
+
+fn default_voice_volume() -> f32 {
     1.0
 }
 
@@ -267,16 +290,30 @@ fn default_scan_interval_secs() -> u64 {
 /// Assessment-loop cadence and cost guardrails (Phase 2).
 #[derive(Debug, Clone, Deserialize)]
 pub struct LoopConfig {
-    /// Seconds between assessment ticks while the alarm is triggered.
+    /// Target frame PERIOD in seconds while triggered — the loop aims for one
+    /// assessment every `cadence_secs`, padding only when a tick (the per-camera
+    /// LLM calls) finished faster; a tick that ran longer fires the next promptly.
     #[serde(default = "default_cadence")]
     pub cadence_secs: u64,
     /// Optional daily billable-input-token cap. When exceeded, the loop slows to
     /// `slow_cadence_secs` until UTC midnight. `null`/absent = no cap.
     #[serde(default)]
     pub daily_token_cap: Option<u64>,
-    /// Cadence used once the daily cap is hit.
+    /// The slow frame period (seconds), used when the daily token cap is hit OR
+    /// when the case has gone quiet long enough to decay off Critical (no activity
+    /// for ≥ the elevated-decay window) — no point hammering the cameras when
+    /// nothing is happening. Fresh activity snaps back to `cadence_secs`.
     #[serde(default = "default_slow_cadence")]
     pub slow_cadence_secs: u64,
+    /// Every N ticks, re-sweep ALL cameras regardless of motion (the periodic
+    /// full baseline refresh). The first tick of a case is always a full sweep;
+    /// `0` = never re-sweep after that baseline (motion-gated forever).
+    #[serde(default = "default_full_sweep_every")]
+    pub full_sweep_every: u32,
+    /// A `_motion`/`_person_detected` sensor that switched `off` within this many
+    /// seconds still counts as "recent activity" (debounce window for the gate).
+    #[serde(default = "default_motion_window_secs")]
+    pub motion_window_secs: u64,
 }
 
 impl Default for LoopConfig {
@@ -285,6 +322,8 @@ impl Default for LoopConfig {
             cadence_secs: default_cadence(),
             daily_token_cap: None,
             slow_cadence_secs: default_slow_cadence(),
+            full_sweep_every: default_full_sweep_every(),
+            motion_window_secs: default_motion_window_secs(),
         }
     }
 }
@@ -295,6 +334,14 @@ fn default_cadence() -> u64 {
 
 fn default_slow_cadence() -> u64 {
     30
+}
+
+fn default_full_sweep_every() -> u32 {
+    5
+}
+
+fn default_motion_window_secs() -> u64 {
+    20
 }
 
 /// Home Assistant connection (localhost on atlas).
@@ -330,6 +377,12 @@ pub struct CameraConfig {
     pub entity: String,
     /// Human label included in the prompt, e.g. `Garage`.
     pub label: String,
+    /// The camera's activity `binary_sensor`s (its `_motion` + `_person_detected`).
+    /// On a motion-gated tick the camera is included iff any of these is active
+    /// (per [`crate::ha::RestClient::sensor_active`]). EMPTY = the camera can't be
+    /// motion-gated, so it is ALWAYS included.
+    #[serde(default)]
+    pub motion_entities: Vec<String>,
 }
 
 impl Config {

@@ -39,10 +39,20 @@ pub struct CaseState {
     /// One-line human situation summary (latest), from the live model.
     pub summary: String,
     pub threat_level: ThreatLevel,
+    /// Human location that tripped the alarm (e.g. "Garage", "Entry"), read once
+    /// at case open from the configured trigger-location entity. Drives the spoken
+    /// breach line. `None` if no such entity is configured / set.
+    #[serde(default)]
+    pub trigger_location: Option<String>,
     /// What each camera currently sees (replaced each tick).
     pub locations: Vec<LocationObservation>,
     /// Detected intruders, reconciled by stable `id` across ticks.
     pub intruders: Vec<Intruder>,
+    /// Current threat observations — weapons, aggression, residents in apparent
+    /// danger, signs of forced entry. Free text; re-baselined on each full sweep,
+    /// additively merged on motion-gated partial ticks.
+    #[serde(default)]
+    pub threats: Vec<String>,
     /// Append-only milestones — the dossier + HUD ticker + voice/PD triggers.
     pub timeline: Vec<TimelineEvent>,
     pub updated_at: DateTime<Utc>,
@@ -62,7 +72,9 @@ pub enum CaseStatus {
     Cleared,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Threat severity. `Ord` follows declaration order (`Info < Elevated < Critical`)
+/// so the engine can ratchet UP and decay DOWN by simple comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThreatLevel {
     Info,
@@ -106,12 +118,24 @@ pub struct Intruder {
     pub location: Option<String>,
     /// Current activity.
     pub activity: Option<String>,
+    /// True once this person has been seen visibly armed / carrying a weapon.
+    /// Latched on (only the forensic pass or a clearer view firms it up; a single
+    /// occluded frame should not clear a weapon already established).
+    #[serde(default)]
+    pub armed: bool,
+    /// The weapon if `armed` (e.g. "kitchen knife", "wooden stick"), else None.
+    #[serde(default)]
+    pub weapon: Option<String>,
     /// Ordered best→worst identifying stills.
     pub best_stills: Vec<StillRef>,
     /// True once the Opus forensic pass has produced firm descriptors.
     pub identified: bool,
     /// Richer forensic paragraph from the Opus pass (for the dossier).
     pub dossier: Option<String>,
+    /// A short one-sentence description for the spoken announcement (from the
+    /// forensic pass). The verbalised profile uses this, not the full descriptors.
+    #[serde(default)]
+    pub spoken_summary: Option<String>,
     /// Camera label the live loop currently reports as the best view (drives
     /// still capture + the Opus pass). Transient; not part of the public record
     /// downstream renders, but kept on the struct for reconciliation.
@@ -143,6 +167,9 @@ pub enum TimelineKind {
     CaseOpened,
     IntruderDetected,
     IntruderIdentified,
+    /// A person was seen to be armed / a weapon or threatening object appeared.
+    /// Material milestone: re-pages the security station and speaks a firm line.
+    WeaponDetected,
     BestStillUpgraded,
     ThreatLevelChanged,
     SecurityStationNotified,
@@ -162,8 +189,10 @@ impl CaseState {
             status: CaseStatus::Triggered,
             summary: "Alarm triggered; assessment starting.".to_string(),
             threat_level: ThreatLevel::Elevated,
+            trigger_location: None,
             locations: Vec::new(),
             intruders: Vec::new(),
+            threats: Vec::new(),
             timeline: Vec::new(),
             updated_at: started_at,
             schema_version: SCHEMA_VERSION,
@@ -198,6 +227,10 @@ pub struct LiveAssessment {
     pub person_detected: bool,
     pub locations: Vec<LocationDelta>,
     pub intruders: Vec<IntruderDelta>,
+    /// Weapons / threats / danger signs observed this tick (free text). Argus
+    /// re-baselines `CaseState.threats` from this on a full sweep, unions on a
+    /// partial tick.
+    pub threats: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -218,6 +251,10 @@ pub struct IntruderDelta {
     pub activity: Option<String>,
     /// Which camera label currently has the clearest view of this person.
     pub best_camera_label: Option<String>,
+    /// True if this person is visibly holding/carrying a weapon in the stills.
+    pub armed: bool,
+    /// The weapon if `armed` (e.g. "kitchen knife", "wooden stick"), else null.
+    pub weapon: Option<String>,
 }
 
 /// The forensic (Opus) identification of one intruder's best still. Schema:
@@ -228,6 +265,14 @@ pub struct Identification {
     pub dossier: String,
     pub confidence: f32,
     pub distinguishing_features: String,
+    /// A SHORT one-sentence description for the SPOKEN security announcement
+    /// (build + clothing + one standout feature). The full `descriptors` stay on
+    /// the record / PagerDuty; only this is verbalised.
+    pub spoken_summary: String,
+    /// Whether the forensic pass judges this person to be armed.
+    pub armed: bool,
+    /// The weapon if `armed`, else null.
+    pub weapon: Option<String>,
 }
 
 /// JSON schema for the live assessment, used as `output_config.format`.
@@ -268,13 +313,20 @@ pub fn live_assessment_schema() -> Value {
                         "confidence": { "type": "number", "description": "0.0-1.0 confidence this is a real, identifiable person." },
                         "location": { "type": ["string", "null"], "description": "Current camera label, or null." },
                         "activity": { "type": ["string", "null"], "description": "What they are doing, or null." },
-                        "best_camera_label": { "type": ["string", "null"], "description": "Camera label with the clearest current view of this person, or null." }
+                        "best_camera_label": { "type": ["string", "null"], "description": "Camera label with the clearest current view of this person, or null." },
+                        "armed": { "type": "boolean", "description": "True if holding/carrying a weapon OR an object plausibly consistent with one (blade, firearm, bat, stick, tool, or an elongated/pointed/metallic object). Lean toward flagging during an active intrusion; only a clearly-recognised benign object (phone, remote, cup) is not a weapon." },
+                        "weapon": { "type": ["string", "null"], "description": "Name of the weapon if armed (e.g. \"kitchen knife\"); hedge if unsure (e.g. \"possible knife\", \"elongated object, possibly a blade\"); else null." }
                     },
-                    "required": ["id", "descriptors", "confidence", "location", "activity", "best_camera_label"]
+                    "required": ["id", "descriptors", "confidence", "location", "activity", "best_camera_label", "armed", "weapon"]
                 }
+            },
+            "threats": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Weapons, threatening objects, aggression, residents in apparent danger, or signs of forced entry visible this tick. Empty if none."
             }
         },
-        "required": ["summary", "threat_level", "person_detected", "locations", "intruders"]
+        "required": ["summary", "threat_level", "person_detected", "locations", "intruders", "threats"]
     })
 }
 
@@ -287,9 +339,12 @@ pub fn identification_schema() -> Value {
             "descriptors": { "type": "string", "description": "Firm physical descriptors anchored on the best still." },
             "dossier": { "type": "string", "description": "A short forensic paragraph for the security-station dossier." },
             "confidence": { "type": "number", "description": "0.0-1.0 confidence in this identification." },
-            "distinguishing_features": { "type": "string", "description": "Tattoos, scars, logos, gait, carried items — anything that aids identification." }
+            "distinguishing_features": { "type": "string", "description": "Tattoos, scars, logos, gait, carried items — anything that aids identification." },
+            "spoken_summary": { "type": "string", "description": "A SHORT single sentence (max ~18 words) for a spoken security announcement: sex, approx age, build, key clothing, and one standout feature. No preamble. E.g. 'Caucasian male, forties, navy t-shirt, grey track pants, full red beard.'" },
+            "armed": { "type": "boolean", "description": "True if holding/carrying a weapon OR an object plausibly consistent with one (blade, firearm, bat, stick, tool, elongated/pointed/metallic object) — this is the clearest frame, scrutinise the hands. Only a clearly-recognised benign object (phone, remote, cup) is not a weapon." },
+            "weapon": { "type": ["string", "null"], "description": "Name of the weapon if armed; hedge if unsure (e.g. \"possible knife\"); else null." }
         },
-        "required": ["descriptors", "dossier", "confidence", "distinguishing_features"]
+        "required": ["descriptors", "dossier", "confidence", "distinguishing_features", "spoken_summary", "armed", "weapon"]
     })
 }
 

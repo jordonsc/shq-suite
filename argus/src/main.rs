@@ -24,7 +24,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
 use tokio::sync::{mpsc, watch};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use config::Config;
@@ -42,6 +42,13 @@ struct Cli {
     /// Run a single assessment cycle now (no alarm) and print the CaseState.
     #[arg(long)]
     once: bool,
+
+    /// Dry-voice mode: run the full voice gate but LOG every line/klaxon instead
+    /// of contacting Overwatch (no real TTS or klaxon). Overrides `overwatch:` and
+    /// forces the outputs consumer to run. Use it on a live (scratch-alarm) test to
+    /// see exactly what WOULD be verbalised.
+    #[arg(long)]
+    dry_voice: bool,
 }
 
 #[tokio::main]
@@ -102,10 +109,28 @@ async fn main() -> Result<()> {
     // Phase 3 outputs. Voice spawns iff `overwatch:` is configured; PagerDuty iff
     // a non-empty `routing_key` is present. An absent block / empty key disables
     // that channel — neither is a hard blocker. Both log on failure, never crash.
-    let voice = cfg.overwatch.as_ref().map(|o| {
-        info!(host = %o.host, port = o.port, "Voice output enabled (Overwatch gRPC)");
-        out::voice::VoiceClient::new(&o.host, o.port, o.alarm_id.clone(), o.voice_id.clone(), o.volume)
-    });
+    let voice = if cli.dry_voice {
+        warn!("Dry-voice mode: spoken lines + klaxon will be LOGGED, not sent (Overwatch not contacted)");
+        Some(out::voice::VoiceClient::new_dry())
+    } else {
+        cfg.overwatch.as_ref().map(|o| {
+            info!(
+                host = %o.host, port = o.port,
+                klaxon_enabled = o.klaxon_enabled,
+                klaxon_volume = o.klaxon_volume, voice_volume = o.voice_volume,
+                "Voice output enabled (Overwatch gRPC)"
+            );
+            out::voice::VoiceClient::new(
+                &o.host,
+                o.port,
+                o.alarm_id.clone(),
+                o.voice_id.clone(),
+                o.klaxon_enabled,
+                o.klaxon_volume,
+                o.voice_volume,
+            )
+        })
+    };
     let pagerduty = cfg.pagerduty.as_ref().and_then(|p| {
         if p.routing_key.trim().is_empty() {
             info!("PagerDuty configured but routing_key empty; PagerDuty output disabled");

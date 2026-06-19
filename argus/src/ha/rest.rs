@@ -78,6 +78,41 @@ impl RestClient {
         Ok(v.get("state").and_then(|s| s.as_str()).map(str::to_string))
     }
 
+    /// Decide whether an activity `binary_sensor` is currently signalling.
+    ///
+    /// Returns `true` if `state == "on"`, OR if `state == "off"` AND its
+    /// `last_changed` (RFC3339) is within `window_secs` of now — so a sensor that
+    /// just dropped still counts as recent activity (debounce). EVERY other case —
+    /// an `unavailable`/`unknown` state, a missing entity, a parse failure, or a
+    /// transport error — returns `false` (treated as "no signal", never panics).
+    /// This means an `unavailable` `_motion` sensor is simply ignored and its
+    /// sibling `_person_detected` carries the gate.
+    pub async fn sensor_active(&self, entity: &str, window_secs: u64) -> bool {
+        let url = format!("{}/api/states/{}", self.base_url, entity);
+        let resp = match self.http.get(&url).bearer_auth(&self.token).send().await {
+            Ok(r) if r.status().is_success() => r,
+            _ => return false,
+        };
+        let v: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        match v.get("state").and_then(|s| s.as_str()) {
+            Some("on") => true,
+            Some("off") => {
+                let Some(last) = v.get("last_changed").and_then(|s| s.as_str()) else {
+                    return false;
+                };
+                let Ok(ts) = chrono::DateTime::parse_from_rfc3339(last) else {
+                    return false;
+                };
+                let age = chrono::Utc::now().signed_duration_since(ts.with_timezone(&chrono::Utc));
+                age.num_seconds() >= 0 && (age.num_seconds() as u64) <= window_secs
+            }
+            _ => false,
+        }
+    }
+
     /// Call an HA service: `POST /api/services/<domain>/<service>` with `data`
     /// as the JSON body. Used by the Phase 4 kiosk takeover to drive
     /// `shq_display.navigate`. Errors (non-2xx, transport) are returned, not

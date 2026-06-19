@@ -178,6 +178,8 @@ fn custom_details(state: &CaseState, offsite: Option<&OffsiteConfig>) -> Value {
                 "descriptors": i.descriptors,
                 "confidence": i.confidence,
                 "identified": i.identified,
+                "armed": i.armed,
+                "weapon": i.weapon,
                 "location": i.location,
                 "activity": i.activity,
                 "dossier": i.dossier,
@@ -208,6 +210,7 @@ fn custom_details(state: &CaseState, offsite: Option<&OffsiteConfig>) -> Value {
         "started_at": state.started_at,
         "updated_at": state.updated_at,
         "intruders": intruders,
+        "threats": state.threats,
         "timeline": timeline,
     });
 

@@ -69,7 +69,10 @@ impl Completion {
     }
 }
 
-/// Anthropic client pinned to one model.
+/// Anthropic client pinned to one model. `Clone` is cheap (the `reqwest::Client`
+/// is an `Arc` internally) so the forensic (Opus) client can be moved into a
+/// spawned task to run concurrently with the live loop.
+#[derive(Clone)]
 pub struct AnthropicClient {
     http: reqwest::Client,
     api_key: String,

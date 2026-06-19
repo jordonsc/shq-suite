@@ -38,11 +38,12 @@ use voice::VoiceClient;
 /// - `offsite` is passed (clone of config) so the PagerDuty dossier can embed the
 ///   deterministic S3 case prefix without any runtime S3 call.
 ///
-/// On a successful PagerDuty `trigger` for a **material** event, we speak the
-/// `security_station_notified` line DIRECTLY (M1): Phase 3 cannot mutate the
-/// engine-owned `CaseState`, so we can't push a `SecurityStationNotified`
-/// timeline event for the gate to pick up. Surfacing it in the HUD ticker (via a
-/// feedback channel back to the engine) is a noted future.
+/// Voice and PagerDuty are driven purely off the timeline diff: the gate
+/// ([`voice_policy::lines_for`]) decides what (if anything) is spoken per event,
+/// and material events re-`trigger` PagerDuty with the latest dossier. The
+/// `intruder_identified` milestone is where the intruder *profile* reaches the
+/// security station (PagerDuty `custom_details`); the speaker only states it was
+/// sent.
 pub async fn run(
     mut rx: watch::Receiver<Option<CaseState>>,
     voice: Option<VoiceClient>,
@@ -101,9 +102,9 @@ async fn route_event(
     speech_tx: Option<&mpsc::Sender<String>>,
     pd: Option<&PagerDuty>,
 ) {
-    // ── Voice channel: positive-only gate → queued speech ───────────────────
+    // ── Voice channel: gate → queued speech (zero or more lines) ─────────────
     if let Some(tx) = speech_tx {
-        if let Some(line) = voice_policy::line_for(event, state) {
+        for line in voice_policy::lines_for(event, state) {
             // Bounded, non-blocking: if the queue is somehow full we drop rather
             // than stall the loop (speech is best-effort intimidation, not record).
             if tx.try_send(line.text).is_err() {
@@ -125,19 +126,9 @@ async fn route_event(
             TimelineKind::CaseOpened
             | TimelineKind::IntruderDetected
             | TimelineKind::IntruderIdentified
+            | TimelineKind::WeaponDetected
             | TimelineKind::ThreatLevelChanged => {
                 pd.trigger(state, Some(offsite)).await;
-                // M1: speak the security-station line directly on a successful-ish
-                // path. We don't get a hard ack from `send` (it logs internally),
-                // so for the open event we announce notification. Bind it to
-                // CaseOpened only to avoid repeating the line on every update.
-                if event.kind == TimelineKind::CaseOpened {
-                    if let Some(tx) = speech_tx {
-                        let _ = tx.try_send(
-                            "Security station has received your image and location.".to_string(),
-                        );
-                    }
-                }
             }
             TimelineKind::Standdown | TimelineKind::Cleared => {
                 pd.resolve(state).await;
@@ -168,7 +159,14 @@ fn spawn_voice_worker(client: VoiceClient) -> mpsc::Sender<String> {
             match msg.as_str() {
                 ALARM_ON => client.set_alarm(true).await,
                 ALARM_OFF => client.set_alarm(false).await,
-                line => client.verbalise(line).await,
+                line => {
+                    // `verbalise` requests blocking playback (`await_playback=true`),
+                    // so this RPC only returns after Overwatch finishes PLAYING the
+                    // clip — not just after synthesis. The serial worker therefore
+                    // paces itself naturally and lines never overlap; no local timing
+                    // estimate is needed.
+                    client.verbalise(line).await;
+                }
             }
         }
         debug!("outputs: voice worker stopped");
