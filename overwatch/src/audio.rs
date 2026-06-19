@@ -16,6 +16,12 @@ pub enum AudioCommand {
     PlayBytes {
         data: Vec<u8>,
         volume: f32,
+        /// If true, block the audio thread until the clip finishes playing
+        /// (`sink.sleep_until_end()`) so the oneshot — and thus the RPC — only
+        /// returns after playback. Tradeoff: a blocking clip defers other audio
+        /// commands (e.g. StopAlarm) on the single audio thread by up to the clip
+        /// length; the looping klaxon sink keeps sounding meanwhile.
+        blocking: bool,
         response: oneshot::Sender<anyhow::Result<()>>,
     },
     StartAlarm {
@@ -79,12 +85,16 @@ impl AudioManager {
         response_rx.await?
     }
 
-    pub async fn play_bytes(&self, data: Vec<u8>, volume: f32) -> anyhow::Result<()> {
+    /// Play raw decoded audio bytes. When `blocking` is true the call resolves only
+    /// after playback finishes (the audio thread holds on `sink.sleep_until_end()`);
+    /// when false it detaches the sink and returns immediately (fire-and-forget).
+    pub async fn play_bytes(&self, data: Vec<u8>, volume: f32, blocking: bool) -> anyhow::Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(AudioCommand::PlayBytes {
                 data,
                 volume,
+                blocking,
                 response: response_tx,
             })
             .map_err(|_| anyhow::anyhow!("Audio thread died"))?;
@@ -138,8 +148,12 @@ impl AudioManagerInner {
                             let result = self.play_file_inner(&path, volume);
                             let _ = response.send(result);
                         }
-                        AudioCommand::PlayBytes { data, volume, response } => {
-                            let result = self.play_bytes_inner(data, volume);
+                        AudioCommand::PlayBytes { data, volume, blocking, response } => {
+                            let result = if blocking {
+                                self.play_bytes_blocking_inner(data, volume)
+                            } else {
+                                self.play_bytes_inner(data, volume)
+                            };
                             let _ = response.send(result);
                         }
                         AudioCommand::StartAlarm {
@@ -194,6 +208,22 @@ impl AudioManagerInner {
         sink.set_volume(volume);
         sink.append(source);
         sink.detach();
+        Ok(())
+    }
+
+    /// Identical to `play_bytes_inner` but blocks the audio thread until the clip
+    /// finishes (`sink.sleep_until_end()` instead of `sink.detach()`), so the
+    /// caller's oneshot — and thus the RPC — returns only after playback completes.
+    /// Note: this defers any other audio command (e.g. StopAlarm) on the single
+    /// audio thread by up to the clip length; the looping klaxon sink keeps
+    /// sounding meanwhile.
+    fn play_bytes_blocking_inner(&self, data: Vec<u8>, volume: f32) -> anyhow::Result<()> {
+        let cursor = std::io::Cursor::new(data);
+        let source = Decoder::new(cursor)?;
+        let sink = Sink::try_new(&self.stream_handle)?;
+        sink.set_volume(volume);
+        sink.append(source);
+        sink.sleep_until_end();
         Ok(())
     }
 

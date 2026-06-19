@@ -104,6 +104,7 @@ impl VoiceService for VoiceServiceImpl {
         let text = req.text;
         let notification_tone_id = req.notification_tone_id;
         let voice_id = req.voice_id;
+        let await_playback = req.await_playback.unwrap_or(false);
 
         tracing::info!(
             "Verbalising text: '{}' with tone={:?}, voice={:?}",
@@ -182,9 +183,11 @@ impl VoiceService for VoiceServiceImpl {
                 ))
             })?;
 
-        // Play synthesized audio
+        // Play synthesized audio. When await_playback is set, this blocks until the
+        // clip finishes (no overlapping speech); otherwise it returns immediately
+        // after synthesis (default = unchanged HA TTS behaviour).
         self.audio_manager
-            .play_bytes(audio_data, volume)
+            .play_bytes(audio_data, volume, await_playback)
             .await
             .map_err(|e| Status::internal(format!("Audio playback failed: {}", e)))?;
 

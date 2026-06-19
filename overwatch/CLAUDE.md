@@ -10,7 +10,7 @@ Rust gRPC server for text-to-speech (AWS Polly) and alarm playback. Runs on a de
 | `src/config.rs` | YAML config parsing (AWS creds, voices, sound paths) |
 | `src/service.rs` | gRPC service impl — SetAlarm + Verbalise + PlayTone handlers |
 | `src/tts.rs` | AWS Polly TTS — synthesises speech, caches audio |
-| `src/audio.rs` | Audio playback via rodio (ALSA backend); also the alarm loop (`start_alarm_inner` plays klaxons via `repeat_infinite` until stopped) |
+| `src/audio.rs` | Audio playback via rodio (ALSA backend); also the alarm loop (`start_alarm_inner` plays klaxons via `repeat_infinite` until stopped). `play_bytes(.., blocking)` selects `play_bytes_inner` (detach, fire-and-forget) vs `play_bytes_blocking_inner` (`sleep_until_end`, blocks the audio thread until the clip finishes) — the latter drives Verbalise's `await_playback` |
 | `proto/voice.proto` | gRPC service definition (source of truth) |
 | `build.rs` | Compiles proto at build time via tonic-build |
 
@@ -34,6 +34,7 @@ service VoiceService {
 - `notification_tone_id`: optional tone to play first (e.g. "notify", "warn", "error")
 - `voice_id`: optional AWS Polly voice (default "Amy")
 - `volume`: optional 0.0-1.0
+- `await_playback`: optional bool (default `false`). When `false` (default — unchanged HA TTS behaviour), the RPC returns after **synthesis** and the sink is detached (`play_bytes_inner`), so concurrent calls mix/overlap. When `true`, playback uses `sink.sleep_until_end()` (`play_bytes_blocking_inner`) so the RPC blocks until the clip **finishes playing** — used by Argus to serialise speech without timing guesses. Tradeoff: a blocking clip holds the single audio thread for the clip length, deferring other audio commands (e.g. StopAlarm); the looping klaxon sink keeps sounding meanwhile.
 
 ### PlayTone
 - `tone_id`: string key from the `notification_tones` config map (same files Verbalise plays as a prefix) — e.g. "notify", "warn", "error"
