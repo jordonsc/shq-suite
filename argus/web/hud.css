@@ -58,6 +58,33 @@
   --pulse-alpha: 0.06;
 }
 
+/* ARMING — amber caution. Distinct from the calm steel ARMED standby: the
+   perimeter is securing, stand clear. A warning pulse runs on the centre
+   emblem/ring (same family as armed, but reads as caution, not calm). */
+[data-state="arming"] {
+  --hud: #ffb020;
+  --hud-dim: #6e4c0c;
+  --hud-glow: #ffc44d;
+  --hud-ink: #ffce6b;
+  --hud-rgb: 255, 176, 32;
+  --pulse-rate: 1.8s;
+  --pulse-alpha: 0.12;
+}
+/* warning pulse on the standby centre (emblem + ring) while arming */
+[data-state="arming"] .emblem,
+[data-state="arming"] .standby-ring {
+  animation: armingPulse 1.4s ease-in-out infinite;
+  transform-origin: center;
+}
+@keyframes armingPulse {
+  0%, 100% { opacity: 0.55; }
+  50%      { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-state="arming"] .emblem,
+  [data-state="arming"] .standby-ring { animation: none !important; }
+}
+
 /* ---- Reset --------------------------------------------------------------- */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -140,6 +167,48 @@ body {
 }
 @media (prefers-reduced-motion: reduce) {
   .pulse-border, .radar, .scanline, .standby-ring circle { animation: none !important; }
+}
+
+/* =============================================================================
+   LIFE-THREATENING urgency — an EXTRA cue layered over the shared red theme.
+   threat_present stays the base crimson pulse; life_threatening reads as more
+   urgent: a stronger/faster border glow PLUS a full-frame vignette throb and a
+   throbbing headline. Removed automatically when data-threat clears (de-escalation).
+   ============================================================================= */
+[data-threat="life_threatening"] .pulse-border {
+  /* punch the inset glow harder than the threat-keyed --pulse-alpha alone */
+  box-shadow:
+    inset 0 0 0 2px rgba(var(--hud-rgb), 0.45),
+    inset 0 0 90px rgba(var(--hud-rgb), calc(var(--pulse-alpha) + 0.18));
+}
+/* full-frame vignette throb — its own overlay so it stacks over the border */
+[data-threat="life_threatening"] .hud::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  background: radial-gradient(120% 100% at 50% 50%,
+    transparent 52%, rgba(var(--hud-rgb), 0.34) 100%);
+  animation: vignettePulse var(--pulse-rate) ease-in-out infinite;
+  will-change: opacity;
+}
+@keyframes vignettePulse {
+  0%, 100% { opacity: 0.2; }
+  50%      { opacity: 1; }
+}
+/* the headline itself throbs at life-threat */
+[data-threat="life_threatening"] .headline {
+  animation: headlinePulse var(--pulse-rate) ease-in-out infinite;
+  will-change: opacity, text-shadow;
+}
+@keyframes headlinePulse {
+  0%, 100% { opacity: 0.78; text-shadow: 0 0 26px rgba(var(--hud-rgb), 0.5); }
+  50%      { opacity: 1;    text-shadow: 0 0 44px rgba(var(--hud-rgb), 0.9); }
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-threat="life_threatening"] .hud::after,
+  [data-threat="life_threatening"] .headline { animation: none !important; }
 }
 
 /* =============================================================================

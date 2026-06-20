@@ -306,7 +306,10 @@ async fn send_status(socket: &mut WebSocket, state: &Option<CaseState>) -> Resul
             "case_id": c.case_id,
             "case_status": c.status,
             "threat_level": c.threat_level,
-            "intruder_count": c.intruders.len(),
+            // The HA component's "Intruder Count" sensor reads this field — keep
+            // the name, but count only PERSONS OF CONCERN (intruder-dominant), not
+            // every person present (a resident/guest is not an "intruder").
+            "intruder_count": c.persons.iter().filter(|p| p.is_subject_of_concern()).count(),
             "summary": c.summary,
             "updated_at": c.updated_at,
         }),

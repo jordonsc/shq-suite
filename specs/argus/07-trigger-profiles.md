@@ -1,7 +1,10 @@
 # Phase 7 — Trigger Profiles (tiered response)
 
-> Sub-spec of the [Argus master plan](./00-master.md). **Status: 🟢 4a + 4b LANDED
-> + precision pass (0.31.0).** Phase 4a (argus 0.28.0) laid the rails —
+> Sub-spec of the [Argus master plan](./00-master.md). **Status: 🟢 LANDED;
+> COLLAPSED TO TWO FLOWS + persons model (0.33.0) — see [Phase 8](#phase-8--collapse-to-two-flows--persons-response-model-argus-0330)
+> for the current shape; the Phase 4a/4b/precision/standdown history below is
+> retained for context but the THREE-profile / `classify_investigate` design it
+> describes is superseded.** Phase 4a (argus 0.28.0) laid the rails —
 > `TriggerProfile` + per-source config + the dormant output/kiosk gate, all
 > defaulting to `Alarm` so an existing case is byte-for-byte unchanged. **Phase 4b
 > (argus 0.29.0)** makes the softer profiles work: the escalation/promotion engine,
@@ -263,3 +266,58 @@ panel-independent fixes:
   no-loop guard is intact:** `mark_promoted` (idempotent on `ActiveCase.escalated`)
   flips the case ungated FIRST, so the script-raised panel `Triggered` is RECONCILED
   by `handle` (a case is already active → no second case, no re-open).
+
+## Phase 8 — collapse to TWO flows + persons response model (argus 0.33.0)
+
+The three-profile design proved over-built and the perimeter `Investigate` flow's
+**resident-profiling crutch** (`classify_investigate` deriving Visitor/Intruder/
+FalseAlarm from a `resident_awareness` enum) never read reliably. It is **ditched**.
+Argus now has exactly **two flows**:
+
+- **`Alarm`** — confirmed breach, full immediate outputs. Unchanged.
+- **`Investigate`** — *the old `General` doorstep flow, rebranded* (serde
+  `alias = "general"` loads old journals). A presumed-benign approach (e.g. a person
+  at the front door): GATED/silent, shallow (Sonnet-only, no Opus unless escalated),
+  promotes to full `Alarm` (klaxon + real-panel trip) ONLY on **structured** danger —
+  an armed person, an injury, `in_duress ≥ DURESS_FLOOR` (0.5), or a model `critical`
+  read — else a quiet standdown after `INVESTIGATE_STANDDOWN_TICKS` (4). NO free-text
+  scanning (the 2026-06-20 false-alarm lesson). The ≥2-tick `apply_persistence` gate,
+  the kill switch, and the script-trip are all unchanged.
+
+The perimeter `Investigate` profile, `InvestigateOutcome`, `ResidentAwareness`,
+`classify_investigate`, `awareness_rank`, the `investigate_deadline`, the
+free-text `obvious_threat`/`resident_in_danger`/`threats_mention` scanners, and the
+audible investigate voice loop are all **removed**.
+
+**Response object → `persons[]`.** The intruder-centric `intruders[]` /
+`Intruder` / `IntruderDelta` became `persons[]` / `Person` / `PersonDelta` — Argus
+can't presume anyone is an intruder. Each person carries independent
+`resident_confidence` / `guest_confidence` / `intruder_confidence`, plus `armed` /
+`weapon` / `injury` / `in_duress` (0–1) / `id_score` (renamed from `id_quality`). A
+person whose intruder confidence dominates (`Person::is_subject_of_concern`, floor
+`CONCERN_INTRUDER_FLOOR` 0.34) is the "intruder" the voice/HUD/PagerDuty/timeline
+speak of. New case field `malicious_activity[]` and two once-off milestones —
+`InjuryDetected` (casualty voice line + PD re-page) and `MaliciousActivity`
+(voice-only). `SCHEMA_VERSION` → 2.
+
+**Resident reference photos DROPPED.** The `resident_photos` config + the Opus
+resident-image anchor are gone; Opus IDs every subject as unknown, and the model's
+text-only `resident_confidence` (from the seed's residents summary) is the sole
+resident signal.
+
+**Prompts.** A universal `SYSTEM_PROMPT` (role + threat-level rubric + assessment
+rules) is prepended to the premises seed as the cached `system` block; the per-tick
+message is a short per-scenario opener — `ALARM_PROMPT`, `INVESTIGATE_TRIGGER_PROMPT`
+(the camera that fired), or `INVESTIGATE_ANCILLARY_PROMPT` (the other cameras during
+an Investigate case, selected by `is_trigger_camera` matching the camera's zone to
+`trigger_location`). `IDENTIFY_INSTRUCTION` dropped the resident-reference paragraph
+and gained an `injury` field.
+
+**Re-arm standdown.** `AlarmModeChanged → Arming/Armed` while a gated case is active
+now stands it down (alongside the existing disarm + kill-switch paths) —
+satisfying the "alarm re-armed → Argus standdown" automation.
+
+**HA automations (user-owned, applied separately):** front-door person detected →
+fire the `investigate` trigger entity; alarm triggered → the alarm panel (unchanged);
+disarm/re-arm → standdown. Argus owns klaxon/voice/kiosks/PagerDuty; HA owns
+triggering + ancillary actions (visitor chime, incident lighting).

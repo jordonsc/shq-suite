@@ -233,6 +233,7 @@ async fn route_event(
             | TimelineKind::IntruderDetected
             | TimelineKind::IntruderIdentified
             | TimelineKind::WeaponDetected
+            | TimelineKind::InjuryDetected
             | TimelineKind::ThreatLevelChanged => {
                 pd.trigger(state, Some(offsite)).await;
             }
@@ -307,45 +308,24 @@ mod tests {
         }
     }
 
-    /// THE GATE SPLIT (c): a gated `Investigate` case routes its 0.7 announce VOICE
-    /// line on `CaseOpened`, but NO klaxon (a hard output) — and `route_event`
-    /// returns before any PagerDuty (passed `None` here; the early-return is the
-    /// proof the PD block is never reached).
+    /// THE GATE: a gated `Investigate` case routes NOTHING on `CaseOpened` — the
+    /// double-check is silent until it escalates: no voice line, no klaxon (a hard
+    /// output), and `route_event` returns before any PagerDuty.
     #[tokio::test]
-    async fn gated_investigate_speaks_but_no_klaxon_or_pd() {
+    async fn gated_investigate_routes_nothing() {
         let (tx, mut rx) = mpsc::channel::<VoiceMsg>(8);
         let voice_gen = AtomicU64::new(0);
         let offsite = OffsiteConfig::default();
 
         let mut state = CaseState::new("case-inv".to_string(), Utc::now(), TriggerProfile::Investigate);
-        state.trigger_location = Some("Backyard".to_string());
+        state.trigger_location = Some("Front Door".to_string());
         let ev = opened();
 
         route_event(&ev, &state, &offsite, None, Some(&tx), &voice_gen, None).await;
 
         let (spoken, klaxon) = drain(&mut rx);
-        assert_eq!(spoken.len(), 1, "the investigate announce must be spoken");
-        assert_eq!(spoken[0].0, "Security alert, Backyard, investigating.");
-        assert_eq!(spoken[0].1, Some(0.7), "spoken at 0.7, not full volume");
-        assert_eq!(klaxon, 0, "a gated investigate case must NOT sound the klaxon");
-    }
-
-    /// THE GATE SPLIT (c): a gated `General` case routes NOTHING on `CaseOpened` —
-    /// no voice line (the policy is silent for gated General) and no klaxon.
-    #[tokio::test]
-    async fn gated_general_routes_nothing() {
-        let (tx, mut rx) = mpsc::channel::<VoiceMsg>(8);
-        let voice_gen = AtomicU64::new(0);
-        let offsite = OffsiteConfig::default();
-
-        let state = CaseState::new("case-gen".to_string(), Utc::now(), TriggerProfile::General);
-        let ev = opened();
-
-        route_event(&ev, &state, &offsite, None, Some(&tx), &voice_gen, None).await;
-
-        let (spoken, klaxon) = drain(&mut rx);
-        assert!(spoken.is_empty(), "a gated General case is fully silent on open");
-        assert_eq!(klaxon, 0, "no klaxon for a gated General case");
+        assert!(spoken.is_empty(), "a gated Investigate case is silent on open");
+        assert_eq!(klaxon, 0, "a gated Investigate case must NOT sound the klaxon");
     }
 
     /// A real (non-gated) `Alarm` case is UNCHANGED: the breach line + the klaxon

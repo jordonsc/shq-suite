@@ -23,90 +23,47 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-/// Bumped if the on-disk / broadcast shape changes incompatibly.
-pub const SCHEMA_VERSION: u32 = 1;
+/// Bumped if the on-disk / broadcast shape changes incompatibly. v2: the
+/// intruder-centric model became persons-with-confidences (`intruders` →
+/// `persons`, with resident/guest/intruder confidences, injury, in_duress) and
+/// added `malicious_activity`.
+pub const SCHEMA_VERSION: u32 = 2;
 
 // ───────────────────────────── Trigger profiles ─────────────────────────────
 
 /// Why Argus was woken, which selects the case's initial posture and — crucially
 /// — **whether its outputs are gated** until Argus confirms a threat. Designed in
-/// `specs/argus/07-trigger-profiles.md`. **Phase 4a lays the rails only**: every
-/// real trigger today is the house alarm → `Alarm`, so the softer profiles exist
-/// but are not yet exercised, and the gate is dormant.
+/// `specs/argus/07-trigger-profiles.md`. Two flows: `Alarm` (a confirmed breach —
+/// full immediate outputs) and `Investigate` (a presumed-benign approach — a
+/// gated, silent double-check that only escalates to `Alarm` on structured
+/// danger).
 ///
 /// `#[serde(default)]` to `Alarm` so an old journal (no `trigger_profile` field)
-/// deserialises to today's full-posture behaviour.
+/// deserialises to today's full-posture behaviour. The retired `general` flow's
+/// journals deserialise to `Investigate` via the serde alias (it was rebranded).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TriggerProfile {
-    /// Confirmed intrusion (the house alarm) — full immediate outputs. Today's
-    /// behaviour; the others are added beside it.
+    /// Confirmed intrusion (the house alarm) — full immediate outputs.
     #[default]
     Alarm,
-    /// Perimeter activity while secured — a gated, silent assessment that only
-    /// escalates to outputs if Argus concludes a real threat (Phase 4b).
+    /// A presumed-benign approach (e.g. a person at the front door) — a gated,
+    /// silent, shallow double-check that escalates to `Alarm` only on structured
+    /// danger (model `critical`, an armed person, an injury, or duress), else a
+    /// quiet standdown. (The retired `general` profile rebranded.)
+    #[serde(alias = "general")]
     Investigate,
-    /// A benign doorstep approach — a gated, fast/shallow triage (Phase 4b).
-    General,
 }
 
 impl TriggerProfile {
     /// The threat level a fresh case of this profile opens at. `Alarm` assumes an
-    /// intrusion in progress (`Elevated`); the gated profiles start at `Info`.
+    /// intrusion in progress (`Elevated`); `Investigate` starts at `Info`.
     pub fn initial_threat(self) -> ThreatLevel {
         match self {
-            TriggerProfile::Alarm => ThreatLevel::Elevated,
-            TriggerProfile::Investigate | TriggerProfile::General => ThreatLevel::Info,
+            TriggerProfile::Alarm => ThreatLevel::ThreatPresent,
+            TriggerProfile::Investigate => ThreatLevel::Benign,
         }
     }
-}
-
-// ───────────────────────────── Investigate smart-alarm outcome ──────────────
-
-/// The smart-alarm classification the engine derives each tick for an active
-/// `Investigate` case — the "what is this perimeter activity?" verdict that drives
-/// the audible investigate loop (announce → assess → resolve). Distinct from
-/// `ThreatLevel` (severity) and `TriggerProfile` (posture): it is the *decision*.
-///
-/// - `Threat`/`Intruder` resolve to **promote** (full `Alarm` + real-alarm trip,
-///   subject to the ≥2-tick persistence gate).
-/// - `Visitor`/`FalseAlarm` resolve to a **quiet stand down** (no alarm).
-/// - `Undetermined` keeps assessing until the investigate deadline, then stands
-///   down (treated as benign).
-///
-/// `#[serde(rename_all="snake_case")]` for the journal; Default `Undetermined`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum InvestigateOutcome {
-    /// A new (non-resident) person AND residents are absent OR present-but-unaware.
-    Intruder,
-    /// A weapon / ski-mask / face-concealment on a new (non-resident) person.
-    Threat,
-    /// A new person BUT residents are present and visibly engaging them.
-    Visitor,
-    /// The person who tripped it is actually a resident — no genuine stranger.
-    FalseAlarm,
-    /// Not enough signal yet; keep assessing.
-    #[default]
-    Undetermined,
-}
-
-/// The model's read of whether the residents are present and AWARE of / engaging
-/// the newcomer — the signal that separates a `Visitor` (engaged) from an
-/// `Intruder` (absent or oblivious). Optional on the live assessment; only the
-/// `Investigate` outcome classifier consumes it. Default `Unknown`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum ResidentAwareness {
-    /// No residents visible / present in the scene.
-    ResidentsAbsent,
-    /// Residents are present but oblivious to the newcomer (not interacting).
-    ResidentsPresentUnaware,
-    /// Residents are present AND engaging the newcomer (waving, talking, relaxed).
-    ResidentsPresentEngaging,
-    /// Can't tell from this frame.
-    #[default]
-    Unknown,
 }
 
 impl std::str::FromStr for TriggerProfile {
@@ -116,10 +73,9 @@ impl std::str::FromStr for TriggerProfile {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
             "alarm" => Ok(TriggerProfile::Alarm),
-            "investigate" => Ok(TriggerProfile::Investigate),
-            "general" => Ok(TriggerProfile::General),
+            "investigate" | "general" => Ok(TriggerProfile::Investigate),
             other => Err(format!(
-                "unknown trigger profile {other:?} (expected alarm|investigate|general)"
+                "unknown trigger profile {other:?} (expected alarm|investigate)"
             )),
         }
     }
@@ -153,22 +109,40 @@ pub struct CaseState {
     /// breach line. `None` if no such entity is configured / set.
     #[serde(default)]
     pub trigger_location: Option<String>,
-    /// For an `Investigate` case: the engine's latest derived smart-alarm
-    /// classification (`classify_investigate`) — journalled so the HUD / record
-    /// shows the verdict. Ignored (left `Undetermined`) for the other profiles.
-    #[serde(default)]
-    pub investigate_outcome: InvestigateOutcome,
     /// What each camera currently sees (replaced each tick).
     pub locations: Vec<LocationObservation>,
-    /// Detected intruders, reconciled by stable `id` across ticks.
-    pub intruders: Vec<Intruder>,
+    /// People assessed this case, reconciled by stable `id` across ticks. Each
+    /// carries resident/guest/intruder confidences — Argus cannot presume anyone
+    /// is an intruder; a person whose intruder confidence dominates is a "subject
+    /// of concern" (`Person::is_subject_of_concern`), which the voice/HUD/PD/
+    /// timeline vocabulary calls an "intruder".
+    #[serde(default)]
+    pub persons: Vec<Person>,
     /// Current threat observations — weapons, aggression, residents in apparent
     /// danger, signs of forced entry. Free text; re-baselined on each full sweep,
     /// additively merged on motion-gated partial ticks.
     #[serde(default)]
     pub threats: Vec<String>,
+    /// Terse malicious actions observed in the scene (e.g. "breaking into car",
+    /// "smashed window"). Re-baselined on a full sweep, unioned on a partial tick
+    /// (same rule as `threats`).
+    #[serde(default)]
+    pub malicious_activity: Vec<String>,
     /// Append-only milestones — the dossier + HUD ticker + voice/PD triggers.
     pub timeline: Vec<TimelineEvent>,
+    /// The priority MAIN image for the HUD primary pane (the large primary view).
+    /// Captured from the frames already grabbed this tick — NOT concern-gated, so
+    /// the kiosk is never blank when there is ANY activity (even an ambiguous /
+    /// resident-only frame). Priority-ranked + sticky-downward: a higher-rank
+    /// category replaces a lower one, but a lower one never displaces a higher.
+    /// `#[serde(default)]` so old journals (no field) still deserialise.
+    #[serde(default)]
+    pub main_still: Option<StillRef>,
+    /// The category string for the HUD label of [`main_still`]: one of
+    /// `"life_threatening"`, `"malicious"`, `"intruder"`, `"any"`. `#[serde(default)]`
+    /// so old journals still deserialise.
+    #[serde(default)]
+    pub main_still_category: Option<String>,
     pub updated_at: DateTime<Utc>,
     pub schema_version: u32,
 }
@@ -186,24 +160,31 @@ pub enum CaseStatus {
     Cleared,
 }
 
-/// Threat severity. `Ord` follows declaration order (`Info < Elevated < Critical`)
-/// so the engine can ratchet UP and decay DOWN by simple comparison.
+/// Threat severity. Outcome-named so the model isn't mis-calibrated by a vague
+/// "elevated"; `Ord` follows declaration order (`Benign < ThreatPresent <
+/// LifeThreatening`) so the engine can ratchet UP and decay DOWN by comparison.
+/// `benign` = no concern; `threat_present` = a genuine threat (an intruder, armed
+/// or not); `life_threatening` = immediate danger to life (armed / duress / injury).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThreatLevel {
-    Info,
-    Elevated,
-    Critical,
+    /// `alias` loads pre-0.33.0 journals (`info`/`elevated`/`critical`).
+    #[serde(alias = "info")]
+    Benign,
+    #[serde(alias = "elevated")]
+    ThreatPresent,
+    #[serde(alias = "critical")]
+    LifeThreatening,
 }
 
 impl ThreatLevel {
-    /// PagerDuty Events v2 severity (Phase 3 maps this).
+    /// PagerDuty Events v2 severity (Phase 3 maps this; PD's enum is fixed).
     #[allow(dead_code)]
     pub fn pagerduty_severity(self) -> &'static str {
         match self {
-            ThreatLevel::Info => "info",
-            ThreatLevel::Elevated => "warning",
-            ThreatLevel::Critical => "critical",
+            ThreatLevel::Benign => "info",
+            ThreatLevel::ThreatPresent => "warning",
+            ThreatLevel::LifeThreatening => "critical",
         }
     }
 }
@@ -220,20 +201,34 @@ pub struct LocationObservation {
     pub last_seen: DateTime<Utc>,
 }
 
+/// Minimum intruder confidence — and dominance over the resident/guest reads —
+/// for a [`Person`] to count as a "subject of concern" (an "intruder" in the
+/// spoken/timeline vocabulary). Below this, or out-dominated by resident/guest,
+/// the person is not treated as a threat by voice/HUD/PagerDuty/forensic-ID.
+pub const CONCERN_INTRUDER_FLOOR: f32 = 0.34;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Intruder {
-    /// Stable within the case (e.g. `subject-1`) so the HUD doesn't thrash.
+pub struct Person {
+    /// Stable within the case (e.g. `subject-1`) so the HUD doesn't thrash and the
+    /// same person is tracked across ticks.
     pub id: String,
     /// Physical descriptors (firmed up by the Opus forensic pass).
     pub descriptors: String,
-    /// 0.0–1.0 identification confidence (latest).
-    pub confidence: f32,
-    /// 0.0–1.0 frame-quality-for-identification of this intruder's latest view
-    /// (face/build clear, in focus, close, well-lit). Drives which still feeds the
-    /// forensic pass and when to re-profile on a clearer shot. Distinct from
-    /// `confidence`.
+    /// 0.0–1.0 likelihood this person is a RESIDENT.
     #[serde(default)]
-    pub id_quality: f32,
+    pub resident_confidence: f32,
+    /// 0.0–1.0 likelihood this person is an invited/expected GUEST or delivery.
+    #[serde(default)]
+    pub guest_confidence: f32,
+    /// 0.0–1.0 likelihood this person is an INTRUDER. The three confidences are
+    /// independent (need not sum to 1); the dominant class drives `is_subject_of_concern`.
+    #[serde(default)]
+    pub intruder_confidence: f32,
+    /// 0.0–1.0 frame-quality-for-identification of this person's latest view
+    /// (face/build clear, in focus, close, well-lit). Drives which still feeds the
+    /// forensic pass and when to re-profile on a clearer shot.
+    #[serde(default)]
+    pub id_score: f32,
     /// Current camera label.
     pub location: Option<String>,
     /// Current activity.
@@ -246,6 +241,15 @@ pub struct Intruder {
     /// The weapon if `armed` (e.g. "kitchen knife", "wooden stick"), else None.
     #[serde(default)]
     pub weapon: Option<String>,
+    /// A visible injury (e.g. "bleeding", "stab wound", "gunshot wound",
+    /// "unconscious", "possibly deceased"), else None. Latched (once seen it is
+    /// kept) so a later occluded frame doesn't drop a casualty.
+    #[serde(default)]
+    pub injury: Option<String>,
+    /// 0.0–1.0 confidence this person is under duress (coerced, restrained,
+    /// threatened, distressed). Tracked as the MAX seen.
+    #[serde(default)]
+    pub in_duress: f32,
     /// Ordered best→worst identifying stills.
     pub best_stills: Vec<StillRef>,
     /// True once the Opus forensic pass has produced firm descriptors.
@@ -261,6 +265,19 @@ pub struct Intruder {
     /// downstream renders, but kept on the struct for reconciliation.
     #[serde(default)]
     pub best_camera: Option<String>,
+}
+
+impl Person {
+    /// Whether this person's dominant classification is INTRUDER (and above
+    /// [`CONCERN_INTRUDER_FLOOR`]) — a "subject of concern". The spoken/timeline
+    /// vocabulary calls such a person an "intruder"; voice/HUD/PagerDuty and the
+    /// forensic-ID pass key on this so a clearly-resident or clearly-guest person
+    /// is neither announced nor profiled. Ties break toward concern (caution).
+    pub fn is_subject_of_concern(&self) -> bool {
+        self.intruder_confidence >= CONCERN_INTRUDER_FLOOR
+            && self.intruder_confidence >= self.resident_confidence
+            && self.intruder_confidence >= self.guest_confidence
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,6 +313,12 @@ pub enum TimelineKind {
     /// A person was seen to be armed / a weapon or threatening object appeared.
     /// Material milestone: re-pages the security station and speaks a firm line.
     WeaponDetected,
+    /// A person was seen to be injured (e.g. bleeding, a wound, unconscious).
+    /// Once-off per person; speaks a casualty line and re-pages the security station.
+    InjuryDetected,
+    /// A malicious action was observed (e.g. "breaking into car", "smashed
+    /// window"). Once-off per distinct action; speaks a terse line (voice-only).
+    MaliciousActivity,
     /// A gated (`Investigate`/`General`) case was **promoted** to `Alarm` — Argus
     /// concluded a real threat. From this milestone the outputs ungate and flow
     /// (the gate in `out::route_event` lets `Escalated` itself through). **Phase
@@ -326,11 +349,13 @@ impl CaseState {
             trigger_profile: profile,
             effective_profile: profile,
             trigger_location: None,
-            investigate_outcome: InvestigateOutcome::Undetermined,
             locations: Vec::new(),
-            intruders: Vec::new(),
+            persons: Vec::new(),
             threats: Vec::new(),
+            malicious_activity: Vec::new(),
             timeline: Vec::new(),
+            main_still: None,
+            main_still_category: None,
             updated_at: started_at,
             schema_version: SCHEMA_VERSION,
         }
@@ -346,9 +371,9 @@ impl CaseState {
         self.updated_at = at;
     }
 
-    /// Find a mutable intruder by stable id.
-    pub fn intruder_mut(&mut self, id: &str) -> Option<&mut Intruder> {
-        self.intruders.iter_mut().find(|i| i.id == id)
+    /// Find a mutable person by stable id.
+    pub fn person_mut(&mut self, id: &str) -> Option<&mut Person> {
+        self.persons.iter_mut().find(|p| p.id == id)
     }
 
     /// True while the case's outputs are **gated** — its `effective_profile` is a
@@ -371,18 +396,15 @@ pub struct LiveAssessment {
     #[allow(dead_code)]
     pub person_detected: bool,
     pub locations: Vec<LocationDelta>,
-    pub intruders: Vec<IntruderDelta>,
+    pub persons: Vec<PersonDelta>,
     /// Weapons / threats / danger signs observed this tick (free text). Argus
     /// re-baselines `CaseState.threats` from this on a full sweep, unions on a
     /// partial tick.
     pub threats: Vec<String>,
-    /// Whether residents are present and ENGAGING the newcomer (the `Investigate`
-    /// smart-alarm signal — separates a welcomed visitor from an unnoticed/absent-
-    /// resident intruder). Optional: the model may omit it (older schema / non-
-    /// investigate runs) → `None`, which the classifier reads as `Unknown`. The
-    /// non-investigate profiles ignore it entirely.
+    /// Terse malicious actions observed this tick (e.g. "breaking into car",
+    /// "smashed window"). Re-baselined on a full sweep, unioned on a partial tick.
     #[serde(default)]
-    pub resident_awareness: Option<ResidentAwareness>,
+    pub malicious_activity: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -393,16 +415,19 @@ pub struct LocationDelta {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct IntruderDelta {
+pub struct PersonDelta {
     /// Reuse an existing id from the supplied roster, or coin the next
     /// `subject-N` for a genuinely new person.
     pub id: String,
     pub descriptors: String,
-    pub confidence: f32,
+    /// Independent 0.0–1.0 likelihoods this person is a resident / guest / intruder.
+    pub resident_confidence: f32,
+    pub guest_confidence: f32,
+    pub intruder_confidence: f32,
     /// 0.0–1.0 suitability of THIS frame for identification (face/build visible,
-    /// in focus, close, well-lit) — distinct from `confidence`. Drives best-still
-    /// selection + when to (re)run the forensic pass.
-    pub id_quality: f32,
+    /// in focus, close, well-lit). Drives best-still selection + when to (re)run
+    /// the forensic pass.
+    pub id_score: f32,
     pub location: Option<String>,
     pub activity: Option<String>,
     /// Which camera label currently has the clearest view of this person.
@@ -411,9 +436,13 @@ pub struct IntruderDelta {
     pub armed: bool,
     /// The weapon if `armed` (e.g. "kitchen knife", "wooden stick"), else null.
     pub weapon: Option<String>,
+    /// A visible injury on this person (e.g. "bleeding", "stab wound"), else null.
+    pub injury: Option<String>,
+    /// 0.0–1.0 confidence this person is under duress (coerced/restrained/threatened).
+    pub in_duress: f32,
 }
 
-/// The forensic (Opus) identification of one intruder's best still. Schema:
+/// The forensic (Opus) identification of one subject's best still. Schema:
 /// [`identification_schema`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct Identification {
@@ -429,6 +458,8 @@ pub struct Identification {
     pub armed: bool,
     /// The weapon if `armed`, else null.
     pub weapon: Option<String>,
+    /// A visible injury the forensic pass can confirm on the clearest frame, else null.
+    pub injury: Option<String>,
 }
 
 /// JSON schema for the live assessment, used as `output_config.format`.
@@ -443,7 +474,7 @@ pub fn live_assessment_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "summary": { "type": "string", "description": "One sentence: who is present, what they are doing, where. If no person, say so." },
-            "threat_level": { "type": "string", "enum": ["info", "elevated", "critical"] },
+            "threat_level": { "type": "string", "enum": ["benign", "threat_present", "life_threatening"] },
             "person_detected": { "type": "boolean" },
             "locations": {
                 "type": "array",
@@ -458,7 +489,7 @@ pub fn live_assessment_schema() -> Value {
                     "required": ["camera_label", "activity", "person_present"]
                 }
             },
-            "intruders": {
+            "persons": {
                 "type": "array",
                 "items": {
                     "type": "object",
@@ -466,29 +497,33 @@ pub fn live_assessment_schema() -> Value {
                     "properties": {
                         "id": { "type": "string", "description": "Reuse an id from the supplied roster for the same person; coin subject-N for a new one." },
                         "descriptors": { "type": "string", "description": "Build/clothing/hair/markings — only what the image supports." },
-                        "confidence": { "type": "number", "description": "0.0-1.0 confidence this is a real, identifiable person." },
-                        "id_quality": { "type": "number", "description": "0.0-1.0: how good THIS frame is for IDENTIFYING the person — 1.0 = face and build clearly visible, in focus, close, well-lit; low = far away, blurred, back turned, heavily occluded, or dark. Judge the FRAME's usefulness for an ID, separately from `confidence`." },
+                        "resident_confidence": { "type": "number", "description": "0.0-1.0 likelihood this person is a RESIDENT named in the briefing. Only high when they clearly match a named resident; a mere resemblance is not a match." },
+                        "guest_confidence": { "type": "number", "description": "0.0-1.0 likelihood this person is an invited/expected GUEST or delivery person." },
+                        "intruder_confidence": { "type": "number", "description": "0.0-1.0 likelihood this person is an INTRUDER. Independent of the other two (they need not sum to 1). When uncertain, weight toward intruder." },
+                        "id_score": { "type": "number", "description": "0.0-1.0: how good THIS frame is for IDENTIFYING the person — 1.0 = face and build clearly visible, in focus, close, well-lit; low = far away, blurred, back turned, heavily occluded, or dark. Judge the FRAME's usefulness for an ID." },
                         "location": { "type": ["string", "null"], "description": "Current camera label, or null." },
                         "activity": { "type": ["string", "null"], "description": "What they are doing, or null." },
                         "best_camera_label": { "type": ["string", "null"], "description": "Camera label with the clearest current view of this person, or null." },
                         "armed": { "type": "boolean", "description": "True if holding/carrying a weapon OR an object plausibly consistent with one (blade, firearm, bat, stick, tool, or an elongated/pointed/metallic object). Lean toward flagging during an active intrusion; only a clearly-recognised benign object (phone, remote, cup) is not a weapon." },
-                        "weapon": { "type": ["string", "null"], "description": "Name of the weapon if armed (e.g. \"kitchen knife\"); hedge if unsure (e.g. \"possible knife\", \"elongated object, possibly a blade\"); else null." }
+                        "weapon": { "type": ["string", "null"], "description": "Name of the weapon if armed (e.g. \"kitchen knife\"); hedge if unsure (e.g. \"possible knife\", \"elongated object, possibly a blade\"); else null." },
+                        "injury": { "type": ["string", "null"], "description": "A visible injury on this person (e.g. \"bleeding\", \"stab wound\", \"gunshot wound\", \"unconscious\", \"possibly deceased\"), else null." },
+                        "in_duress": { "type": "number", "description": "0.0-1.0 confidence this person is under duress — coerced, restrained, threatened, or in visible distress. 0.0 if they appear free and calm." }
                     },
-                    "required": ["id", "descriptors", "confidence", "id_quality", "location", "activity", "best_camera_label", "armed", "weapon"]
+                    "required": ["id", "descriptors", "resident_confidence", "guest_confidence", "intruder_confidence", "id_score", "location", "activity", "best_camera_label", "armed", "weapon", "injury", "in_duress"]
                 }
             },
             "threats": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "Weapons, threatening objects, aggression, residents in apparent danger, or signs of forced entry visible this tick. Empty if none."
+                "description": "Weapons, threatening objects, aggression, persons in apparent danger, or signs of forced entry visible this tick. Empty if none."
             },
-            "resident_awareness": {
-                "type": "string",
-                "enum": ["residents_absent", "residents_present_unaware", "residents_present_engaging", "unknown"],
-                "description": "PERIMETER-SECURITY signal: are the residents present and ENGAGING any newcomer? 'residents_present_engaging' = a resident is visibly interacting with the newcomer — waving, talking, walking together, relaxed close proximity (a welcomed guest). 'residents_present_unaware' = a resident is in view but oblivious / not interacting (e.g. indoors, back turned, unaware someone has approached). 'residents_absent' = NO resident is present in the scene at all (a lone newcomer). 'unknown' = you cannot tell from this frame. Judge engagement generously toward 'engaging' ONLY when the interaction is genuinely relaxed and mutual; a stranger alone, or residents who plainly haven't noticed them, is NOT engaging."
+            "malicious_activity": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Terse malicious actions visible this tick, e.g. \"breaking into car\", \"smashed window\", \"forcing a door\". Empty if none."
             }
         },
-        "required": ["summary", "threat_level", "person_detected", "locations", "intruders", "threats", "resident_awareness"]
+        "required": ["summary", "threat_level", "person_detected", "locations", "persons", "threats", "malicious_activity"]
     })
 }
 
@@ -504,9 +539,10 @@ pub fn identification_schema() -> Value {
             "distinguishing_features": { "type": "string", "description": "Tattoos, scars, logos, gait, carried items — anything that aids identification." },
             "spoken_summary": { "type": "string", "description": "A SHORT single sentence (max ~18 words) for a spoken security announcement: sex, approx age, build, key clothing, and one standout feature. No preamble. E.g. 'Caucasian male, forties, navy t-shirt, grey track pants, full red beard.'" },
             "armed": { "type": "boolean", "description": "True if holding/carrying a weapon OR an object plausibly consistent with one (blade, firearm, bat, stick, tool, elongated/pointed/metallic object) — this is the clearest frame, scrutinise the hands. Only a clearly-recognised benign object (phone, remote, cup) is not a weapon." },
-            "weapon": { "type": ["string", "null"], "description": "Name of the weapon if armed; hedge if unsure (e.g. \"possible knife\"); else null." }
+            "weapon": { "type": ["string", "null"], "description": "Name of the weapon if armed; hedge if unsure (e.g. \"possible knife\"); else null." },
+            "injury": { "type": ["string", "null"], "description": "A visible injury you can confirm on this clearest frame (e.g. \"bleeding\", \"stab wound\", \"gunshot wound\", \"unconscious\", \"possibly deceased\"), else null." }
         },
-        "required": ["descriptors", "dossier", "confidence", "distinguishing_features", "spoken_summary", "armed", "weapon"]
+        "required": ["descriptors", "dossier", "confidence", "distinguishing_features", "spoken_summary", "armed", "weapon", "injury"]
     })
 }
 
@@ -626,6 +662,19 @@ mod tests {
         assert_eq!(state.trigger_profile, TriggerProfile::Alarm);
         assert_eq!(state.effective_profile, TriggerProfile::Alarm);
         assert!(!state.gated(), "an Alarm case is never gated");
+        // The legacy `intruders` field is unknown now (ignored); `persons` defaults.
+        assert!(state.persons.is_empty());
+    }
+
+    /// A retired `general`-profile journal deserialises to the rebranded
+    /// `Investigate` profile (serde alias), not an error.
+    #[test]
+    fn legacy_general_profile_maps_to_investigate() {
+        let p: TriggerProfile = serde_json::from_str("\"general\"").unwrap();
+        assert_eq!(p, TriggerProfile::Investigate);
+        // And the canonical name still round-trips.
+        let p2: TriggerProfile = serde_json::from_str("\"investigate\"").unwrap();
+        assert_eq!(p2, TriggerProfile::Investigate);
     }
 
     /// A round-trip through serde preserves an explicit non-default profile, and a
@@ -634,7 +683,7 @@ mod tests {
     fn profile_round_trips_and_drives_gating() {
         let mut state =
             CaseState::new("case-test".to_string(), Utc::now(), TriggerProfile::Investigate);
-        assert_eq!(state.threat_level, ThreatLevel::Info);
+        assert_eq!(state.threat_level, ThreatLevel::Benign);
         assert!(state.gated());
 
         let s = serde_json::to_string(&state).unwrap();
@@ -654,7 +703,7 @@ mod tests {
     #[test]
     fn alarm_profile_opens_elevated() {
         let s = CaseState::new("c".to_string(), Utc::now(), TriggerProfile::Alarm);
-        assert_eq!(s.threat_level, ThreatLevel::Elevated);
+        assert_eq!(s.threat_level, ThreatLevel::ThreatPresent);
         assert_eq!(s.trigger_profile, TriggerProfile::Alarm);
         assert!(!s.gated());
     }

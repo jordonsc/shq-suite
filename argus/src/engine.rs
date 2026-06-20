@@ -21,11 +21,10 @@ use tracing::{error, info, warn};
 
 use crate::case::{
     default_case_base, identification_schema, live_assessment_schema, CaseDir, CaseState,
-    CaseStatus, Identification, Intruder, IntruderDelta, InvestigateOutcome, LiveAssessment,
-    LocationDelta, LocationObservation, ResidentAwareness, StillRef, ThreatLevel, TimelineKind,
-    TriggerProfile,
+    CaseStatus, Identification, LiveAssessment, LocationDelta, LocationObservation, Person,
+    PersonDelta, StillRef, ThreatLevel, TimelineKind, TriggerProfile, CONCERN_INTRUDER_FLOOR,
 };
-use crate::config::{Config, ResidentPhoto};
+use crate::config::Config;
 use crate::ha::{HaEvent, RestClient};
 use crate::llm::{AnthropicClient, AssessRequest, ImageInput, Reasoning, Usage};
 use crate::state::AlarmMode;
@@ -74,11 +73,17 @@ const AUTO_CLOSE_SECS: i64 = 3600;
 /// disarm paths use it).
 const AUTHORISED_DWELL_SECS: u64 = 15;
 
-/// `General` (benign-doorstep) standdown budget: a gated `General` case that sees
-/// nothing of concern auto-closes quietly after this many ticks. Kept small —
-/// `General` is a fast, shallow glance for OBVIOUS danger, not a deep ID; it must
-/// stay cheap (it fires on every doorstep visitor) and silent.
-const GENERAL_STANDDOWN_TICKS: u64 = 4;
+/// `Investigate` standdown budget: a gated `Investigate` case that sees nothing
+/// of concern auto-closes quietly after this many ticks. Kept small — Investigate
+/// is a fast, shallow double-check of presumed-benign activity (it fires on every
+/// front-door visitor / delivery), so it must stay cheap and silent.
+const INVESTIGATE_STANDDOWN_TICKS: u64 = 4;
+
+/// `in_duress` confidence at or above which a person counts as a structured
+/// duress signal — lifts the threat to `LifeThreatening` (the structured set that
+/// can reach the top tier) and escalates a gated `Investigate` case. A high bar:
+/// only a confident duress read forces it; a faint/uncertain read does not.
+const DURESS_FLOOR: f32 = 0.75;
 
 /// **Escalation persistence gate (the production false-escalation safety win).**
 /// A GATED (`Investigate`/`General`) case must see its escalate condition hold for
@@ -95,12 +100,6 @@ const GENERAL_STANDDOWN_TICKS: u64 = 4;
 /// house-alarm path.
 const ESCALATION_PERSISTENCE_TICKS: u32 = 2;
 
-/// `Investigate` (perimeter-security) silent-run budget: a gated `Investigate`
-/// case quietly stands down when this window elapses with no escalation. Used to
-/// seed `ActiveCase.investigate_deadline` at case open (a real perimeter-cooldown
-/// telemetry timer could replace it later; the default holds until then).
-const INVESTIGATE_DEADLINE_SECS: u64 = 120;
-
 /// What the authorised-dwell timer does when it elapses.
 #[derive(Debug, Clone, Copy)]
 enum Revert {
@@ -110,26 +109,82 @@ enum Revert {
     ToDisarmed,
 }
 
+/// The universal **system prompt** — prepended to the private premises seed to
+/// form the cached `system` block on every Sonnet/Opus call (the seed supplies
+/// the `< residence summary >` / `< residents summary >` content referenced at the
+/// end). Holds the role, the threat-level rubric, and the persistent assessment
+/// rules so the per-scenario message prompts can stay short.
+pub const SYSTEM_PROMPT: &str = "You are a smart-security AI that reviews camera footage to \
+    produce a risk assessment of an incident at a residence. You are given a single camera still \
+    and must determine whether anyone is attempting to enter, or has already entered, the premises, \
+    and whether any person appears to be under duress.\n\n\
+    For each frame, report:\n\
+    - a holistic threat level for the scene;\n\
+    - the people present and, for each, the likelihood they are a resident, a guest, or an intruder \
+    (independent 0.0-1.0 confidences that need not sum to 1);\n\
+    - any threats and any injuries you observe;\n\
+    - an activity summary of what is happening in the frame, paying special attention to anything \
+    potentially malicious;\n\
+    - a terse list of malicious actions in the frame, e.g. \"breaking into car\", \"smashed window\".\n\n\
+    Determine the threat level as follows:\n\
+    - benign: no sign of intrusion, threat, or duress — a resident, an expected guest or delivery, \
+    or no one of concern.\n\
+    - threat_present: a genuine threat is present — a non-resident attempting or making entry, \
+    forcing or testing a door or window, prowling or casing the property, or otherwise behaving as \
+    an intruder, armed or not.\n\
+    - life_threatening: immediate danger to life — a person is armed, appears to be under duress, or \
+    appears to be seriously injured.\n\n\
+    How readily to treat an unknown person as a threat depends on the situation, and is stated in \
+    the instruction for this frame.\n\n\
+    Assessing people (important): assign each person a resident, a guest, and an intruder \
+    confidence. Only assign a high resident confidence when the person clearly matches a named \
+    resident in the briefing below — a mere resemblance (similar build, hair, skin tone, or \
+    clothing) is not a match. When you are uncertain, weight your confidence toward intruder: fail \
+    toward caution.\n\n\
+    Weapons: look closely at every person's hands and anything they hold or carry. Set `armed` if \
+    they hold a weapon, or any object plausibly consistent with one (a blade, firearm, bat, stick, \
+    tool, or an elongated, pointed, or metallic object), and name it in `weapon`, hedging when \
+    unsure. Only an object clearly recognised as benign (a phone, remote, or cup) is not a weapon.\n\n\
+    Injuries and duress: record any visible injury in a person's `injury` field (e.g. \"bleeding\", \
+    \"stab wound\", \"gunshot wound\", \"unconscious\", \"possibly deceased\"). Set `in_duress` \
+    (0.0-1.0) for any person who appears coerced, restrained, threatened, or in distress.";
+
+/// Investigate scenario opener for the camera that fired the trigger. Posture:
+/// presumed-benign, so the bar for a threat is HIGH (benign unless confident).
+const INVESTIGATE_TRIGGER_PROMPT: &str = "Benign activity has been detected on this camera — most \
+    likely a guest arriving, a delivery, or a resident returning. Treat the scene as `benign` UNLESS \
+    you have HIGH confidence it is genuinely a threat — an obvious weapon, a masked or prowling \
+    intruder, or forced entry — in which case report `threat_present` (or `life_threatening` if a \
+    weapon, duress, or injury is present). When in doubt, it is benign.";
+
+/// Investigate scenario opener for the other (ancillary) cameras during a case.
+const INVESTIGATE_ANCILLARY_PROMPT: &str = "Benign activity has been detected elsewhere on the \
+    premises, likely a guest or a delivery. You are reviewing an unrelated camera; normal activity \
+    is expected — residents or guests on the property. Treat the scene as `benign` UNLESS you have \
+    HIGH confidence of a genuine threat — an obvious weapon, a masked or prowling intruder, forced \
+    entry, or someone in duress — in which case report `threat_present` (or `life_threatening` for a \
+    weapon, duress, or injury). When in doubt, it is benign.";
+
+/// Alarm scenario opener (any camera) — a confirmed breach is assumed, so an
+/// unknown person IS a threat (the opposite posture to Investigate).
+const ALARM_PROMPT: &str = "An alarm has been triggered — an intrusion is assumed. Treat any person \
+    who is not clearly a resident or an expected guest as a threat: report at least `threat_present`, \
+    and `life_threatening` if anyone is armed, appears to be under duress, or appears injured. \
+    Determine who is present and, for each, their likelihood of being a resident, a guest, or an \
+    intruder; note any weapons, injuries, or signs of duress, and any malicious activity.";
+
 /// The forensic (Opus) instruction — shared by the inline (`--once`) and the
 /// spawned (daemon) identification paths.
-const IDENTIFY_INSTRUCTION: &str = "The LAST image is the clearest still of a detected subject \
-    (the camera frame, labelled \"Camera: ...\"). Any images labelled \"Resident reference\" are \
-    photos of KNOWN AUTHORISED RESIDENTS — compare the subject in the camera still against them. \
-    If the subject matches a resident reference photo BEYOND REASONABLE DOUBT, identify the person \
-    as that resident: say so in the descriptors/dossier, set `confidence` to reflect the match, and \
-    do NOT treat them as an intruder. A mere resemblance (similar build, hair, skin tone, or \
-    clothing) is NOT a match — when the match is uncertain, or the subject matches no reference \
-    photo, treat them as an intruder. Fail toward intruder. (If no \"Resident reference\" images are \
-    present, simply identify the subject as an unknown intruder.)\n\n\
-    Produce a firm forensic identification of the subject in the camera still: physical \
-    descriptors, distinguishing features, and a short dossier paragraph for the security station. \
-    ALSO write `spoken_summary` — a single short sentence (max ~18 words) suitable to be read aloud \
-    over a security speaker (sex, approx age, build, key clothing, one standout feature; no \
-    preamble). Also determine whether the person is armed — examine the hands and any held object \
-    CLOSELY (this is the clearest frame, your best chance to confirm or rule out a weapon the live \
-    pass was unsure about). Set `armed` true if they hold a weapon or any object plausibly \
-    consistent with one (blade, firearm, bat, stick, tool, or an elongated/pointed/metallic object) \
-    and name it in `weapon`, hedging if unsure. Anchor every claim on the images.";
+const IDENTIFY_INSTRUCTION: &str = "The image is the clearest still of a detected subject (the \
+    camera frame). Produce a firm forensic identification of this subject: physical descriptors, \
+    distinguishing features, and a short dossier paragraph for the security station. ALSO write \
+    `spoken_summary` — a single short sentence (max ~18 words) suitable to be read aloud over a \
+    security speaker (sex, approx age, build, key clothing, one standout feature; no preamble). \
+    Determine whether the person is armed — examine the hands and any held object CLOSELY (this is \
+    the clearest frame, your best chance to confirm or rule out a weapon the live pass was unsure \
+    about). Set `armed` true if they hold a weapon or any object plausibly consistent with one \
+    (blade, firearm, bat, stick, tool, or an elongated/pointed/metallic object) and name it in \
+    `weapon`, hedging if unsure. Note any visible `injury`. Anchor every claim on the image.";
 
 /// The result of a forensic (Opus) identification, delivered back to the engine's
 /// event loop over an mpsc so the Opus call runs CONCURRENTLY with the live loop
@@ -143,27 +198,16 @@ struct IdResult {
 }
 
 /// Run one forensic identification call. Free function (no `&self`) so it can run
-/// inline OR inside a spawned task with cloned client + seed.
-///
-/// `residents` are the labelled resident reference photos (Opus-only) — PREPENDED
-/// to the request images (each as `"Resident reference: <name>"`) BEFORE the
-/// suspect still so the model can anchor a confident resident match. An empty
-/// slice leaves the request unchanged (the suspect still is the only image).
+/// inline OR inside a spawned task with a cloned client + system prompt.
 async fn run_identify(
     opus: &AnthropicClient,
-    seed: &str,
-    residents: &[ResidentPhoto],
+    system: &str,
     label: &str,
     jpeg: &[u8],
 ) -> (Result<Identification>, Option<Usage>) {
-    let mut images: Vec<ImageInput> = residents
-        .iter()
-        .map(|r| ImageInput::resident(&r.name, &r.jpeg))
-        .collect();
-    images.push(ImageInput::camera(label, jpeg));
     let req = AssessRequest {
-        seed,
-        images,
+        system,
+        images: vec![ImageInput::camera(label, jpeg)],
         instruction: IDENTIFY_INSTRUCTION.to_string(),
         schema: Some(identification_schema()),
         max_tokens: ID_MAX_TOKENS,
@@ -201,6 +245,12 @@ struct ActiveCase {
     /// Intruder ids for which a weapon-capture still has already been grabbed, so
     /// a persistently-armed person doesn't re-capture every tick.
     weapon_still: HashSet<String>,
+    /// Person ids whose injury has already been announced (the `InjuryDetected`
+    /// milestone fires once per person).
+    injury_announced: HashSet<String>,
+    /// Distinct malicious-activity strings already announced this case (the
+    /// `MaliciousActivity` milestone fires once per distinct action).
+    announced_malicious: HashSet<String>,
     /// When a person was last seen on any camera. Drives the threat-decay timers
     /// and the auto-close timeout. Seeded to the case start so an empty case still
     /// decays + auto-closes.
@@ -222,10 +272,6 @@ struct ActiveCase {
     /// at most once. An `Alarm`-profile case opens with this already `true` (it is
     /// born at full posture, never "promoted").
     escalated: bool,
-    /// For an `Investigate` case: the instant its silent assessment window closes.
-    /// When it passes with no escalation, the case quietly stands down. `None` for
-    /// the other profiles (which don't use a deadline).
-    investigate_deadline: Option<Instant>,
     /// Consecutive-tick count for which a gated case's escalate condition has held
     /// (Phase 4b precision pass). Promotion only fires once this reaches
     /// [`ESCALATION_PERSISTENCE_TICKS`] — so a single misread frame can't trip the
@@ -233,6 +279,11 @@ struct ActiveCase {
     /// Irrelevant for an `Alarm` case (born escalated → `decide_promotion` is a
     /// no-op there, so this stays 0).
     escalation_streak: u32,
+    /// Rank of the MAIN-image still currently held for the HUD primary pane
+    /// (life_threatening=3 / malicious=2 / intruder=1 / any=0). Reset per case;
+    /// a newer still only replaces the main image when its rank ≥ this
+    /// (sticky-downward — see [`should_replace_main`] / [`compute_main_rank`]).
+    main_still_rank: u8,
 }
 
 /// Running daily token usage for the optional cap.
@@ -248,12 +299,15 @@ pub struct Engine {
     rest: RestClient,
     sonnet: AnthropicClient,
     opus: AnthropicClient,
+    /// The cached `system` block for the LIVE (Sonnet) loop: the universal
+    /// [`SYSTEM_PROMPT`] + the private premises seed, assembled once at startup.
+    system: String,
+    /// The cached `system` block for the OPUS forensic call: the premises seed
+    /// ALONE. The live `SYSTEM_PROMPT` frames the per-frame assessment task, which
+    /// confuses the forensic ID call (it stubbed `dossier`/`spoken_summary` to
+    /// "placeholder"); the forensic instruction defines its own task, so it gets
+    /// the neutral seed only.
     seed: String,
-    /// Labelled resident reference photos, loaded into memory at startup. Attached
-    /// to the **Opus forensic ID** call ONLY (never the Sonnet live loop), prepended
-    /// to the suspect still so the model can anchor a confident resident match.
-    /// Empty (no `resident_photos:`, or none loaded) ⇒ the Opus call is unchanged.
-    resident_photos: Vec<ResidentPhoto>,
     /// Camera label → entity id, for mapping the model's `*_label` fields back.
     label_to_entity: HashMap<String, String>,
     /// Entity id → camera label. The model sometimes returns the entity id (it's
@@ -295,8 +349,8 @@ impl Engine {
         rest: RestClient,
         sonnet: AnthropicClient,
         opus: AnthropicClient,
+        system: String,
         seed: String,
-        resident_photos: Vec<ResidentPhoto>,
         state_tx: watch::Sender<Option<CaseState>>,
     ) -> Self {
         let label_to_entity: HashMap<String, String> = cfg
@@ -328,8 +382,8 @@ impl Engine {
             rest,
             sonnet,
             opus,
+            system,
             seed,
-            resident_photos,
             label_to_entity,
             entity_to_label,
             label_to_zone,
@@ -399,18 +453,59 @@ impl Engine {
                 // padded up to the cadence. So frames aim for ~cadence_secs apart.
                 let cadence = Duration::from_secs(self.current_cadence());
                 let wait = cadence.saturating_sub(self.last_tick_duration);
-                tokio::select! {
-                    maybe = rx.recv() => match maybe {
-                        Some(ev) => self.handle(ev).await,
-                        None => break,
-                    },
-                    Some(cmd) = ctrl_rx.recv() => self.handle_control(cmd).await,
-                    Some(res) = id_rx.recv() => self.handle_identification(res),
-                    _ = tokio::time::sleep(wait) => {
-                        if let Err(e) = self.tick().await {
-                            error!("assessment tick failed: {e:#}");
+
+                // Take the case into a LOCAL so a preempted (dropped) tick future
+                // can't lose it: the tick borrows `&mut active`, so if the select
+                // resolves on an HA/control/id arm instead, the dropped tick future
+                // just ends the borrow — `active` is still owned here and is restored
+                // below. (Contrast `tick()`, which `self.active.take()`s and only
+                // restores at the end — dropping THAT future mid-flight would strand
+                // the case as `None`. That path is kept only for `run_once`.)
+                let mut active = self.active.take().expect("active.is_some() checked");
+
+                enum Step {
+                    Ticked(Result<bool>, Duration),
+                    Ha(Option<HaEvent>),
+                    Ctrl(ControlCommand),
+                    Id(IdResult),
+                }
+
+                let step = {
+                    let tick_fut = async {
+                        tokio::time::sleep(wait).await;
+                        let t0 = Instant::now();
+                        let r = self.run_tick(&mut active).await;
+                        (r, t0.elapsed())
+                    };
+                    tokio::pin!(tick_fut);
+                    tokio::select! {
+                        (r, dur) = &mut tick_fut => Step::Ticked(r, dur),
+                        maybe = rx.recv() => Step::Ha(maybe),
+                        Some(cmd) = ctrl_rx.recv() => Step::Ctrl(cmd),
+                        Some(res) = id_rx.recv() => Step::Id(res),
+                    }
+                }; // tick_fut dropped here → the &mut self / &mut active borrows end
+
+                // Restore the case BEFORE handling the event so the disarm fast-path
+                // (handle → standdown) finds it and flushes Cleared/dossier/AUTHORISED.
+                self.active = Some(active);
+
+                match step {
+                    Step::Ticked(r, dur) => {
+                        self.last_tick_duration = dur;
+                        match r {
+                            Ok(true) => {
+                                info!("case ending (auto-close / quiet standdown); standing down");
+                                self.standdown().await;
+                            }
+                            Ok(false) => {}
+                            Err(e) => error!("assessment tick failed: {e:#}"),
                         }
                     }
+                    Step::Ha(Some(ev)) => self.handle(ev).await,
+                    Step::Ha(None) => break,
+                    Step::Ctrl(cmd) => self.handle_control(cmd).await,
+                    Step::Id(res) => self.handle_identification(res),
                 }
             } else {
                 // The authorised-dwell timer (if armed): when it elapses, revert the
@@ -491,6 +586,14 @@ impl Engine {
                     AlarmMode::Arming | AlarmMode::Armed => {
                         self.revert_pending = None; // arming/armed supersedes any dwell
                         self.broadcast_mode(mode);
+                        // Re-arming stands a GATED (Investigate) case down: the
+                        // resident has armed the house, so a silent doorstep
+                        // double-check is resolved. A full `Alarm` case is left
+                        // alone (re-arming mid-alarm shouldn't silently cancel it).
+                        if self.active.as_ref().is_some_and(|a| a.state.gated()) {
+                            info!("re-armed; standing down the active gated case");
+                            self.standdown().await;
+                        }
                     }
                     AlarmMode::Disarmed => {
                         if self.active.is_some() {
@@ -637,27 +740,19 @@ impl Engine {
         let dir = CaseDir::create(&base, &case_id, now, alarm_entity)
             .context("creating case dir")?;
         let mut state = CaseState::new(case_id.clone(), now, profile);
-        // Read the human location that tripped the alarm (set by the HA "Alarm
-        // Sensors" automation) so the spoken breach line can name it. For an
-        // `Investigate` case the perimeter automation sets a SEPARATE entity
-        // (`investigate_location_entity`); fall back to the alarm one if unset.
-        let location_entity = match profile {
-            TriggerProfile::Investigate => self
-                .cfg
-                .investigate_location_entity
-                .as_deref()
-                .or(self.cfg.trigger_location_entity.as_deref()),
-            _ => self.cfg.trigger_location_entity.as_deref(),
-        };
-        state.trigger_location = self.read_location(location_entity).await;
-        // The case-open detail reflects the profile. For a gated profile the
-        // `CaseOpened` event is suppressed by the output gate (no voice/PD), so
-        // this text only surfaces on the journal + HUD — but it must not say "Alarm
-        // triggered" for a silent perimeter/doorstep assessment.
+        // Read the human location that tripped the case (set by the HA automation)
+        // so the spoken breach line — and the trigger-vs-ancillary camera split —
+        // can name it. Same entity for both profiles.
+        state.trigger_location = self
+            .read_location(self.cfg.trigger_location_entity.as_deref())
+            .await;
+        // The case-open detail reflects the profile. For a gated `Investigate` the
+        // `CaseOpened` event is suppressed by the output gate (no voice/PD), so this
+        // text only surfaces on the journal + HUD — it must not say "Alarm triggered"
+        // for a silent doorstep double-check.
         let opened_detail = match profile {
             TriggerProfile::Alarm => "Alarm triggered; case opened.",
-            TriggerProfile::Investigate => "Perimeter activity; silent assessment opened.",
-            TriggerProfile::General => "Doorstep approach; quick assessment opened.",
+            TriggerProfile::Investigate => "Presumed-benign approach; silent assessment opened.",
         };
         state.push_event(now, TimelineKind::CaseOpened, opened_detail);
         info!(
@@ -690,29 +785,24 @@ impl Engine {
             id_spoken: HashSet::new(),
             identifying: HashSet::new(),
             weapon_still: HashSet::new(),
+            injury_announced: HashSet::new(),
+            announced_malicious: HashSet::new(),
             last_activity: now,
             tick_count: 0,
             announced_zones,
             initial_zone_recorded,
-            // An `Alarm` case is born at full posture (never "promoted"); the gated
-            // profiles start un-escalated and may be promoted by `evaluate_promotion`.
+            // An `Alarm` case is born at full posture (never "promoted"); a gated
+            // `Investigate` starts un-escalated and may be promoted by `evaluate_promotion`.
             escalated: profile == TriggerProfile::Alarm,
-            // `Investigate` runs silent for a bounded window then quietly stands down.
-            investigate_deadline: match profile {
-                TriggerProfile::Investigate => {
-                    Some(Instant::now() + Duration::from_secs(INVESTIGATE_DEADLINE_SECS))
-                }
-                _ => None,
-            },
             escalation_streak: 0,
+            main_still_rank: 0,
         };
         self.persist_and_broadcast(&mut active)?;
         self.active = Some(active);
         Ok(())
     }
 
-    /// Read a configured location entity (the alarm `trigger_location_entity` or
-    /// the perimeter `investigate_location_entity`). `None` if unconfigured,
+    /// Read the configured `trigger_location_entity`. `None` if unconfigured,
     /// unreadable, or a placeholder state (`unknown`/`unavailable`/empty).
     async fn read_location(&self, entity: Option<&str>) -> Option<String> {
         let entity = entity?;
@@ -810,7 +900,11 @@ impl Engine {
         // the periodic-sweep interval was the main lag in room-change detection).
         // Cost is acceptable during a live intrusion; it reverts to motion-gating
         // once the case goes quiet (decays off Critical).
-        let actively_tracking = !active.state.intruders.is_empty()
+        let actively_tracking = active
+            .state
+            .persons
+            .iter()
+            .any(|p| p.is_subject_of_concern())
             && (now - active.last_activity).num_seconds() < DECAY_ELEVATED_SECS;
         let full = base_full || actively_tracking;
         let cameras = if full {
@@ -863,12 +957,13 @@ impl Engine {
         //    (warn + skip that camera); the surviving results are merged into one
         //    `LiveAssessment` before the existing merge/threat machinery runs.
         let sonnet = &self.sonnet;
-        let seed = &self.seed;
+        let system = &self.system;
         let calls = stills.iter().map(|(label, jpeg)| {
-            let instruction = self.live_instruction_camera(&active.state, &telemetry, label);
+            let is_trigger = self.is_trigger_camera(label, active.state.trigger_location.as_deref());
+            let instruction = self.live_instruction_camera(&active.state, &telemetry, label, is_trigger);
             async move {
                 let req = AssessRequest {
-                    seed,
+                    system,
                     images: vec![ImageInput::camera(label, jpeg)],
                     instruction,
                     schema: Some(live_assessment_schema()),
@@ -906,13 +1001,13 @@ impl Engine {
             return Ok(close);
         }
 
-        // Zones an intruder was seen in THIS tick, keyed off each camera's own
-        // sighting (first detection, any confidence) rather than the reconciled
-        // best-view location — so a room change is announced the moment a frame
-        // shows the intruder there, not once that camera becomes the dominant view.
+        // Zones a person of concern was seen in THIS tick, keyed off each camera's
+        // own sighting rather than the reconciled best-view location — so a room
+        // change is announced the moment a frame shows them there, not once that
+        // camera becomes the dominant view.
         let mut zones_seen: Vec<String> = Vec::new();
         for (label, a) in &labelled {
-            if !a.intruders.is_empty() {
+            if a.persons.iter().any(delta_is_concern) {
                 let zone = self.zone_for_label(label);
                 if !zones_seen.contains(&zone) {
                     zones_seen.push(zone);
@@ -928,44 +1023,47 @@ impl Engine {
         // Was a person seen this tick? Drives activity (threat ratchet + decay).
         let model_threat = live.threat_level;
         let person_seen = live.person_detected
-            || !live.intruders.is_empty()
+            || !live.persons.is_empty()
             || live.locations.iter().any(|l| l.person_present);
-        // Capture the merged resident-awareness BEFORE `merge_live` consumes `live`
-        // — the Investigate classifier reads it below (None ⇒ Unknown).
-        let resident_awareness = live.resident_awareness.unwrap_or_default();
 
         // 4. Merge the delta into CaseState (does NOT touch threat level).
         self.merge_live(active, live, full, now);
 
-        // 4a. Investigate smart-alarm classification (only for an Investigate case;
-        // a no-op verdict-store otherwise). Derived AFTER the merge so it reads the
-        // up-to-date intruder roster + threats. Drives the escalation/standdown
-        // decision + the spoken stand-down line.
-        if active.state.trigger_profile == TriggerProfile::Investigate {
-            active.state.investigate_outcome =
-                classify_investigate(&active.state, resident_awareness);
-        }
-        // Announce intruder movement into a fresh zone (off this tick's per-camera
-        // sightings — earliest reliable signal).
+        // Announce a person-of-concern's movement into a fresh zone (off this tick's
+        // per-camera sightings — earliest reliable signal).
         self.announce_zone_entries(active, &zones_seen, now);
         if active.state.status == CaseStatus::Triggered {
             active.state.status = CaseStatus::Assessing;
         }
 
-        // 5. Best stills + Opus forensic for new/improved intruders (async). A
-        // non-escalated `General` case is a SHALLOW, Sonnet-only glance — it must
-        // not spend Opus (it fires on every doorstep visitor). Once it escalates
-        // (`effective_profile` flips to `Alarm`), the forensic pass runs as normal.
-        if active.state.effective_profile != TriggerProfile::General || active.escalated {
-            self.upgrade_intruders(active, &stills, now).await;
+        // 5. Best stills + Opus forensic for new/improved persons of concern
+        // (async). A non-escalated `Investigate` case is a SHALLOW, Sonnet-only
+        // double-check — it must not spend Opus (it fires on every front-door
+        // visitor). Once it escalates (`effective_profile` flips to `Alarm`), the
+        // forensic pass runs as normal.
+        if active.state.effective_profile != TriggerProfile::Investigate || active.escalated {
+            self.upgrade_persons(active, &stills, now).await;
         }
 
-        // 6. Threat model. Up only via the model/weapon WHILE active; down only via
-        // the inactivity decay (below). Never let the model de-escalate.
+        // 6. Threat model. Up only via the model/structured danger WHILE active;
+        // down only via the inactivity decay (below). Never let the model
+        // de-escalate. `life_threatening` is reserved for STRUCTURED danger — an
+        // armed person, a serious injury, or a person clearly in duress (≥
+        // `DURESS_FLOOR`): such danger forces it (the floor), and WITHOUT it the
+        // model's read is CAPPED at `threat_present` (the ceiling). So the top tier
+        // always means a concrete life-safety signal, never the model over-calling.
         if person_seen {
             active.last_activity = now;
-            let armed = active.state.intruders.iter().any(|i| i.armed);
-            let candidate = if armed { ThreatLevel::Critical } else { model_threat };
+            let structured_danger = active.state.persons.iter().any(|p| {
+                p.armed
+                    || p.injury.as_deref().is_some_and(|i| !i.trim().is_empty())
+                    || p.in_duress >= DURESS_FLOOR
+            });
+            let candidate = if structured_danger {
+                ThreatLevel::LifeThreatening // floor: structured danger forces the top tier
+            } else {
+                model_threat.min(ThreatLevel::ThreatPresent) // ceiling: no life_threatening without it
+            };
             self.raise_threat(active, candidate, now);
         }
         let mut close = self.decay_threat(active, now);
@@ -980,12 +1078,83 @@ impl Engine {
             close = true;
         }
 
+        // 8. MAIN image for the HUD primary pane. NOT concern-gated and NOT
+        //    output-gated — the HUD/journal are never gated, so the kiosk is never
+        //    blank when there is ANY activity (even an ambiguous/resident-only
+        //    frame). Reuse the frames ALREADY captured this tick (no extra HA
+        //    snapshot, no LLM call). Priority-ranked + sticky-downward: a newer
+        //    still only replaces the held one when its rank ≥ the current rank.
+        if let Some((tick_rank, category)) = compute_main_rank(&active.state) {
+            if should_replace_main(active.main_still_rank, tick_rank) {
+                // Pick the camera label whose frame to show. For a person of concern
+                // (rank ≥ 1), prefer a concern person's best_camera then location;
+                // for rank 0 (or if no concern frame resolves) any person-present
+                // location; final fallback: the sole captured frame. Mirrors the
+                // spirit of `pick_still_label`.
+                let mut label: Option<String> = None;
+                if tick_rank >= 1 {
+                    for p in &active.state.persons {
+                        if !p.is_subject_of_concern() {
+                            continue;
+                        }
+                        if let Some(bc) = &p.best_camera {
+                            if stills.contains_key(bc) {
+                                label = Some(bc.clone());
+                                break;
+                            }
+                        }
+                        if let Some(loc) = &p.location {
+                            if stills.contains_key(loc) {
+                                label = Some(loc.clone());
+                                break;
+                            }
+                        }
+                    }
+                }
+                if label.is_none() {
+                    for l in &active.state.locations {
+                        if l.person_present && stills.contains_key(&l.label) {
+                            label = Some(l.label.clone());
+                            break;
+                        }
+                    }
+                }
+                if label.is_none() && stills.len() == 1 {
+                    label = stills.keys().next().cloned();
+                }
+                // Only proceed if we resolved a label that has a frame this tick.
+                if let Some(label) = label {
+                    if let Some(jpeg) = stills.get(&label) {
+                        let still_id = format!("main-{:04}", active.next_still);
+                        active.next_still += 1;
+                        match active.dir.save_still(&still_id, jpeg) {
+                            Ok(_) => {
+                                let camera = self
+                                    .label_to_entity
+                                    .get(&label)
+                                    .cloned()
+                                    .unwrap_or_else(|| label.clone());
+                                active.state.main_still = Some(StillRef {
+                                    id: still_id,
+                                    camera,
+                                    captured_at: now,
+                                });
+                                active.state.main_still_category = Some(category.to_string());
+                                active.main_still_rank = tick_rank;
+                            }
+                            Err(e) => error!("failed to save main still {still_id}: {e:#}"),
+                        }
+                    }
+                }
+            }
+        }
+
         active.state.updated_at = now;
         info!(
             case_id = %active.state.case_id,
             profile = ?active.state.effective_profile,
             threat = ?active.state.threat_level,
-            intruders = active.state.intruders.len(),
+            persons = active.state.persons.len(),
             in_tok = summed.total_input(),
             out_tok = summed.output_tokens,
             cache_read = summed.cache_read_input_tokens,
@@ -1034,11 +1203,11 @@ impl Engine {
             return true;
         }
         let ceiling = if idle >= DECAY_LOW_SECS {
-            ThreatLevel::Info
+            ThreatLevel::Benign
         } else if idle >= DECAY_ELEVATED_SECS {
-            ThreatLevel::Elevated
+            ThreatLevel::ThreatPresent
         } else {
-            ThreatLevel::Critical // no cap inside the active window
+            ThreatLevel::LifeThreatening // no cap inside the active window
         };
         if active.state.threat_level > ceiling {
             self.set_threat(active, ceiling, now, "inactivity");
@@ -1063,8 +1232,8 @@ impl Engine {
             return;
         }
         // Ratchet up so the freshly-promoted case doesn't immediately decay.
-        if active.state.threat_level < ThreatLevel::Elevated {
-            self.set_threat(active, ThreatLevel::Elevated, now, "escalated");
+        if active.state.threat_level < ThreatLevel::ThreatPresent {
+            self.set_threat(active, ThreatLevel::ThreatPresent, now, "escalated");
         }
         info!(
             case_id = %active.state.case_id,
@@ -1148,9 +1317,9 @@ impl Engine {
         let window = self.cfg.loop_config.motion_window_secs;
         let tracked: std::collections::HashSet<String> = active
             .state
-            .intruders
+            .persons
             .iter()
-            .filter_map(|i| i.best_camera.clone())
+            .filter_map(|p| p.best_camera.clone())
             .collect();
         let mut out = Vec::new();
         for cam in &self.cfg.cameras {
@@ -1172,119 +1341,89 @@ impl Engine {
         out
     }
 
-    /// Build the Sonnet instruction for ONE camera's focused assessment. Scopes the
-    /// model to the single frame `label` (so it gives that frame full attention),
-    /// while still passing telemetry + the current intruder roster (so it reuses
-    /// existing `subject-N` ids). The RESIDENT RECOGNITION and WEAPONS & THREATS
-    /// clauses are kept verbatim from the original multi-image instruction.
-    ///
-    /// The OPENING posture is parameterised by `state.effective_profile` (Phase
-    /// 4b): an `Alarm` case is hunting an intruder (today's text); `Investigate`
-    /// vets whether perimeter activity is a prowler vs a resident/known visitor;
-    /// `General` is a quick glance for OBVIOUS danger at a friendly zone.
-    fn live_instruction_camera(&self, state: &CaseState, telemetry: &str, label: &str) -> String {
+    /// Whether camera `label` is the one that TRIGGERED an Investigate case — its
+    /// zone matches the case's `trigger_location` (case-insensitive). With no known
+    /// trigger location, every camera is treated as a trigger camera (more
+    /// scrutiny). Selects the trigger vs ancillary Investigate prompt; irrelevant to
+    /// `Alarm` (which always uses the alarm prompt).
+    fn is_trigger_camera(&self, label: &str, trigger_location: Option<&str>) -> bool {
+        match trigger_location.map(zone_key).filter(|t| !t.is_empty()) {
+            Some(trigger) => zone_key(&self.zone_for_label(label)) == trigger,
+            None => true,
+        }
+    }
+
+    /// Build the per-scenario Sonnet message for ONE camera's focused assessment.
+    /// The universal role + threat-rubric + assessment rules live in the cached
+    /// system prompt ([`SYSTEM_PROMPT`]); this message carries the scenario opener
+    /// (Alarm / Investigate trigger / Investigate ancillary), the single-camera
+    /// scoping, the CONTEXT priors (local time + arm state), telemetry, and the
+    /// current person roster (so ids are reused). `is_trigger` selects the
+    /// Investigate trigger-vs-ancillary opener (ignored for `Alarm`).
+    fn live_instruction_camera(
+        &self,
+        state: &CaseState,
+        telemetry: &str,
+        label: &str,
+        is_trigger: bool,
+    ) -> String {
         // CONTEXT (priors, not triggers). The current local date/time + the alarm
         // arm state inform suspicion but never decide it: a resident arriving home
         // at an odd hour is STILL a resident; an approach while armed-away (with the
         // residents out) merely weights suspicion higher. The local time also lets
         // the model reason recency against any telemetry timestamps — e.g. a
-        // `event.front_door_access` entry the operator adds to `telemetry_entities`
-        // for "recent authorised front-door access" (no special-casing in code;
-        // the model compares that timestamp to the current local time below).
+        // `event.front_door_access` entry the operator adds to `telemetry_entities`.
         let local_time = format_local_time(Utc::now(), &self.cfg.timezone);
-        let arm_state = self
-            .prev_mode
-            .map(|m| m.describe())
-            .unwrap_or("unknown");
+        let arm_state = self.prev_mode.map(|m| m.describe()).unwrap_or("unknown");
         let context = format!(
             "CONTEXT (priors that inform suspicion, NOT triggers — weigh them, don't \
              decide on them). Current local time: {local_time}. House alarm: {arm_state}. \
-             A resident arriving home, even at an odd hour, is still a resident; but a \
-             perimeter or door approach while the house is armed-away (residents out) should \
-             weight your suspicion higher. Compare any access/event timestamps in the \
-             telemetry against this current local time to judge recency."
+             A resident arriving home, even at an odd hour, is still a resident; but a door \
+             or perimeter approach while the house is armed-away (residents out) should weight \
+             your suspicion higher. Compare any access/event timestamps in the telemetry \
+             against this current local time to judge recency."
         );
 
         let mut roster = String::new();
-        if state.intruders.is_empty() {
-            roster.push_str("No intruders detected yet.");
+        if state.persons.is_empty() {
+            roster.push_str("No people detected yet.");
         } else {
-            roster.push_str("Current intruder roster (reuse these ids for the same people):\n");
-            for i in &state.intruders {
+            roster.push_str("Current person roster (reuse these ids for the same people):\n");
+            for p in &state.persons {
                 roster.push_str(&format!(
-                    "- {}: {} (confidence {:.2}, last seen {})\n",
-                    i.id,
-                    i.descriptors,
-                    i.confidence,
-                    i.location.as_deref().unwrap_or("unknown")
+                    "- {}: {} (intruder {:.2} / guest {:.2} / resident {:.2}, last seen {})\n",
+                    p.id,
+                    p.descriptors,
+                    p.intruder_confidence,
+                    p.guest_confidence,
+                    p.resident_confidence,
+                    p.location.as_deref().unwrap_or("unknown")
                 ));
             }
         }
-        // Per-profile opening posture (Phase 4b). The structured output + the
-        // RESIDENT RECOGNITION / WEAPONS & THREATS clauses below are identical
-        // across profiles — only the framing of WHY Argus is looking changes.
-        let posture = match state.effective_profile {
-            TriggerProfile::Alarm => {
-                "The intruder alarm is active; assume an intrusion is in progress."
-            }
+
+        // The scenario opener: `Alarm` always uses the alarm prompt; an Investigate
+        // case uses the trigger-camera prompt for the camera that fired and the
+        // ancillary prompt for the rest.
+        let opener = match state.effective_profile {
+            TriggerProfile::Alarm => ALARM_PROMPT,
             TriggerProfile::Investigate => {
-                "This is a PERIMETER SECURITY smart-alarm assessment while the premises is \
-                 secured. Activity has been detected on an external camera. Your job is the \
-                 smart-alarm decision: is this an INTRUDER, a THREAT, a welcomed VISITOR, or a \
-                 FALSE ALARM (a resident)? Three things matter:\n\
-                 (a) RESIDENT AWARENESS — set `resident_awareness`. Are the residents present and \
-                 ENGAGING any newcomer? 'residents_present_engaging' = a resident is visibly \
-                 interacting with them (waving, talking, walking together, relaxed close \
-                 proximity) — a welcomed guest. 'residents_present_unaware' = a resident is in \
-                 view but oblivious / not interacting. 'residents_absent' = no resident is in the \
-                 scene at all (a lone newcomer). Only say 'engaging' when the interaction is \
-                 genuinely relaxed and mutual.\n\
-                 (b) WEAPON / CONCEALMENT — hunt for a weapon, a ski-mask / balaclava, or any \
-                 face concealment on a newcomer (see the WEAPONS & THREATS clause below). Note it \
-                 in `threats`.\n\
-                 (c) FRAMING — an INTRUDER is a non-resident the residents are NOT aware of (or \
-                 are absent); a VISITOR is a non-resident the residents ARE engaging; a weapon or \
-                 mask on a non-resident is a THREAT; if the only person present is a resident, it \
-                 is a FALSE ALARM. Do not assume an intrusion — assess it."
-            }
-            TriggerProfile::General => {
-                "This is a QUICK doorstep check at a FRIENDLY zone (someone approaching) and is NOT \
-                 an active intrusion. Assume a benign visitor — a delivery, a resident, or an \
-                 ordinary caller. Look for CLEAR, unambiguous signs of danger ONLY: a plainly \
-                 visible weapon IN HAND (gun, knife, bat, crowbar, machete), a balaclava or \
-                 deliberately concealed face, or active forced entry. Set `threat_level` to \
-                 `critical` IF AND ONLY IF you CLEARLY see one of those; otherwise keep it low. Do \
-                 NOT set `armed` or `critical` for an ordinary carried item — a parcel, bag, phone, \
-                 keys, bottle, umbrella, or clipboard is NOT a weapon — nor for any ambiguous or \
-                 unclear object. When in ANY doubt, the visitor is benign: do not flag a threat."
+                if is_trigger {
+                    INVESTIGATE_TRIGGER_PROMPT
+                } else {
+                    INVESTIGATE_ANCILLARY_PROMPT
+                }
             }
         };
+
         format!(
-            "{posture} You are assessing a \
-             SINGLE camera named \"{label}\" — the one still above. Report ONLY what is visible in \
-             this one frame: your `locations` should describe just this camera, and your \
-             `intruders`/`threats` only the people and threats visible in it. Return an updated \
-             structured situation report for this frame.\n\n{context}\n\n{telemetry}\n\n{roster}\n\n\
-             RESIDENT RECOGNITION (critical). The premises briefing names the residents. Only treat \
-             a person as a resident — and therefore EXCLUDE them from `intruders` — when their \
-             appearance matches a named resident BEYOND REASONABLE DOUBT. A mere resemblance \
-             (similar build, hair, skin tone, or clothing) is NOT enough: someone who only looks \
-             like a resident is still an intruder. When in any doubt, classify as an intruder — \
-             fail toward intruder. For every person who is NOT a near-certain resident, either \
-             reuse an existing roster id or coin the next `subject-N`.\n\n\
-             WEAPONS & THREATS (critical). For EVERY person, look closely at their hands and \
-             anything they are holding or carrying. Set `armed` to true if they hold a weapon OR any \
-             object that could plausibly be one — a knife or blade, firearm, bat, stick, screwdriver \
-             or other tool, bottle, or an elongated / pointed / metallic object whose shape or grip \
-             is consistent with a weapon. Name it in `weapon`, hedging when unsure (e.g. \"kitchen \
-             knife\", \"possible knife\", \"elongated object, possibly a blade\"). Do NOT dismiss a \
-             hard-to-make-out handheld object as harmless — during an active intrusion a plausible \
-             weapon must be flagged. (Only an object clearly recognised as benign — a phone, remote, \
-             or cup — is not a weapon.) List every weapon or threat in `threats`, and set \
-             `threat_level` to `critical` whenever a weapon is present or a resident appears to be in \
-             danger.\n\n\
-             Report only what this frame supports. If no person is visible in this camera, return \
-             empty `intruders` and set `person_detected` to false."
+            "{opener}\n\nYou are assessing a SINGLE camera named \"{label}\" — the still above. \
+             Report ONLY what is visible in this one frame: `locations` should describe just this \
+             camera, and `persons` / `threats` / `malicious_activity` only the people and things \
+             visible in it.\n\n{context}\n\n{telemetry}\n\n{roster}\n\n\
+             Reuse an existing roster id for a person already seen; coin the next `subject-N` for a \
+             new person. If no person is visible, return empty `persons` and set `person_detected` \
+             to false."
         )
     }
 
@@ -1319,28 +1458,15 @@ impl Engine {
         // mid-incident. `live.threat_level` is read by the caller as the ratchet
         // candidate.
 
-        // Threats: a full sweep re-baselines the whole list (the model just saw
-        // every camera); a partial tick only saw some cameras, so union its
-        // observations with what we already had rather than dropping the rest.
-        let threats: Vec<String> = live
-            .threats
-            .into_iter()
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty())
-            .collect();
-        if full {
-            let mut deduped: Vec<String> = Vec::new();
-            for t in threats {
-                if !deduped.contains(&t) {
-                    deduped.push(t);
-                }
-            }
-            active.state.threats = deduped;
-        } else {
-            for t in threats {
-                if !active.state.threats.contains(&t) {
-                    active.state.threats.push(t);
-                }
+        // Threats + malicious activity: a full sweep re-baselines the whole list
+        // (the model just saw every camera); a partial tick unions its observations
+        // with what we already had rather than dropping the rest.
+        merge_string_list(&mut active.state.threats, live.threats, full);
+        merge_string_list(&mut active.state.malicious_activity, live.malicious_activity, full);
+        // Each newly observed malicious action earns a once-off milestone.
+        for action in active.state.malicious_activity.clone() {
+            if active.announced_malicious.insert(action.to_lowercase()) {
+                active.state.push_event(now, TimelineKind::MaliciousActivity, action);
             }
         }
 
@@ -1373,20 +1499,29 @@ impl Engine {
             }
         }
 
-        // Intruders: reconcile by stable id.
-        for d in live.intruders {
-            if let Some(existing) = active.state.intruder_mut(&d.id) {
-                existing.confidence = d.confidence;
-                existing.id_quality = d.id_quality;
+        // Persons: reconcile by stable id. Each carries resident/guest/intruder
+        // confidences; a person whose intruder confidence dominates is a "subject
+        // of concern" — those drive the IntruderDetected milestone, voice, and the
+        // forensic pass. Injuries/duress matter for ANY person (an injured resident
+        // is critical too).
+        for d in live.persons {
+            if let Some(existing) = active.state.person_mut(&d.id) {
+                existing.resident_confidence = d.resident_confidence;
+                existing.guest_confidence = d.guest_confidence;
+                existing.intruder_confidence = d.intruder_confidence;
+                existing.id_score = d.id_score;
                 existing.location = self.to_label_opt(d.location);
                 existing.activity = d.activity;
+                existing.in_duress = existing.in_duress.max(d.in_duress);
                 // Don't let the fast loop clobber the firmer Opus descriptors.
                 if !existing.identified {
                     existing.descriptors = d.descriptors;
                 }
                 existing.best_camera = self.to_label_opt(d.best_camera_label);
                 // Weapons latch ON: a person seen armed stays armed even if a later
-                // frame occludes the weapon. Emit a milestone on the OFF→ON edge.
+                // frame occludes the weapon. Stage the milestone, fire it after the
+                // `existing` borrow ends (the milestone helpers re-borrow `active`).
+                let mut weapon_event: Option<(String, Option<String>)> = None;
                 if d.armed {
                     let newly_armed = !existing.armed;
                     existing.armed = true;
@@ -1394,10 +1529,24 @@ impl Engine {
                         existing.weapon = d.weapon.clone();
                     }
                     if newly_armed {
-                        let id = existing.id.clone();
-                        let weapon = existing.weapon.clone();
-                        Self::push_weapon_event(active, &id, weapon.as_deref(), now);
+                        weapon_event = Some((existing.id.clone(), existing.weapon.clone()));
                     }
+                }
+                // Injury latches ON; announce once per person (staged like the weapon).
+                let mut injury_event: Option<(String, String)> = None;
+                if let Some(injury) = non_empty(&d.injury) {
+                    if existing.injury.is_none() {
+                        existing.injury = Some(injury.clone());
+                    }
+                    injury_event = Some((existing.id.clone(), injury));
+                }
+                // `existing` is no longer used past here — the borrow ends, so the
+                // milestone helpers can take `active` mutably.
+                if let Some((id, weapon)) = weapon_event {
+                    Self::push_weapon_event(active, &id, weapon.as_deref(), now);
+                }
+                if let Some((id, injury)) = injury_event {
+                    Self::announce_injury(active, &id, &injury, now);
                 }
             } else {
                 // Honour the model's id if it coined a fresh subject-N; bump our
@@ -1412,29 +1561,41 @@ impl Engine {
                 } else {
                     d.id.clone()
                 };
-                active.state.push_event(
-                    now,
-                    TimelineKind::IntruderDetected,
-                    format!("Intruder {id} detected: {}", d.descriptors),
-                );
-                active.state.intruders.push(Intruder {
+                // Only a person of CONCERN earns the "intruder detected" milestone;
+                // a clearly resident/guest newcomer is recorded silently.
+                if delta_is_concern(&d) {
+                    active.state.push_event(
+                        now,
+                        TimelineKind::IntruderDetected,
+                        format!("Intruder {id} detected: {}", d.descriptors),
+                    );
+                }
+                let injury = non_empty(&d.injury);
+                active.state.persons.push(Person {
                     id: id.clone(),
                     descriptors: d.descriptors,
-                    confidence: d.confidence,
-                    id_quality: d.id_quality,
+                    resident_confidence: d.resident_confidence,
+                    guest_confidence: d.guest_confidence,
+                    intruder_confidence: d.intruder_confidence,
+                    id_score: d.id_score,
                     location: self.to_label_opt(d.location),
                     activity: d.activity,
                     armed: d.armed,
                     weapon: d.weapon.clone(),
+                    injury: injury.clone(),
+                    in_duress: d.in_duress,
                     best_stills: Vec::new(),
                     identified: false,
                     dossier: None,
                     spoken_summary: None,
                     best_camera: self.to_label_opt(d.best_camera_label),
                 });
-                // A first sighting that is already armed earns the weapon milestone too.
+                // A first sighting already armed / injured earns its milestone too.
                 if d.armed {
                     Self::push_weapon_event(active, &id, d.weapon.as_deref(), now);
+                }
+                if let Some(injury) = injury {
+                    Self::announce_injury(active, &id, &injury, now);
                 }
             }
         }
@@ -1496,12 +1657,25 @@ impl Engine {
         active.state.push_event(now, TimelineKind::WeaponDetected, detail);
     }
 
-    /// For each intruder whose best view improved — or who is newly armed (so we
-    /// grab the weapon frame for the kiosk + forensic pass) — save a fresh still
-    /// and SCHEDULE the Opus forensic pass. The Opus call runs CONCURRENTLY (a
-    /// spawned task posting back over `id_tx`) so the live loop keeps its cadence;
-    /// in `--once` (no `id_tx`) it runs inline so the printed state is complete.
-    async fn upgrade_intruders(
+    /// Push an `InjuryDetected` milestone for `id` (once per person), naming the
+    /// injury. The voice gate renders a casualty line and PagerDuty re-pages.
+    fn announce_injury(active: &mut ActiveCase, id: &str, injury: &str, now: chrono::DateTime<Utc>) {
+        if active.injury_announced.insert(id.to_string()) {
+            active.state.push_event(
+                now,
+                TimelineKind::InjuryDetected,
+                format!("{id} appears injured: {injury}."),
+            );
+        }
+    }
+
+    /// For each person of CONCERN whose best view improved — or who is newly armed
+    /// (so we grab the weapon frame for the kiosk + forensic pass) — save a fresh
+    /// still and SCHEDULE the Opus forensic pass. A clearly resident/guest person is
+    /// not profiled. The Opus call runs CONCURRENTLY (a spawned task posting back
+    /// over `id_tx`) so the live loop keeps its cadence; in `--once` (no `id_tx`) it
+    /// runs inline so the printed state is complete.
+    async fn upgrade_persons(
         &mut self,
         active: &mut ActiveCase,
         stills: &HashMap<String, Vec<u8>>,
@@ -1509,17 +1683,21 @@ impl Engine {
     ) {
         // Collect the work first (immutable scan), then mutate.
         let mut jobs: Vec<(String, String, Vec<u8>)> = Vec::new(); // (id, camera_label, jpeg)
-        for intruder in &active.state.intruders {
-            // Don't queue a second forensic pass while one is already in flight.
-            if active.identifying.contains(&intruder.id) {
+        for person in &active.state.persons {
+            // Only profile a subject of concern (intruder-dominant); skip a clearly
+            // resident/guest person — no point spending Opus to ID a known person.
+            if !person.is_subject_of_concern() {
                 continue;
             }
-            // Pick the CLEAREST frame for the forensic pass: `best_camera` now
-            // tracks the highest-`id_quality` view (set in the merge). The live
-            // model often leaves it null on early ticks, so fall back to the
-            // intruder's current location, then any person-present camera, so Opus
-            // still starts on the FIRST detection.
-            let Some(label) = pick_still_label(intruder, stills, &active.state.locations) else {
+            // Don't queue a second forensic pass while one is already in flight.
+            if active.identifying.contains(&person.id) {
+                continue;
+            }
+            // Pick the CLEAREST frame for the forensic pass: `best_camera` tracks the
+            // highest-`id_score` view (set in the merge). The live model often leaves
+            // it null on early ticks, so fall back to the person's current location,
+            // then any person-present camera, so Opus still starts on the FIRST sighting.
+            let Some(label) = pick_still_label(person, stills, &active.state.locations) else {
                 continue;
             };
             let Some(jpeg) = stills.get(&label) else {
@@ -1528,19 +1706,19 @@ impl Engine {
             // (Re)profile when the FRAME got meaningfully clearer than the one we
             // last profiled — chase a better picture rather than a confidence
             // wobble. First sighting always profiles (so the record fills fast).
-            let last = active.still_quality.get(&intruder.id).copied();
+            let last = active.still_quality.get(&person.id).copied();
             let clearer = match last {
                 None => true,
-                Some(prev) => intruder.id_quality >= prev + QUALITY_IMPROVE,
+                Some(prev) => person.id_score >= prev + QUALITY_IMPROVE,
             };
             // Always capture a still the first time someone is seen armed, so the
             // weapon frame reaches the kiosk + Opus even if the frame was no clearer.
-            let weapon_capture = intruder.armed && !active.weapon_still.contains(&intruder.id);
+            let weapon_capture = person.armed && !active.weapon_still.contains(&person.id);
             if clearer || weapon_capture {
                 if weapon_capture {
-                    active.weapon_still.insert(intruder.id.clone());
+                    active.weapon_still.insert(person.id.clone());
                 }
-                jobs.push((intruder.id.clone(), label, jpeg.clone()));
+                jobs.push((person.id.clone(), label, jpeg.clone()));
             }
         }
 
@@ -1562,10 +1740,10 @@ impl Engine {
                 camera,
                 captured_at: now,
             };
-            if let Some(intruder) = active.state.intruder_mut(&id) {
-                intruder.best_stills.insert(0, still_ref);
-                intruder.best_stills.truncate(MAX_BEST_STILLS);
-                active.still_quality.insert(id.clone(), intruder.id_quality);
+            if let Some(person) = active.state.person_mut(&id) {
+                person.best_stills.insert(0, still_ref);
+                person.best_stills.truncate(MAX_BEST_STILLS);
+                active.still_quality.insert(id.clone(), person.id_score);
             }
             active.state.push_event(
                 now,
@@ -1579,12 +1757,12 @@ impl Engine {
                 // Daemon: spawn so the live loop never blocks on Opus.
                 Some(tx) => {
                     let opus = self.opus.clone();
+                    // Forensic ID gets the SEED only (not the live SYSTEM_PROMPT).
                     let seed = self.seed.clone();
-                    let residents = self.resident_photos.clone();
                     let case_id = active.state.case_id.clone();
                     tokio::spawn(async move {
                         let (ident, usage) =
-                            run_identify(&opus, &seed, &residents, &label, &jpeg).await;
+                            run_identify(&opus, &seed, &label, &jpeg).await;
                         let _ = tx
                             .send(IdResult {
                                 case_id,
@@ -1600,7 +1778,6 @@ impl Engine {
                     let (ident, usage) = run_identify(
                         &self.opus,
                         &self.seed,
-                        &self.resident_photos,
                         &label,
                         &jpeg,
                     )
@@ -1647,9 +1824,9 @@ impl Engine {
         self.active = Some(active);
     }
 
-    /// Merge an `Identification` into intruder `id`: firm descriptors/dossier,
-    /// latch armed/weapon (emitting `WeaponDetected` on the OFF→ON edge), push the
-    /// `IntruderIdentified` milestone ONCE (on the first identification), and
+    /// Merge an `Identification` into person `id`: firm descriptors/dossier, latch
+    /// armed/weapon (emitting `WeaponDetected` on the OFF→ON edge) and any injury,
+    /// push the `IntruderIdentified` milestone ONCE (on the first solid id), and
     /// ratchet the threat to Critical on a fresh weapon confirmation.
     fn apply_identification(
         &self,
@@ -1660,49 +1837,64 @@ impl Engine {
     ) {
         let mut newly_armed = false;
         let mut weapon_for_event: Option<String> = None;
+        let mut new_injury: Option<String> = None;
         // The forensic pass re-runs as clearer stills arrive (firming up
         // descriptors). The `IntruderIdentified` milestone — which drives the
-        // spoken profile + the PagerDuty page — fires ONCE per intruder, and only
-        // once the identification is solid (`confidence >= ID_SPEAK_CONF`), so the
-        // announced profile isn't a guess off a first-glimpse frame. Every pass
-        // still updates the record (descriptors/dossier/best-still) silently.
-        let confidence;
-        if let Some(intruder) = active.state.intruder_mut(id) {
-            intruder.descriptors = ident.descriptors;
-            intruder.dossier = Some(ident.dossier);
-            let summary = ident.spoken_summary.trim();
-            if !summary.is_empty() {
-                intruder.spoken_summary = Some(summary.to_string());
+        // spoken profile + the PagerDuty page — fires ONCE per person, and only once
+        // the identification is solid (`ident.confidence >= ID_SPEAK_CONF`), so the
+        // announced profile isn't a guess off a first-glimpse frame. Every pass still
+        // updates the record (descriptors/dossier/best-still) silently.
+        if let Some(person) = active.state.person_mut(id) {
+            // Guard against a degenerate forensic output (a model occasionally
+            // stubs a free-text field to "placeholder" / empty): never overwrite a
+            // good value with junk, and never speak/page a stub. The Sonnet
+            // descriptors stand if Opus returns nothing meaningful.
+            if meaningful(&ident.descriptors) {
+                person.descriptors = ident.descriptors;
             }
-            intruder.confidence = intruder.confidence.max(ident.confidence);
-            intruder.identified = true;
-            confidence = intruder.confidence;
+            if meaningful(&ident.dossier) {
+                person.dossier = Some(ident.dossier);
+            }
+            if meaningful(&ident.spoken_summary) {
+                person.spoken_summary = Some(ident.spoken_summary.trim().to_string());
+            }
+            person.identified = true;
             // The forensic pass can be what first confirms a weapon a grainy live
             // frame missed. Latch armed ON; never clear it.
             if ident.armed {
-                newly_armed = !intruder.armed;
-                intruder.armed = true;
-                if intruder.weapon.is_none() {
-                    intruder.weapon = ident.weapon.clone();
+                newly_armed = !person.armed;
+                person.armed = true;
+                if person.weapon.is_none() {
+                    person.weapon = ident.weapon.clone();
                 }
-                weapon_for_event = intruder.weapon.clone();
+                weapon_for_event = person.weapon.clone();
+            }
+            // Latch any injury the forensic pass can confirm.
+            if let Some(injury) = non_empty(&ident.injury) {
+                if person.injury.is_none() {
+                    person.injury = Some(injury.clone());
+                }
+                new_injury = Some(injury);
             }
         } else {
-            return; // intruder gone (shouldn't happen mid-case)
+            return; // person gone (shouldn't happen mid-case)
         }
         // Announce (+ page) the first time we have a confident-enough profile.
-        if confidence >= ID_SPEAK_CONF && active.id_spoken.insert(id.to_string()) {
+        if ident.confidence >= ID_SPEAK_CONF && active.id_spoken.insert(id.to_string()) {
             active.state.push_event(
                 now,
                 TimelineKind::IntruderIdentified,
                 format!("{id} identified: {}", ident.distinguishing_features),
             );
         }
+        if let Some(injury) = new_injury {
+            Self::announce_injury(active, id, &injury, now);
+        }
         if newly_armed {
             Self::push_weapon_event(active, id, weapon_for_event.as_deref(), now);
             // A forensic weapon confirmation is fresh activity → ratchet to Critical.
             active.last_activity = now;
-            self.raise_threat(active, ThreatLevel::Critical, now);
+            self.raise_threat(active, ThreatLevel::LifeThreatening, now);
         }
     }
 
@@ -1729,8 +1921,8 @@ impl Engine {
 /// - `threat_level`: MAX across calls (`Info < Elevated < Critical`).
 /// - `person_detected`: logical OR.
 /// - `locations`: concatenated (each call contributes its own camera).
-/// - `threats`: concatenated, trimmed, empties dropped, first occurrence kept.
-/// - `intruders`: reconciled by `id` — see `merge_intruders`.
+/// - `threats` / `malicious_activity`: concatenated, trimmed, empties dropped, deduped.
+/// - `persons`: reconciled by `id` — see `merge_persons`.
 /// - `summary`: the per-camera summaries of cameras that saw a person, joined
 ///   with "; "; a clear-all line if none did.
 fn merge_camera_assessments(results: Vec<LiveAssessment>) -> LiveAssessment {
@@ -1738,21 +1930,18 @@ fn merge_camera_assessments(results: Vec<LiveAssessment>) -> LiveAssessment {
         .iter()
         .map(|r| r.threat_level)
         .max()
-        .unwrap_or(ThreatLevel::Info);
+        .unwrap_or(ThreatLevel::Benign);
     let person_detected = results.iter().any(|r| r.person_detected);
 
     let mut locations: Vec<LocationDelta> = Vec::new();
     let mut threats: Vec<String> = Vec::new();
+    let mut malicious_activity: Vec<String> = Vec::new();
     let mut summaries: Vec<String> = Vec::new();
     for r in &results {
         locations.extend(r.locations.iter().cloned());
-        for t in &r.threats {
-            let t = t.trim();
-            if !t.is_empty() && !threats.iter().any(|e| e == t) {
-                threats.push(t.to_string());
-            }
-        }
-        if r.person_detected || !r.intruders.is_empty() {
+        dedup_extend(&mut threats, &r.threats);
+        dedup_extend(&mut malicious_activity, &r.malicious_activity);
+        if r.person_detected || !r.persons.is_empty() {
             let s = r.summary.trim();
             if !s.is_empty() {
                 summaries.push(s.to_string());
@@ -1760,7 +1949,7 @@ fn merge_camera_assessments(results: Vec<LiveAssessment>) -> LiveAssessment {
         }
     }
 
-    let intruders = merge_intruders(&results);
+    let persons = merge_persons(&results);
 
     let summary = if summaries.is_empty() {
         "No persons detected on the assessed cameras.".to_string()
@@ -1768,51 +1957,39 @@ fn merge_camera_assessments(results: Vec<LiveAssessment>) -> LiveAssessment {
         summaries.join("; ")
     };
 
-    // Resident-awareness (the Investigate signal): take the MOST engaged read any
-    // camera reported this tick — a resident engaging the newcomer on ANY frame is
-    // the decisive signal, and it shouldn't be diluted by another camera that just
-    // sees the stranger alone. `engage > unaware > absent > unknown`.
-    let resident_awareness = results
-        .iter()
-        .filter_map(|r| r.resident_awareness)
-        .max_by_key(|a| awareness_rank(*a));
-
     LiveAssessment {
         summary,
         threat_level,
         person_detected,
         locations,
-        intruders,
+        persons,
         threats,
-        resident_awareness,
+        malicious_activity,
     }
 }
 
-/// Rank a `ResidentAwareness` for the "most engaged read wins" merge across
-/// cameras. Higher = more decisive for distinguishing a welcomed visitor.
-fn awareness_rank(a: ResidentAwareness) -> u8 {
-    match a {
-        ResidentAwareness::ResidentsPresentEngaging => 3,
-        ResidentAwareness::ResidentsPresentUnaware => 2,
-        ResidentAwareness::ResidentsAbsent => 1,
-        ResidentAwareness::Unknown => 0,
+/// Append the trimmed, non-empty, not-already-present items of `src` to `acc`.
+fn dedup_extend(acc: &mut Vec<String>, src: &[String]) {
+    for s in src {
+        let s = s.trim();
+        if !s.is_empty() && !acc.iter().any(|e| e == s) {
+            acc.push(s.to_string());
+        }
     }
 }
 
-/// Reconcile the per-camera intruder deltas by stable `id` into one delta each,
-/// preserving order of first appearance. Within an id group:
-/// - `armed` = OR (any camera that saw them armed wins);
-/// - `weapon` = first non-empty weapon, preferring one from an armed sighting;
-/// - `confidence` = MAX; `id_quality` = MAX (best frame for ID anywhere this tick);
-/// - `descriptors` = from the highest-confidence sighting;
-/// - `location`/`activity` = from the highest-confidence sighting;
-/// - `best_camera_label` = the camera of the highest-`id_quality` sighting (so the
-///   forensic pass profiles on the CLEAREST view), falling back to any non-null one.
-fn merge_intruders(results: &[LiveAssessment]) -> Vec<IntruderDelta> {
+/// Reconcile the per-camera person deltas by stable `id` into one delta each,
+/// preserving order of first appearance. The CLEAREST sighting (max `id_score`)
+/// drives the per-person reads. Within an id group:
+/// - class confidences / `descriptors` / `location` / `activity`: from the clearest sighting;
+/// - `armed` = OR; `weapon` = first non-empty, preferring an armed sighting;
+/// - `injury` = first non-empty; `in_duress` = MAX; `id_score` = MAX;
+/// - `best_camera_label` = the clearest sighting's camera, then its location, then any.
+fn merge_persons(results: &[LiveAssessment]) -> Vec<PersonDelta> {
     let mut order: Vec<String> = Vec::new();
-    let mut groups: HashMap<String, Vec<IntruderDelta>> = HashMap::new();
+    let mut groups: HashMap<String, Vec<PersonDelta>> = HashMap::new();
     for r in results {
-        for d in &r.intruders {
+        for d in &r.persons {
             if !groups.contains_key(&d.id) {
                 order.push(d.id.clone());
             }
@@ -1820,50 +1997,82 @@ fn merge_intruders(results: &[LiveAssessment]) -> Vec<IntruderDelta> {
         }
     }
 
-    let mut out: Vec<IntruderDelta> = Vec::with_capacity(order.len());
+    let mut out: Vec<PersonDelta> = Vec::with_capacity(order.len());
     for id in order {
         let group = &groups[&id];
-        // Highest-confidence sighting (first wins ties) drives descriptors +
-        // location/activity/best_camera.
-        let best = group
+        // The clearest sighting (max id_score, first wins ties) drives descriptors,
+        // the class confidences, and location/activity/best_camera.
+        let clearest = group
             .iter()
-            .max_by(|a, b| a.confidence.total_cmp(&b.confidence))
+            .max_by(|a, b| a.id_score.total_cmp(&b.id_score))
             .expect("group is non-empty");
         let armed = group.iter().any(|d| d.armed);
-        let confidence = group.iter().map(|d| d.confidence).fold(f32::MIN, f32::max);
-        let id_quality = group.iter().map(|d| d.id_quality).fold(f32::MIN, f32::max);
+        let id_score = group.iter().map(|d| d.id_score).fold(f32::MIN, f32::max);
+        let in_duress = group.iter().map(|d| d.in_duress).fold(f32::MIN, f32::max);
         // Prefer a weapon from an armed sighting; else any non-empty weapon.
         let weapon = group
             .iter()
             .filter(|d| d.armed)
             .find_map(|d| non_empty(&d.weapon))
             .or_else(|| group.iter().find_map(|d| non_empty(&d.weapon)));
-        // best_camera_label: the camera with the CLEAREST view of this person (max
-        // id_quality) so the forensic pass profiles on the best shot; fall back to
-        // its reported location, then any non-null best_camera in the group.
-        let clearest = group
-            .iter()
-            .max_by(|a, b| a.id_quality.total_cmp(&b.id_quality))
-            .expect("group is non-empty");
+        let injury = group.iter().find_map(|d| non_empty(&d.injury));
         let best_camera_label = clearest
             .best_camera_label
             .clone()
             .or_else(|| clearest.location.clone())
             .or_else(|| group.iter().find_map(|d| d.best_camera_label.clone()));
 
-        out.push(IntruderDelta {
+        out.push(PersonDelta {
             id,
-            descriptors: best.descriptors.clone(),
-            confidence,
-            id_quality,
-            location: best.location.clone(),
-            activity: best.activity.clone(),
+            descriptors: clearest.descriptors.clone(),
+            resident_confidence: clearest.resident_confidence,
+            guest_confidence: clearest.guest_confidence,
+            intruder_confidence: clearest.intruder_confidence,
+            id_score,
+            location: clearest.location.clone(),
+            activity: clearest.activity.clone(),
             best_camera_label,
             armed,
             weapon,
+            injury,
+            in_duress,
         });
     }
     out
+}
+
+/// Merge a delta's free-text string list into the case's accumulator. A full
+/// sweep re-baselines (the model just saw every camera); a partial tick unions
+/// (it only saw some). Trims, drops empties, dedups (first occurrence kept).
+fn merge_string_list(acc: &mut Vec<String>, delta: Vec<String>, full: bool) {
+    let items: Vec<String> = delta
+        .into_iter()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if full {
+        let mut deduped: Vec<String> = Vec::new();
+        for t in items {
+            if !deduped.contains(&t) {
+                deduped.push(t);
+            }
+        }
+        *acc = deduped;
+    } else {
+        for t in items {
+            if !acc.contains(&t) {
+                acc.push(t);
+            }
+        }
+    }
+}
+
+/// Mirror of [`Person::is_subject_of_concern`] for a live delta — true when the
+/// intruder confidence dominates (and clears [`CONCERN_INTRUDER_FLOOR`]).
+fn delta_is_concern(d: &PersonDelta) -> bool {
+    d.intruder_confidence >= CONCERN_INTRUDER_FLOOR
+        && d.intruder_confidence >= d.resident_confidence
+        && d.intruder_confidence >= d.guest_confidence
 }
 
 /// Return a trimmed non-empty clone of an optional string, else `None`.
@@ -1872,6 +2081,14 @@ fn non_empty(s: &Option<String>) -> Option<String> {
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .map(str::to_string)
+}
+
+/// Whether a forensic free-text field carries real content — non-empty and not a
+/// stub ("placeholder"). Guards against a degenerate model output being recorded
+/// or spoken (see `apply_identification`).
+fn meaningful(s: &str) -> bool {
+    let t = s.trim();
+    !t.is_empty() && !t.eq_ignore_ascii_case("placeholder")
 }
 
 /// Normalise a zone name to a comparison key (trimmed, lower-cased) so the
@@ -1903,52 +2120,7 @@ fn format_local_time(now: DateTime<Utc>, tz_name: &str) -> String {
     format!("{} ({})", local.format("%A %-d %B %Y, %H:%M"), tz_name)
 }
 
-/// Derive the `Investigate` smart-alarm verdict for the current case state +
-/// the merged `resident_awareness` of this tick. Pure (no IO), so unit-testable.
-///
-/// Precedence (most severe first):
-/// 1. **Threat** — a weapon / mask / face-concealment on a person (armed intruder,
-///    or an obvious-threat keyword in the model's free text).
-/// 2. **Intruder** — a genuine stranger present (a non-resident on the roster —
-///    the model excludes near-certain residents) AND residents are ABSENT or
-///    PRESENT-but-UNAWARE (`Unknown` falls here too: fail toward intruder).
-/// 3. **Visitor** — a stranger present BUT residents are present and ENGAGING them.
-/// 4. **FalseAlarm** — NO genuine stranger, but a person was seen (it was a
-///    resident → no real stranger).
-/// 5. **Undetermined** — nothing of note yet (no stranger, no person) — keep going.
-fn classify_investigate(state: &CaseState, awareness: ResidentAwareness) -> InvestigateOutcome {
-    let stranger_present = !state.intruders.is_empty();
-
-    // 1. Threat — a weapon/mask on a person. An armed intruder, or a free-text
-    //    face-concealment/weapon indicator while a stranger is present.
-    let armed = state.intruders.iter().any(|i| i.armed);
-    if stranger_present && (armed || obvious_threat(state)) {
-        return InvestigateOutcome::Threat;
-    }
-
-    if stranger_present {
-        // 2/3. A genuine stranger: engaging residents ⇒ Visitor; otherwise (absent /
-        //      unaware / unknown) ⇒ Intruder. Fail toward intruder on `Unknown`.
-        return match awareness {
-            ResidentAwareness::ResidentsPresentEngaging => InvestigateOutcome::Visitor,
-            ResidentAwareness::ResidentsAbsent
-            | ResidentAwareness::ResidentsPresentUnaware
-            | ResidentAwareness::Unknown => InvestigateOutcome::Intruder,
-        };
-    }
-
-    // 4. No stranger, but a person was seen this case (the model classed them a
-    //    resident → no genuine stranger): a false alarm.
-    let person_seen = state.locations.iter().any(|l| l.person_present);
-    if person_seen {
-        return InvestigateOutcome::FalseAlarm;
-    }
-
-    // 5. Nothing yet.
-    InvestigateOutcome::Undetermined
-}
-
-/// The Phase-4b per-tick escalation verdict for a gated case (pure of IO so it is
+/// The per-tick escalation verdict for a gated case (pure of IO so it is
 /// unit-testable; [`Engine::evaluate_promotion`] acts on it).
 #[derive(Debug, PartialEq, Eq)]
 enum PromotionDecision {
@@ -1962,74 +2134,47 @@ enum PromotionDecision {
 }
 
 /// Decide the escalation verdict for an ACTIVE case this tick. No-op
-/// (`Continue`) for an already-`Alarm`/escalated case. For a gated profile:
-/// - **Always-escalate (any profile):** an armed intruder, `threat_level ==
-///   Critical`, or a resident-in-danger signal.
-/// - **`General`:** also escalate on an OBVIOUS threat indicator (weapon /
-///   face-concealment / balaclava); else quiet standdown once `tick_count` reaches
-///   `GENERAL_STANDDOWN_TICKS`.
-/// - **`Investigate`:** escalate on a confirmed intruder behaving as a prowler;
-///   else quiet standdown once `investigate_deadline` passes.
+/// (`Continue`) for an already-`Alarm`/escalated case. A gated `Investigate` case
+/// escalates to full `Alarm` once it concludes a genuine threat — i.e. the threat
+/// reaches `≥ threat_present` (an intruder, armed or not). The specific structured
+/// signals (armed / injury / duress ≥ [`DURESS_FLOOR`]) are checked first for a
+/// precise reason string; they also force `life_threatening` anyway. We deliberately
+/// do NOT scan the model's free text (that substring-matched "no weapon visible" →
+/// "weapon" and false-fired on a benign delivery driver, incident 2026-06-20).
+/// With nothing of concern the shallow double-check quietly stands down once
+/// `tick_count` reaches [`INVESTIGATE_STANDDOWN_TICKS`].
 fn decide_promotion(active: &ActiveCase) -> PromotionDecision {
     if active.escalated || !active.state.gated() {
         return PromotionDecision::Continue;
     }
     let state = &active.state;
 
-    // Always-escalate set (shared by both gated profiles).
-    if state.intruders.iter().any(|i| i.armed) {
-        return PromotionDecision::Promote("armed intruder");
+    // Specific structured signals first (precise reason), then the general
+    // threat-present bar — a confident intruder, armed or not.
+    if state.persons.iter().any(|p| p.armed) {
+        return PromotionDecision::Promote("armed person");
     }
-    if state.threat_level >= ThreatLevel::Critical {
-        return PromotionDecision::Promote("critical threat");
+    if state
+        .persons
+        .iter()
+        .any(|p| p.injury.as_deref().is_some_and(|i| !i.trim().is_empty()))
+    {
+        return PromotionDecision::Promote("person injured");
     }
-    if resident_in_danger(state) {
-        return PromotionDecision::Promote("resident in danger");
+    if state.persons.iter().any(|p| p.in_duress >= DURESS_FLOOR) {
+        return PromotionDecision::Promote("person in duress");
+    }
+    if state.threat_level >= ThreatLevel::ThreatPresent {
+        return PromotionDecision::Promote("threat present");
     }
 
-    match state.effective_profile {
-        TriggerProfile::Alarm => PromotionDecision::Continue, // unreachable (gated ruled out)
-        TriggerProfile::General => {
-            // General escalates ONLY via the structured always-escalate set above —
-            // an `armed` intruder, a model-set `threat_level == Critical`, or a
-            // resident in danger. These are explicit, high-confidence signals.
-            // It deliberately does NOT escalate on free-text scene description: that
-            // substring-matched "no weapon visible" → "weapon" and false-fired on a
-            // benign delivery driver (incident 2026-06-20). The doorstep prompt
-            // makes the model reserve `armed`/`critical` for a CLEARLY visible weapon
-            // or balaclava, so those structured signals are trustworthy here.
-            // Otherwise the shallow glance quietly stands down after its budget.
-            if active.tick_count + 1 >= GENERAL_STANDDOWN_TICKS {
-                // +1: this is the (tick_count)-th tick about to complete.
-                PromotionDecision::Standdown
-            } else {
-                PromotionDecision::Continue
-            }
-        }
-        TriggerProfile::Investigate => {
-            // The smart-alarm outcome (derived each tick in `run_tick`) drives the
-            // resolution: a Threat/Intruder promotes (full Alarm + real-alarm trip,
-            // persistence-gated); a Visitor/FalseAlarm quietly stands down; an
-            // Undetermined keeps assessing until the deadline, then stands down
-            // (treated as benign — residents/visitor, never an alarm).
-            match state.investigate_outcome {
-                InvestigateOutcome::Threat => PromotionDecision::Promote("threat detected"),
-                InvestigateOutcome::Intruder => PromotionDecision::Promote("intruder detected"),
-                InvestigateOutcome::Visitor | InvestigateOutcome::FalseAlarm => {
-                    PromotionDecision::Standdown
-                }
-                InvestigateOutcome::Undetermined => {
-                    if active
-                        .investigate_deadline
-                        .is_some_and(|d| Instant::now() >= d)
-                    {
-                        PromotionDecision::Standdown
-                    } else {
-                        PromotionDecision::Continue
-                    }
-                }
-            }
-        }
+    // Nothing of concern: the shallow Investigate double-check quietly stands down
+    // once its tick budget elapses. (`Alarm` is unreachable here — gated ruled out.)
+    if active.tick_count + 1 >= INVESTIGATE_STANDDOWN_TICKS {
+        // +1: this is the (tick_count)-th tick about to complete.
+        PromotionDecision::Standdown
+    } else {
+        PromotionDecision::Continue
     }
 }
 
@@ -2108,71 +2253,6 @@ fn mark_promoted(active: &mut ActiveCase, reason: &str, now: DateTime<Utc>) -> b
     true
 }
 
-/// Does any free-text `threats` line (or the summary) contain one of `needles`
-/// (case-insensitive substring)? The live model writes danger signs as free text
-/// (`threats`) plus a one-line `summary`; the escalation policy scans both. Used
-/// to detect resident-in-danger / face-concealment / forced-entry indicators the
-/// structured fields don't capture as a boolean.
-/// Negation-aware keyword scan over the model's free text (summary + `threats`).
-/// Split into clauses so a needle only counts in a clause that is NOT negated —
-/// the model's "no weapon visible" / "no mask" narration must never fire an
-/// escalation (this exact substring false-match caused the 2026-06-20 false alarm).
-fn threats_mention(state: &CaseState, needles: &[&str]) -> bool {
-    const NEG: &[&str] = &[
-        "no ", "not ", "n't", "without", "nothing", "no sign", "benign",
-        "ordinary", "unremarkable",
-    ];
-    let mut hay = state.summary.to_lowercase();
-    for t in &state.threats {
-        hay.push('\n');
-        hay.push_str(&t.to_lowercase());
-    }
-    hay.split(|c| matches!(c, '.' | ',' | ';' | '\n' | '!'))
-        .any(|clause| {
-            needles.iter().any(|n| clause.contains(n))
-                && !NEG.iter().any(|neg| clause.contains(neg))
-        })
-}
-
-/// Affirmative concealment / forced-entry sign for the softer profiles. WEAPONS are
-/// handled STRUCTURALLY via `Intruder.armed` (the model's explicit boolean), so
-/// weapon keywords are deliberately NOT scanned here — the old version substring-
-/// matched "no weapon visible" → "weapon" and promoted a benign delivery driver to
-/// a full house alarm (incident 2026-06-20). Negation-aware via `threats_mention`.
-fn obvious_threat(state: &CaseState) -> bool {
-    threats_mention(
-        state,
-        &[
-            "balaclava", "ski mask", "ski-mask", "masked", "face conceal",
-            "face cover", "covered face", "concealed face", "forced entry",
-            "forcing the", "prying", "jimmying", "crowbar", "breaking in",
-        ],
-    )
-}
-
-/// A resident appears to be in apparent danger — the always-escalate signal that
-/// is independent of an intruder being armed (e.g. a person grabbed, threatened,
-/// or a struggle visible). Read from the free-text threat observations.
-fn resident_in_danger(state: &CaseState) -> bool {
-    threats_mention(
-        state,
-        &[
-            "resident in danger",
-            "in danger",
-            "being attacked",
-            "under threat",
-            "struggle",
-            "hostage",
-            "assault",
-        ],
-    )
-}
-
-/// An OBVIOUS threat indicator at a friendly zone (the `General` escalation bar):
-/// a visibly brandished weapon, face concealment (balaclava / mask), or
-/// forced-entry behaviour. `armed`/`Critical` are handled by the always-escalate
-/// set; this catches the obvious-but-not-yet-Critical signals from the free text.
-
 /// Ensure the subject counter is at least `n` (used when the model coins ids).
 fn self_next_subject_at_least(active: &mut ActiveCase, n: u32) {
     if active.next_subject < n {
@@ -2180,22 +2260,53 @@ fn self_next_subject_at_least(active: &mut ActiveCase, n: u32) {
     }
 }
 
-/// Choose the camera label whose still feeds the forensic pass for `intruder`,
+/// Whether a tick's MAIN-image candidate (rank `tick_rank`) should REPLACE the
+/// currently-held main image (rank `current_rank`). Sticky-downward: a newer
+/// still of the same OR higher category replaces, a lower one NEVER does. Pure +
+/// unit-tested.
+fn should_replace_main(current_rank: u8, tick_rank: u8) -> bool {
+    tick_rank >= current_rank
+}
+
+/// Compute the MAIN-image priority rank for the current case state, with the
+/// category string for the HUD label. Returns `None` when there is NO activity at
+/// all (no person anywhere) — the caller then leaves the existing main image as-is.
+/// Ranks (high→low): 3 life_threatening / 2 malicious / 1 intruder / 0 any-person.
+/// Pure + unit-tested.
+fn compute_main_rank(state: &CaseState) -> Option<(u8, &'static str)> {
+    if state.threat_level == ThreatLevel::LifeThreatening {
+        return Some((3, "life_threatening"));
+    }
+    if !state.malicious_activity.is_empty() {
+        return Some((2, "malicious"));
+    }
+    if state.persons.iter().any(|p| p.is_subject_of_concern()) {
+        return Some((1, "intruder"));
+    }
+    let any_person =
+        !state.persons.is_empty() || state.locations.iter().any(|l| l.person_present);
+    if any_person {
+        return Some((0, "any"));
+    }
+    None
+}
+
+/// Choose the camera label whose still feeds the forensic pass for `person`,
 /// from the frames captured THIS tick (`stills`, keyed by camera label). Tries,
-/// in order: the model's `best_camera`, the intruder's current `location`, any
+/// in order: the model's `best_camera`, the person's current `location`, any
 /// person-present location we captured, then — if only one camera was captured —
-/// that one. `None` means we can't tie this intruder to a frame yet.
+/// that one. `None` means we can't tie this person to a frame yet.
 fn pick_still_label(
-    intruder: &Intruder,
+    person: &Person,
     stills: &HashMap<String, Vec<u8>>,
     locations: &[LocationObservation],
 ) -> Option<String> {
-    if let Some(bc) = &intruder.best_camera {
+    if let Some(bc) = &person.best_camera {
         if stills.contains_key(bc) {
             return Some(bc.clone());
         }
     }
-    if let Some(loc) = &intruder.location {
+    if let Some(loc) = &person.location {
         if stills.contains_key(loc) {
             return Some(loc.clone());
         }
@@ -2214,7 +2325,7 @@ fn pick_still_label(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::case::{CaseState, Intruder};
+    use crate::case::{CaseState, Person};
 
     /// Build a bare `ActiveCase` for the escalation-decision tests. The `CaseDir`
     /// is rooted in a unique per-test temp dir (the decision/state helpers under
@@ -2233,18 +2344,15 @@ mod tests {
             id_spoken: HashSet::new(),
             identifying: HashSet::new(),
             weapon_still: HashSet::new(),
+            injury_announced: HashSet::new(),
+            announced_malicious: HashSet::new(),
             last_activity: now,
             tick_count: 0,
             announced_zones: HashSet::new(),
             initial_zone_recorded: false,
             escalated: profile == TriggerProfile::Alarm,
-            investigate_deadline: match profile {
-                TriggerProfile::Investigate => {
-                    Some(Instant::now() + Duration::from_secs(INVESTIGATE_DEADLINE_SECS))
-                }
-                _ => None,
-            },
             escalation_streak: 0,
+            main_still_rank: 0,
         }
     }
 
@@ -2260,16 +2368,21 @@ mod tests {
         t ^ ((n as u128) << 96)
     }
 
-    fn intruder(id: &str, armed: bool) -> Intruder {
-        Intruder {
+    /// A person of concern (intruder confidence dominant), optionally armed.
+    fn person(id: &str, armed: bool) -> Person {
+        Person {
             id: id.to_string(),
             descriptors: "test".to_string(),
-            confidence: 0.9,
-            id_quality: 0.8,
+            resident_confidence: 0.1,
+            guest_confidence: 0.1,
+            intruder_confidence: 0.9,
+            id_score: 0.8,
             location: None,
             activity: None,
             armed,
             weapon: if armed { Some("knife".to_string()) } else { None },
+            injury: None,
+            in_duress: 0.0,
             best_stills: Vec::new(),
             identified: false,
             dossier: None,
@@ -2278,17 +2391,17 @@ mod tests {
         }
     }
 
-    /// A `General` case with nothing of concern QUIETLY STANDS DOWN once it reaches
-    /// the tick budget — and never promotes (so no outputs ever fired: it stays
-    /// gated, no `Escalated` milestone).
+    /// An `Investigate` case with nothing of concern QUIETLY STANDS DOWN once it
+    /// reaches the tick budget — and never promotes (so no outputs ever fired: it
+    /// stays gated, no `Escalated` milestone).
     #[test]
-    fn general_quietly_stands_down_after_budget() {
-        let mut c = active_case(TriggerProfile::General);
+    fn investigate_quietly_stands_down_after_budget() {
+        let mut c = active_case(TriggerProfile::Investigate);
         // Below the budget → keep assessing.
         c.tick_count = 0;
         assert_eq!(decide_promotion(&c), PromotionDecision::Continue);
         // At the budget edge → quiet standdown.
-        c.tick_count = GENERAL_STANDDOWN_TICKS - 1;
+        c.tick_count = INVESTIGATE_STANDDOWN_TICKS - 1;
         assert_eq!(decide_promotion(&c), PromotionDecision::Standdown);
         // It never escalated, so it stayed gated the whole time (no outputs).
         assert!(c.state.gated());
@@ -2300,26 +2413,23 @@ mod tests {
             .any(|e| e.kind == TimelineKind::Escalated));
     }
 
-    /// An ARMED intruder promotes ANY gated profile (the always-escalate set).
+    /// An ARMED person promotes a gated `Investigate` case (the structured set).
     #[test]
-    fn armed_intruder_promotes_any_profile() {
-        for profile in [TriggerProfile::General, TriggerProfile::Investigate] {
-            let mut c = active_case(profile);
-            c.state.intruders.push(intruder("subject-1", true));
-            assert_eq!(
-                decide_promotion(&c),
-                PromotionDecision::Promote("armed intruder"),
-                "{profile:?} with an armed intruder must promote",
-            );
-            // Applying the promotion flips the posture to Alarm + pushes Escalated.
-            assert!(mark_promoted(&mut c, "armed intruder", Utc::now()));
-            assert_eq!(c.state.effective_profile, TriggerProfile::Alarm);
-            assert!(c
-                .state
-                .timeline
-                .iter()
-                .any(|e| e.kind == TimelineKind::Escalated));
-        }
+    fn armed_person_promotes_investigate() {
+        let mut c = active_case(TriggerProfile::Investigate);
+        c.state.persons.push(person("subject-1", true));
+        assert_eq!(
+            decide_promotion(&c),
+            PromotionDecision::Promote("armed person"),
+        );
+        // Applying the promotion flips the posture to Alarm + pushes Escalated.
+        assert!(mark_promoted(&mut c, "armed person", Utc::now()));
+        assert_eq!(c.state.effective_profile, TriggerProfile::Alarm);
+        assert!(c
+            .state
+            .timeline
+            .iter()
+            .any(|e| e.kind == TimelineKind::Escalated));
     }
 
     /// A promoted case is NO LONGER gated — its outputs flow from then on.
@@ -2327,7 +2437,7 @@ mod tests {
     fn promoted_case_is_not_gated() {
         let mut c = active_case(TriggerProfile::Investigate);
         assert!(c.state.gated(), "an Investigate case opens gated");
-        assert!(mark_promoted(&mut c, "prowler behaviour", Utc::now()));
+        assert!(mark_promoted(&mut c, "critical threat", Utc::now()));
         assert!(!c.state.gated(), "a promoted case ungates");
         // `mark_promoted` is idempotent: a second call does nothing (no double
         // Escalated milestone, no re-trip).
@@ -2344,171 +2454,80 @@ mod tests {
     }
 
     /// An `Alarm`-profile case is never subject to the escalation policy (it's born
-    /// escalated/ungated) — the reconciliation invariant that a real-alarm case is
-    /// unchanged by Phase 4b.
+    /// escalated/ungated) — the invariant that a real-alarm case is unchanged.
     #[test]
     fn alarm_case_is_never_promoted_or_stood_down() {
         let mut c = active_case(TriggerProfile::Alarm);
         assert!(c.escalated);
         assert!(!c.state.gated());
-        c.state.intruders.push(intruder("subject-1", true));
+        c.state.persons.push(person("subject-1", true));
         c.tick_count = 100;
         assert_eq!(decide_promotion(&c), PromotionDecision::Continue);
     }
 
-    /// `General` escalates on an OBVIOUS threat indicator (e.g. a balaclava) read
-    /// from the free-text threats — before the budget runs out.
+    /// `Investigate` escalates once the threat reaches `≥ threat_present` (a genuine
+    /// intruder, armed or not), with specific reasons for the structured signals
+    /// (armed / injury / duress). A free-text concealment string ALONE does NOT
+    /// promote (the free-text path false-fired on a benign delivery driver, 2026-06-20).
     #[test]
-    fn general_promotes_only_on_structured_danger() {
-        // A free-text concealment string ALONE no longer promotes General — that
-        // free-text path false-fired on a benign delivery driver (2026-06-20).
-        let mut c = active_case(TriggerProfile::General);
+    fn investigate_promotes_on_threat_present_or_structured_danger() {
+        // Free-text threat alone, threat still benign → no promotion.
+        let mut c = active_case(TriggerProfile::Investigate);
         c.state.threats.push("person wearing a balaclava".to_string());
         assert_eq!(decide_promotion(&c), PromotionDecision::Continue);
 
-        // The model's STRUCTURED Critical (set only for a clearly-visible weapon or
-        // balaclava per the doorstep prompt) promotes.
-        c.state.threat_level = ThreatLevel::Critical;
-        assert_eq!(
-            decide_promotion(&c),
-            PromotionDecision::Promote("critical threat")
-        );
+        // Armed person → promote (specific reason).
+        let mut armed = active_case(TriggerProfile::Investigate);
+        armed.state.persons.push(person("subject-1", true));
+        assert_eq!(decide_promotion(&armed), PromotionDecision::Promote("armed person"));
 
-        // An armed intruder (structured) promotes too.
-        let mut c2 = active_case(TriggerProfile::General);
-        c2.state.intruders.push(intruder("subject-1", true));
-        assert_eq!(
-            decide_promotion(&c2),
-            PromotionDecision::Promote("armed intruder")
-        );
-    }
-
-    /// `Investigate` escalation/standdown is driven by the derived
-    /// `investigate_outcome`: Threat/Intruder → promote; Visitor/FalseAlarm →
-    /// quiet standdown; Undetermined → keep assessing until the deadline.
-    #[test]
-    fn investigate_promotion_keys_on_outcome() {
-        // Intruder → promote.
-        let mut c = active_case(TriggerProfile::Investigate);
-        c.state.investigate_outcome = InvestigateOutcome::Intruder;
-        assert_eq!(
-            decide_promotion(&c),
-            PromotionDecision::Promote("intruder detected")
-        );
-
-        // Threat → promote (distinct reason for the spoken line keying).
-        let mut t = active_case(TriggerProfile::Investigate);
-        t.state.investigate_outcome = InvestigateOutcome::Threat;
-        assert_eq!(
-            decide_promotion(&t),
-            PromotionDecision::Promote("threat detected")
-        );
-
-        // Visitor / FalseAlarm → quiet standdown (no alarm).
-        for benign in [InvestigateOutcome::Visitor, InvestigateOutcome::FalseAlarm] {
-            let mut b = active_case(TriggerProfile::Investigate);
-            b.state.investigate_outcome = benign;
-            assert_eq!(
-                decide_promotion(&b),
-                PromotionDecision::Standdown,
-                "{benign:?} must stand down quietly"
-            );
-        }
-
-        // Undetermined before the deadline → keep assessing.
-        let mut u = active_case(TriggerProfile::Investigate);
-        u.state.investigate_outcome = InvestigateOutcome::Undetermined;
-        assert_eq!(decide_promotion(&u), PromotionDecision::Continue);
-        // …and once the deadline passes, a quiet standdown (treated as benign).
-        u.investigate_deadline = Some(Instant::now() - Duration::from_secs(1));
-        assert_eq!(decide_promotion(&u), PromotionDecision::Standdown);
-    }
-
-    /// `classify_investigate` returns each of the four outcomes for the right
-    /// inputs (plus Undetermined when there's nothing yet).
-    #[test]
-    fn classify_investigate_covers_all_outcomes() {
-        // Threat — a weapon/mask on a present stranger (armed intruder).
+        // A model `threat_present` read (a confident unarmed intruder) → promote.
         let mut threat = active_case(TriggerProfile::Investigate);
-        threat.state.intruders.push(intruder("subject-1", true));
-        assert_eq!(
-            classify_investigate(&threat.state, ResidentAwareness::ResidentsAbsent),
-            InvestigateOutcome::Threat
-        );
-        // Threat also via a free-text face-concealment indicator on a stranger.
-        let mut masked = active_case(TriggerProfile::Investigate);
-        masked.state.intruders.push(intruder("subject-1", false));
-        masked.state.threats.push("newcomer wearing a balaclava".to_string());
-        assert_eq!(
-            classify_investigate(&masked.state, ResidentAwareness::Unknown),
-            InvestigateOutcome::Threat
-        );
+        threat.state.threat_level = ThreatLevel::ThreatPresent;
+        assert_eq!(decide_promotion(&threat), PromotionDecision::Promote("threat present"));
+        // …and `life_threatening` likewise (≥ threat_present).
+        let mut life = active_case(TriggerProfile::Investigate);
+        life.state.threat_level = ThreatLevel::LifeThreatening;
+        assert_eq!(decide_promotion(&life), PromotionDecision::Promote("threat present"));
 
-        // Intruder — a stranger, residents absent/unaware (or unknown → fail toward
-        // intruder).
-        let mut intr = active_case(TriggerProfile::Investigate);
-        intr.state.intruders.push(intruder("subject-1", false));
-        for aware in [
-            ResidentAwareness::ResidentsAbsent,
-            ResidentAwareness::ResidentsPresentUnaware,
-            ResidentAwareness::Unknown,
-        ] {
-            assert_eq!(
-                classify_investigate(&intr.state, aware),
-                InvestigateOutcome::Intruder,
-                "stranger + {aware:?} ⇒ Intruder"
-            );
-        }
+        // An injured person → promote (even if not intruder-dominant: an injured
+        // resident is life-threatening too).
+        let mut hurt = active_case(TriggerProfile::Investigate);
+        let mut p = person("subject-1", false);
+        p.injury = Some("bleeding".to_string());
+        hurt.state.persons.push(p);
+        assert_eq!(decide_promotion(&hurt), PromotionDecision::Promote("person injured"));
 
-        // Visitor — a stranger, residents present and ENGAGING them.
-        assert_eq!(
-            classify_investigate(&intr.state, ResidentAwareness::ResidentsPresentEngaging),
-            InvestigateOutcome::Visitor
-        );
+        // A person clearly in duress → promote.
+        let mut duress = active_case(TriggerProfile::Investigate);
+        let mut p = person("subject-1", false);
+        p.in_duress = 0.9;
+        duress.state.persons.push(p);
+        assert_eq!(decide_promotion(&duress), PromotionDecision::Promote("person in duress"));
 
-        // FalseAlarm — no stranger, but a person was seen (a resident tripped it).
-        let mut fa = active_case(TriggerProfile::Investigate);
-        fa.state.locations.push(LocationObservation {
-            camera: "camera.x".to_string(),
-            label: "Front Yard".to_string(),
-            activity: "a resident walking up".to_string(),
-            person_present: true,
-            last_seen: Utc::now(),
-        });
-        assert_eq!(
-            classify_investigate(&fa.state, ResidentAwareness::ResidentsPresentEngaging),
-            InvestigateOutcome::FalseAlarm
-        );
-
-        // Undetermined — nothing detected yet.
-        let empty = active_case(TriggerProfile::Investigate);
-        assert_eq!(
-            classify_investigate(&empty.state, ResidentAwareness::Unknown),
-            InvestigateOutcome::Undetermined
-        );
+        // A faint duress read (below the floor) does NOT promote.
+        let mut faint = active_case(TriggerProfile::Investigate);
+        let mut p = person("subject-1", false);
+        p.in_duress = DURESS_FLOOR - 0.1;
+        faint.state.persons.push(p);
+        assert_eq!(decide_promotion(&faint), PromotionDecision::Continue);
     }
 
-    /// The escalation helpers' keyword scans (resident-in-danger / obvious-threat).
+    /// `is_subject_of_concern`: intruder-dominant (≥ floor) is a concern; a clearly
+    /// resident/guest person is not.
     #[test]
-    fn threat_keyword_helpers() {
-        let mut c = active_case(TriggerProfile::General);
-        assert!(!resident_in_danger(&c.state));
-        c.state.summary = "A resident appears to be in danger".to_string();
-        assert!(resident_in_danger(&c.state));
-
-        // Concealment fires obvious_threat; a weapon does NOT (that's structural via
-        // `armed`), so obvious_threat is concealment/forced-entry only.
-        let mut c2 = active_case(TriggerProfile::General);
-        c2.state.threats.push("subject is wearing a balaclava".to_string());
-        assert!(obvious_threat(&c2.state));
-
-        // Regression for the 2026-06-20 false alarm: a NEGATED danger mention in the
-        // model's narration must NOT fire (substring "weapon" inside "no weapon").
-        let mut c3 = active_case(TriggerProfile::General);
-        c3.state.summary = "no weapon or threatening behaviour visible".to_string();
-        assert!(!obvious_threat(&c3.state));
-        c3.state.threats.push("no mask or face concealment".to_string());
-        assert!(!obvious_threat(&c3.state));
+    fn subject_of_concern_classification() {
+        assert!(person("subject-1", false).is_subject_of_concern());
+        let mut resident = person("subject-2", false);
+        resident.resident_confidence = 0.9;
+        resident.intruder_confidence = 0.05;
+        assert!(!resident.is_subject_of_concern());
+        // Below the floor even when intruder is the max → not a concern.
+        let mut faint = person("subject-3", false);
+        faint.resident_confidence = 0.2;
+        faint.guest_confidence = 0.2;
+        faint.intruder_confidence = 0.2;
+        assert!(!faint.is_subject_of_concern());
     }
 
     /// PERSISTENCE GATE (a): a gated case whose escalate condition holds on a
@@ -2520,9 +2539,9 @@ mod tests {
         // `ESCALATION_PERSISTENCE_TICKS` is the contract this test pins (==2).
         assert_eq!(ESCALATION_PERSISTENCE_TICKS, 2);
         let mut c = active_case(TriggerProfile::Investigate);
-        // Armed intruder → `decide_promotion` yields Promote each tick.
-        c.state.intruders.push(intruder("subject-1", true));
-        assert_eq!(decide_promotion(&c), PromotionDecision::Promote("armed intruder"));
+        // Armed person → `decide_promotion` yields Promote each tick.
+        c.state.persons.push(person("subject-1", true));
+        assert_eq!(decide_promotion(&c), PromotionDecision::Promote("armed person"));
 
         // Tick 1: condition met once → HOLD (streak 1), no promotion yet.
         let d = decide_promotion(&c);
@@ -2533,7 +2552,7 @@ mod tests {
         let d = decide_promotion(&c);
         assert_eq!(
             apply_persistence(&mut c, d),
-            PromotionAction::Promote("armed intruder")
+            PromotionAction::Promote("armed person")
         );
         assert_eq!(c.escalation_streak, 2);
     }
@@ -2544,22 +2563,22 @@ mod tests {
     #[test]
     fn intermittent_signal_never_promotes() {
         let mut c = active_case(TriggerProfile::Investigate);
-        let armed = intruder("subject-1", true);
+        let armed = person("subject-1", true);
 
         // Tick 1: met → streak 1, hold.
-        c.state.intruders = vec![armed.clone()];
+        c.state.persons = vec![armed.clone()];
         let d = decide_promotion(&c);
         assert_eq!(apply_persistence(&mut c, d), PromotionAction::Hold);
         assert_eq!(c.escalation_streak, 1);
 
-        // Tick 2: NOT met (intruder gone from this frame) → streak resets to 0.
-        c.state.intruders.clear();
+        // Tick 2: NOT met (person gone from this frame) → streak resets to 0.
+        c.state.persons.clear();
         let d = decide_promotion(&c);
         assert_eq!(apply_persistence(&mut c, d), PromotionAction::Hold);
         assert_eq!(c.escalation_streak, 0);
 
         // Tick 3: met again → streak only back to 1, still NOT promoting.
-        c.state.intruders = vec![armed];
+        c.state.persons = vec![armed];
         let d = decide_promotion(&c);
         assert_eq!(apply_persistence(&mut c, d), PromotionAction::Hold);
         assert_eq!(c.escalation_streak, 1);
@@ -2568,10 +2587,10 @@ mod tests {
     /// A `Standdown` decision also resets the streak (and maps straight through).
     #[test]
     fn standdown_resets_streak() {
-        let mut c = active_case(TriggerProfile::General);
+        let mut c = active_case(TriggerProfile::Investigate);
         c.escalation_streak = 1;
         // No threat, at the budget edge → Standdown.
-        c.tick_count = GENERAL_STANDDOWN_TICKS - 1;
+        c.tick_count = INVESTIGATE_STANDDOWN_TICKS - 1;
         let d = decide_promotion(&c);
         assert_eq!(d, PromotionDecision::Standdown);
         assert_eq!(apply_persistence(&mut c, d), PromotionAction::Standdown);
@@ -2596,5 +2615,71 @@ mod tests {
         // An invalid tz name falls back to UTC (no panic), tagged with the bad name.
         let bad = format_local_time(instant, "Not/AZone");
         assert_eq!(bad, "Saturday 20 June 2026, 01:32 (Not/AZone)");
+    }
+
+    /// MAIN-image replacement rule (sticky-downward): a newer still of the SAME or
+    /// HIGHER rank replaces; a LOWER rank never displaces a higher one.
+    #[test]
+    fn main_image_replacement_is_sticky_downward() {
+        // Same rank replaces (newer-same-category wins).
+        assert!(should_replace_main(2, 2));
+        // Higher replaces lower.
+        assert!(should_replace_main(1, 3));
+        // Lower NEVER replaces higher.
+        assert!(!should_replace_main(3, 1));
+        // Baseline any-vs-any replaces.
+        assert!(should_replace_main(0, 0));
+    }
+
+    /// MAIN-image rank table: each tier maps to its (rank, category), and an empty
+    /// case (no person anywhere) yields `None` (leave the existing image as-is).
+    #[test]
+    fn compute_main_rank_covers_each_tier() {
+        // Empty case → no activity → None.
+        let empty = CaseState::new("c".to_string(), Utc::now(), TriggerProfile::Alarm);
+        assert_eq!(compute_main_rank(&empty), None);
+
+        // Rank 0 (any): a benign person present (low intruder confidence), threat
+        // not life-threatening, no malicious activity.
+        let mut any = CaseState::new("c".to_string(), Utc::now(), TriggerProfile::Investigate);
+        let mut benign = person("subject-1", false);
+        benign.resident_confidence = 0.9;
+        benign.intruder_confidence = 0.05;
+        benign.guest_confidence = 0.1;
+        assert!(!benign.is_subject_of_concern());
+        any.persons.push(benign);
+        assert_eq!(compute_main_rank(&any), Some((0, "any")));
+
+        // Rank 0 also via a person-present location with NO persons on the roster.
+        let mut loc_only =
+            CaseState::new("c".to_string(), Utc::now(), TriggerProfile::Investigate);
+        loc_only.locations.push(LocationObservation {
+            camera: "camera.x".to_string(),
+            label: "Kitchen".to_string(),
+            activity: "someone moving".to_string(),
+            person_present: true,
+            last_seen: Utc::now(),
+        });
+        assert_eq!(compute_main_rank(&loc_only), Some((0, "any")));
+
+        // Rank 1 (intruder): a person of concern present.
+        let mut intruder =
+            CaseState::new("c".to_string(), Utc::now(), TriggerProfile::Investigate);
+        intruder.persons.push(person("subject-1", false));
+        assert_eq!(compute_main_rank(&intruder), Some((1, "intruder")));
+
+        // Rank 2 (malicious): malicious_activity non-empty (outranks intruder).
+        let mut malicious =
+            CaseState::new("c".to_string(), Utc::now(), TriggerProfile::Investigate);
+        malicious.persons.push(person("subject-1", false));
+        malicious.malicious_activity.push("breaking into car".to_string());
+        assert_eq!(compute_main_rank(&malicious), Some((2, "malicious")));
+
+        // Rank 3 (life_threatening): threat_level dominates everything.
+        let mut life = CaseState::new("c".to_string(), Utc::now(), TriggerProfile::Alarm);
+        life.threat_level = ThreatLevel::LifeThreatening;
+        life.malicious_activity.push("smashed window".to_string());
+        life.persons.push(person("subject-1", true));
+        assert_eq!(compute_main_rank(&life), Some((3, "life_threatening")));
     }
 }

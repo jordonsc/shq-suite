@@ -94,8 +94,9 @@ pub async fn run(
     );
 
     // What the kiosks currently show. Assume they boot on their dashboards; we
-    // navigate only when the desired target actually changes.
+    // navigate only when the desired target — or the keep-awake pin — changes.
     let mut current = Target::Dashboard;
+    let mut current_force_on = false;
 
     loop {
         // Recompute + navigate on a change to EITHER channel.
@@ -104,7 +105,14 @@ pub async fn run(
             let mode = *mode_rx.borrow();
             (desired_target(&case, mode), alarm_active(&case, mode))
         };
-        if desired != current {
+        // Re-navigate on a target change OR when the keep-awake pin flips while
+        // staying on the HUD. arming→triggered keeps the SAME `/alarm` URL (the
+        // target doesn't change), so without the pin check the `keep_awake:true`
+        // pin computed for the live alarm would NEVER be sent — the screens get
+        // woken at arm-time but could blank during the actual alarm.
+        let target_changed = desired != current;
+        let pin_changed = desired == Target::Hud && force_on != current_force_on;
+        if target_changed || pin_changed {
             match desired {
                 // Wake the screen on every alarm-mode takeover so the standby/
                 // alarm pane is visible even on a sleeping/clock kiosk; PIN it
@@ -117,6 +125,7 @@ pub async fn run(
                 Target::Dashboard => restore(&rest, &kiosks).await,
             }
             current = desired;
+            current_force_on = force_on;
         }
 
         tokio::select! {
@@ -189,14 +198,10 @@ mod tests {
 
     #[test]
     fn gated_case_does_not_take_over() {
-        // A gated (Investigate/General) case must NOT flip the kiosk while it
-        // assesses silently — it is treated as "no case" with no active mode.
+        // A gated (Investigate) case must NOT flip the kiosk while it assesses
+        // silently — it is treated as "no case" with no active mode.
         assert!(
             desired_target(&case(TriggerProfile::Investigate), AlarmMode::Disarmed)
-                == Target::Dashboard
-        );
-        assert!(
-            desired_target(&case(TriggerProfile::General), AlarmMode::Disarmed)
                 == Target::Dashboard
         );
     }
@@ -223,7 +228,7 @@ mod tests {
             desired_target(&case(TriggerProfile::Investigate), AlarmMode::Armed) == Target::Hud
         );
         assert!(
-            desired_target(&case(TriggerProfile::General), AlarmMode::Triggered) == Target::Hud
+            desired_target(&case(TriggerProfile::Investigate), AlarmMode::Triggered) == Target::Hud
         );
     }
 }

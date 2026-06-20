@@ -195,20 +195,25 @@ impl PagerDuty {
 
 /// Build the `custom_details` dossier object for a trigger.
 fn custom_details(state: &CaseState, offsite: Option<&OffsiteConfig>) -> Value {
-    let intruders: Vec<Value> = state
-        .intruders
+    let persons: Vec<Value> = state
+        .persons
         .iter()
-        .map(|i| {
+        .map(|p| {
             json!({
-                "id": i.id,
-                "descriptors": i.descriptors,
-                "confidence": i.confidence,
-                "identified": i.identified,
-                "armed": i.armed,
-                "weapon": i.weapon,
-                "location": i.location,
-                "activity": i.activity,
-                "dossier": i.dossier,
+                "id": p.id,
+                "descriptors": p.descriptors,
+                "resident_confidence": p.resident_confidence,
+                "guest_confidence": p.guest_confidence,
+                "intruder_confidence": p.intruder_confidence,
+                "subject_of_concern": p.is_subject_of_concern(),
+                "identified": p.identified,
+                "armed": p.armed,
+                "weapon": p.weapon,
+                "injury": p.injury,
+                "in_duress": p.in_duress,
+                "location": p.location,
+                "activity": p.activity,
+                "dossier": p.dossier,
             })
         })
         .collect();
@@ -235,8 +240,9 @@ fn custom_details(state: &CaseState, offsite: Option<&OffsiteConfig>) -> Value {
         "status": state.status,
         "started_at": state.started_at,
         "updated_at": state.updated_at,
-        "intruders": intruders,
+        "persons": persons,
         "threats": state.threats,
+        "malicious_activity": state.malicious_activity,
         "timeline": timeline,
     });
 

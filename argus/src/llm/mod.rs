@@ -3,8 +3,9 @@
 //! Generalised for Phase 2: one client per model (`claude-sonnet-4-6` for the
 //! live what/where loop, `claude-opus-4-8` for forensic identification), with
 //! optional structured output (`output_config.format`) and optional adaptive
-//! thinking + effort. The premises seed is a `cache_control`-cached `system`
-//! block on every call (caches are model-scoped, 5-min TTL).
+//! thinking + effort. The `system` block (the universal security-AI system prompt
+//! + the private premises seed) is `cache_control`-cached on every call (caches
+//! are model-scoped, 5-min TTL).
 //!
 //! Two reasoning profiles:
 //! - [`Reasoning::Fast`] — thinking disabled, `effort: low`. The Sonnet live
@@ -24,46 +25,22 @@ use tracing::warn;
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
-/// What an image is, which selects its caption prefix in the request:
-/// `"Camera: <label>"` for a live still vs `"Resident reference: <label>"` for a
-/// resident anchor photo (Opus forensic ID only). Distinct prefixes let the model
-/// tell the suspect frame apart from the known-resident references.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ImageKind {
-    /// A camera still — captioned `"Camera: <label>"` (the default).
-    #[default]
-    Camera,
-    /// A resident reference photo — captioned `"Resident reference: <label>"`.
-    ResidentReference,
-}
-
-/// One image to include in a request — a camera still or (Opus-only) a resident
-/// reference photo, distinguished by [`ImageKind`] which sets the caption prefix.
+/// One camera still to include in a request, captioned `"Camera: <label>"` so
+/// the model can name the frame it is assessing.
 pub struct ImageInput<'a> {
     pub label: &'a str,
     pub jpeg: &'a [u8],
-    /// Caption prefix selector. Defaults to [`ImageKind::Camera`] when omitted via
-    /// `..Default::default()`.
-    pub kind: ImageKind,
 }
 
 impl<'a> ImageInput<'a> {
-    /// A camera still (the common case).
+    /// A camera still.
     pub fn camera(label: &'a str, jpeg: &'a [u8]) -> Self {
-        Self { label, jpeg, kind: ImageKind::Camera }
-    }
-
-    /// A resident reference photo (Opus forensic ID anchor).
-    pub fn resident(label: &'a str, jpeg: &'a [u8]) -> Self {
-        Self { label, jpeg, kind: ImageKind::ResidentReference }
+        Self { label, jpeg }
     }
 
     /// The caption text block that precedes this image.
     fn caption(&self) -> String {
-        match self.kind {
-            ImageKind::Camera => format!("Camera: {}", self.label),
-            ImageKind::ResidentReference => format!("Resident reference: {}", self.label),
-        }
+        format!("Camera: {}", self.label)
     }
 }
 
@@ -78,11 +55,10 @@ pub enum Reasoning {
 
 /// Parameters for one assessment call.
 pub struct AssessRequest<'a> {
-    /// Cached premises seed (the `system` block).
-    pub seed: &'a str,
-    /// One or more images, each preceded by a caption text block per its
-    /// [`ImageKind`]: `"Camera: <label>"` for stills, `"Resident reference:
-    /// <label>"` for Opus resident-anchor photos.
+    /// The cached `system` block — the universal security-AI system prompt
+    /// followed by the private premises seed (assembled once at startup).
+    pub system: &'a str,
+    /// One or more camera stills, each preceded by a `"Camera: <label>"` caption.
     pub images: Vec<ImageInput<'a>>,
     /// The instruction text appended after the images.
     pub instruction: String,
@@ -137,8 +113,8 @@ impl AnthropicClient {
 
     /// Run one `/v1/messages` call.
     pub async fn assess(&self, req: &AssessRequest<'_>) -> Result<Completion> {
-        // Volatile content (images + instruction) goes AFTER the cached seed so
-        // the cache prefix (model + seed) holds across ticks.
+        // Volatile content (images + instruction) goes AFTER the cached system
+        // block so the cache prefix (model + system prompt + seed) holds across ticks.
         let content = build_user_content(req);
 
         let mut body = json!({
@@ -146,7 +122,7 @@ impl AnthropicClient {
             "max_tokens": req.max_tokens,
             "system": [{
                 "type": "text",
-                "text": req.seed,
+                "text": req.system,
                 "cache_control": { "type": "ephemeral" }
             }],
             "messages": [{ "role": "user", "content": content }],
@@ -288,7 +264,7 @@ mod tests {
 
     fn req<'a>(images: Vec<ImageInput<'a>>) -> AssessRequest<'a> {
         AssessRequest {
-            seed: "SEED",
+            system: "SYSTEM",
             images,
             instruction: "INSTRUCTION".to_string(),
             schema: None,
@@ -297,14 +273,10 @@ mod tests {
         }
     }
 
-    /// The caption prefix distinguishes a camera still from a resident reference.
+    /// Every camera image is captioned "Camera: <label>".
     #[test]
-    fn caption_prefix_is_kind_specific() {
+    fn camera_caption_prefix() {
         assert_eq!(ImageInput::camera("Garage", b"x").caption(), "Camera: Garage");
-        assert_eq!(
-            ImageInput::resident("Jordon", b"x").caption(),
-            "Resident reference: Jordon"
-        );
     }
 
     /// Pull the caption text from a [text, image] pair-and-trailing-instruction
@@ -318,41 +290,31 @@ mod tests {
             .collect()
     }
 
-    /// With resident photos present they are PREPENDED (labelled "Resident
-    /// reference: <name>"), the suspect camera still is LAST, and the instruction
-    /// trails — the exact order the Opus forensic path builds.
+    /// The user content is each camera image as a [caption, image] pair, in order,
+    /// with the instruction text trailing as the final block.
     #[test]
-    fn residents_prepend_suspect_still_last() {
-        let jordon = b"jordon-jpeg".to_vec();
-        let resident = b"resident-jpeg".to_vec();
-        let suspect = b"suspect-jpeg".to_vec();
+    fn builds_camera_pairs_then_instruction() {
+        let a = b"a-jpeg".to_vec();
+        let b = b"b-jpeg".to_vec();
         let images = vec![
-            ImageInput::resident("Jordon", &jordon),
-            ImageInput::resident("Resident", &resident),
-            ImageInput::camera("subject-1", &suspect),
+            ImageInput::camera("Kitchen", &a),
+            ImageInput::camera("Garage", &b),
         ];
         let content = build_user_content(&req(images));
-        // 3 images → 3 [text,image] pairs + 1 instruction text = 7 blocks.
-        assert_eq!(content.len(), 7);
+        // 2 images → 2 [text,image] pairs + 1 instruction text = 5 blocks.
+        assert_eq!(content.len(), 5);
         assert_eq!(
             captions(&content),
-            vec![
-                "Resident reference: Jordon".to_string(),
-                "Resident reference: Resident".to_string(),
-                "Camera: subject-1".to_string(),
-            ]
+            vec!["Camera: Kitchen".to_string(), "Camera: Garage".to_string()]
         );
-        // The instruction is the final block.
         assert_eq!(content.last().unwrap()["text"], "INSTRUCTION");
     }
 
-    /// Graceful absence: ZERO resident photos leaves the request exactly as before
-    /// — the suspect still is the only image, captioned "Camera: <label>".
+    /// A single camera still: one [caption, image] pair + the instruction.
     #[test]
-    fn no_residents_leaves_request_unchanged() {
+    fn single_camera_still() {
         let suspect = b"suspect-jpeg".to_vec();
         let content = build_user_content(&req(vec![ImageInput::camera("subject-1", &suspect)]));
-        // 1 image → 1 [text,image] pair + 1 instruction = 3 blocks.
         assert_eq!(content.len(), 3);
         assert_eq!(captions(&content), vec!["Camera: subject-1".to_string()]);
         assert_eq!(content.last().unwrap()["text"], "INSTRUCTION");

@@ -17,6 +17,15 @@
   "use strict";
 
   /* ---------------------------------------------------------------------------
+     Feature flags
+     The rotating radar sweep is OFF by default (it reads as too busy on the
+     kiosk). Opt in for eyeballing with ?radar=1.
+     ------------------------------------------------------------------------- */
+  const RADAR_ENABLED = false;
+  const radarOn = RADAR_ENABLED ||
+    new URLSearchParams(location.search).get("radar") === "1";
+
+  /* ---------------------------------------------------------------------------
      Small DOM helpers
      ------------------------------------------------------------------------- */
   const $ = (id) => document.getElementById(id);
@@ -237,9 +246,9 @@
         threat_level keys pulse rate + intensity.
      ========================================================================= */
   const THREAT = {
-    info:     { rate: "4.5s", alpha: 0.10, sweep: "9s", label: "INFO" },
-    elevated: { rate: "2.6s", alpha: 0.20, sweep: "6s", label: "ELEVATED" },
-    critical: { rate: "1.2s", alpha: 0.34, sweep: "3.4s", label: "CRITICAL" },
+    benign:           { rate: "4.5s", alpha: 0.10, sweep: "9s",   label: "BENIGN" },
+    threat_present:   { rate: "2.6s", alpha: 0.20, sweep: "6s",   label: "THREAT" },
+    life_threatening: { rate: "1.2s", alpha: 0.34, sweep: "3.4s", label: "LIFE THREAT" },
   };
 
   function applyTheme(caseState) {
@@ -255,7 +264,7 @@
     } else {
       state = "alarm";
       headline = "ALARM MODE";
-      const t = THREAT[caseState.threat_level] || THREAT.elevated;
+      const t = THREAT[caseState.threat_level] || THREAT.threat_present;
       clearance = t.label;
     }
     root.setAttribute("data-state", state);
@@ -263,16 +272,21 @@
     els.clearance.textContent = clearance;
     setEmblem(state);
 
-    // pulse + sweep keyed to threat (alarm only; calm otherwise)
+    // pulse + sweep keyed to threat (alarm only; calm otherwise). The
+    // data-threat attribute lets CSS add an EXTRA urgency cue at
+    // life_threatening (a headline + full-frame vignette pulse) on top of the
+    // shared red theme. Cleared in every non-alarm branch so it can't stick.
     if (state === "alarm") {
-      const t = THREAT[caseState.threat_level] || THREAT.elevated;
+      const t = THREAT[caseState.threat_level] || THREAT.threat_present;
       root.style.setProperty("--pulse-rate", t.rate);
       root.style.setProperty("--pulse-alpha", String(t.alpha));
       root.style.setProperty("--sweep-rate", t.sweep);
+      root.setAttribute("data-threat", caseState.threat_level || "threat_present");
     } else {
       root.style.removeProperty("--pulse-rate");
       root.style.removeProperty("--pulse-alpha");
       root.style.removeProperty("--sweep-rate");
+      root.removeAttribute("data-threat");
     }
   }
 
@@ -337,11 +351,17 @@
 
     const loc = intr.location || intr.best_camera || "";
     const act = intr.activity || "";
-    e.meta.textContent = [loc, act].filter(Boolean).join(" · ");
+    // Structured-danger flags surfaced inline: weapon, injury, duress.
+    const flags = [];
+    if (intr.armed) flags.push(intr.weapon ? `ARMED: ${intr.weapon}` : "ARMED");
+    if (intr.injury) flags.push(`INJURED: ${intr.injury}`);
+    if (clamp01(intr.in_duress) >= DURESS_FLOOR) flags.push("DURESS");
+    e.meta.textContent = [loc, act, ...flags].filter(Boolean).join(" · ");
 
-    const conf = clamp01(intr.confidence);
+    // The confidence bar shows the INTRUDER likelihood (the dominant class here).
+    const conf = clamp01(intr.intruder_confidence);
     e.fill.style.right = `${(1 - conf) * 100}%`;
-    e.cval.textContent = `CONF ${Math.round(conf * 100)}%`;
+    e.cval.textContent = `INTRUDER ${Math.round(conf * 100)}%`;
 
     // mugshot = first of best_stills
     const stillId = intr.best_stills && intr.best_stills[0] && intr.best_stills[0].id;
@@ -374,6 +394,22 @@
   }
 
   const clamp01 = (n) => Math.max(0, Math.min(1, typeof n === "number" ? n : 0));
+
+  // A person is a "subject of concern" (an "intruder" in the HUD's vocabulary)
+  // when their intruder confidence dominates the resident/guest reads and clears
+  // the floor — mirrors `Person::is_subject_of_concern` on the Rust side. The HUD
+  // surfaces only these as threat cards; a clearly resident/guest person is not shown.
+  const CONCERN_FLOOR = 0.34;
+  const DURESS_FLOOR = 0.5;
+  function isConcern(p) {
+    const ic = clamp01(p.intruder_confidence);
+    return ic >= CONCERN_FLOOR
+      && ic >= clamp01(p.resident_confidence)
+      && ic >= clamp01(p.guest_confidence);
+  }
+  function subjectsOfConcern(cs) {
+    return (cs.persons || []).filter(isConcern);
+  }
 
   /* =========================================================================
      7. TICKER — newest-first timeline, type-on effect for genuinely new lines
@@ -447,7 +483,7 @@
   // Mode-specific copy for the standby pane (arming/armed/disarmed). The HUD shows
   // this when the alarm is up but there is no incident yet.
   const SYS = {
-    arming:     { state: "standby",    hl: "ARMING",       clr: "ARMING",  s1: "ARMING",          s2: "SECURING PERIMETER · STAND CLEAR", status: "Arming…" },
+    arming:     { state: "arming",     hl: "ARMING",       clr: "ARMING",  s1: "ARMING",          s2: "SECURING PERIMETER · STAND CLEAR", status: "Arming…" },
     armed:      { state: "standby",    hl: "SYSTEM ARMED", clr: "ARMED",   s1: "SYSTEM ARMED",    s2: "ALL SECTORS NOMINAL · STANDBY",    status: "All clear" },
     // green all-clear shown for a few seconds after any disarm
     authorised: { state: "authorised", hl: "AUTHORISED",   clr: "GRANTED", s1: "ACCESS GRANTED",  s2: "ALL CLEAR · STAND DOWN",           status: "All clear" },
@@ -464,6 +500,7 @@
     root.style.removeProperty("--pulse-rate");
     root.style.removeProperty("--pulse-alpha");
     root.style.removeProperty("--sweep-rate");
+    root.removeAttribute("data-threat");
     els.headline.textContent = m.hl;
     els.clearance.textContent = m.clr;
     els.standby.hidden = false;
@@ -501,16 +538,38 @@
     // The main pane tracks the INTRUDER, not generic camera chatter — so it shows
     // the latest intruder-level activity (location/activity/best still), never an
     // unrelated camera note (e.g. the garage's parked car).
+    //
+    // Image source: prefer the engine's priority-ranked `main_still` (populated
+    // even for an ambiguous/resident-only frame, so the pane is never blank when
+    // there's activity). Fall back to the pickPrimaryView heuristic still id only
+    // when main_still is absent. Location/activity TEXT always comes from
+    // pickPrimaryView (it follows the subject of concern).
     const view = pickPrimaryView(caseState);
-    els.camLoc.textContent = view ? (view.label || "CAMERA") : "—";
-    els.camAct.textContent = view ? (view.activity || "") : "";
-    if (els.camPhText) els.camPhText.textContent = view ? "ACQUIRING" : "NO SIGNAL";
-    loadStill(els.camImg, (show) => { els.camPlaceholder.hidden = !show; }, view && view.stillId);
+    const mainStill = caseState.main_still;
+    const haveMainStill = !!(mainStill && mainStill.id);
+    const stillId = haveMainStill ? mainStill.id : (view && view.stillId);
+
+    if (view) {
+      els.camLoc.textContent = view.label || "CAMERA";
+      els.camAct.textContent = view.activity || "";
+    } else if (haveMainStill) {
+      // No subject of concern AND no person-present location to label, but we DO
+      // have a main image — show it under a category/generic label.
+      els.camLoc.textContent = mainStillLabel(caseState.main_still_category);
+      els.camAct.textContent = "";
+    } else {
+      els.camLoc.textContent = "—";
+      els.camAct.textContent = "";
+    }
+    if (els.camPhText) {
+      els.camPhText.textContent = (view || haveMainStill) ? "ACQUIRING" : "NO SIGNAL";
+    }
+    loadStill(els.camImg, (show) => { els.camPlaceholder.hidden = !show; }, stillId);
 
     els.camRec.style.visibility =
       (caseState.status === "cleared") ? "hidden" : "visible";
 
-    reconcileIntruders(caseState.intruders);
+    reconcileIntruders(subjectsOfConcern(caseState));
     renderTicker(caseState);
   }
 
@@ -519,20 +578,31 @@
     return s ? new Date(s.captured_at || 0).getTime() : 0;
   }
 
-  // The primary view = the most relevant INTRUDER (the latest intruder-level
+  // The primary view = the most relevant SUBJECT OF CONCERN (the latest threat-level
   // activity), so the main pane follows the threat — not whatever camera last had
   // something to say. Ranking: currently-located first, then armed, then highest
-  // confidence, then most recent best still. Only with NO intruders do we fall
-  // back to a person-present location.
+  // intruder confidence, then most recent best still. Only with NO subjects of
+  // concern do we fall back to a person-present location.
+  // Short human label for the priority-ranked main_still category (the engine's
+  // ranking vocabulary). Used only when there's no subject/location text to show.
+  function mainStillLabel(cat) {
+    switch (cat) {
+      case "life_threatening": return "LIFE THREAT";
+      case "malicious":        return "MALICIOUS";
+      case "intruder":         return "INTRUDER";
+      default:                 return "ACTIVITY";
+    }
+  }
+
   function pickPrimaryView(cs) {
-    const intruders = cs.intruders || [];
-    if (intruders.length) {
-      const i = intruders.slice().sort((a, b) => {
+    const subjects = subjectsOfConcern(cs);
+    if (subjects.length) {
+      const i = subjects.slice().sort((a, b) => {
         const al = a.location || a.best_camera ? 1 : 0;
         const bl = b.location || b.best_camera ? 1 : 0;
         if (al !== bl) return bl - al;
         if (!!b.armed !== !!a.armed) return (b.armed ? 1 : 0) - (a.armed ? 1 : 0);
-        const ac = clamp01(a.confidence), bc = clamp01(b.confidence);
+        const ac = clamp01(a.intruder_confidence), bc = clamp01(b.intruder_confidence);
         if (bc !== ac) return bc - ac;
         return stillTime(b) - stillTime(a);
       })[0];
@@ -564,10 +634,10 @@
   }
 
   function pickMainStill(cs, loc) {
-    // newest best_still from an intruder at the primary location, else any.
-    const intruders = cs.intruders || [];
-    const atLoc = intruders.filter((i) => loc && (i.location === loc.label || i.best_camera === loc.label));
-    const pool = (atLoc.length ? atLoc : intruders);
+    // newest best_still from a subject of concern at the primary location, else any.
+    const subjects = subjectsOfConcern(cs);
+    const atLoc = subjects.filter((i) => loc && (i.location === loc.label || i.best_camera === loc.label));
+    const pool = (atLoc.length ? atLoc : subjects);
     let best = null, bestT = -1;
     for (const i of pool) {
       const s = i.best_stills && i.best_stills[0];
@@ -653,7 +723,14 @@
     buildTickRail();
     buildCrosshairs();
     setEmblem("standby");
-    startRadar();
+    if (radarOn) {
+      startRadar();
+    } else {
+      // radar disabled: never start the RAF loop, and hide the canvas so the
+      // --sweep-rate work is dropped entirely.
+      const cv = $("radar");
+      if (cv) cv.style.display = "none";
+    }
     tickTimer();
     render(null);              // idle until first WS message
 

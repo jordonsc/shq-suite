@@ -68,33 +68,30 @@ cameras:
 
 alarm_entity: "alarm_control_panel.shq_alarm"
 
-# Trigger profiles (Phase 4a/4b — tiered response). Each source maps an HA entity
-# to the posture a case opened by it takes:
+# Trigger profiles (tiered response — TWO flows). Each source maps an HA entity to
+# the posture a case opened by it takes:
 #   alarm       → confirmed intrusion: full immediate outputs (klaxon/voice/PD/kiosk)
-#   investigate → perimeter activity while secured: GATED (silent), time-boxed; on a
-#                 confirmed prowler Argus PROMOTES to alarm — full outputs AND it
-#                 trips the real alarm_control_panel — else quiet standdown.
-#   general     → benign doorstep approach: GATED, fast/shallow (Sonnet-only, no Opus
-#                 unless escalated); promotes on an OBVIOUS threat (weapon / concealed
-#                 face / forced entry), else quiet standdown after a few ticks.
+#   investigate → a presumed-benign approach (e.g. a person at the front door): GATED
+#                 (silent), fast/shallow (Sonnet-only, no Opus unless escalated). It
+#                 double-checks the activity really is benign; on STRUCTURED danger
+#                 (a weapon, an injury, duress, or a model `critical` read) Argus
+#                 PROMOTES to alarm — full outputs AND it trips the real
+#                 alarm_control_panel — else quiet standdown after a few ticks.
 # An escalation always goes to FULL alarm posture (klaxon included) and trips the
 # real house alarm — see `escalation_alarm_script` below for HOW it trips the panel.
 # OMIT `triggers` (or leave it empty) and the `alarm_entity` above is synthesised
 # into a single `alarm`-profile source — i.e. exactly today's behaviour. The softer
-# sources below are USER-OWNED placeholders (the real perimeter/front-door entities
-# are private); the alarm entity drives the full arm/disarm machine, the softer ones
-# fire a one-shot gated case on their active (on/detected) edge.
+# source below is a USER-OWNED placeholder (the real front-door entity is private);
+# the alarm entity drives the full arm/disarm machine, the softer one fires a
+# one-shot gated case on its active (on/detected) edge.
 # triggers:
 #   - entity: "alarm_control_panel.shq_alarm"
 #     profile: alarm
-#   - entity: "binary_sensor.perimeter_activity"   # e.g. a person/vehicle template group
+#   - entity: "binary_sensor.front_door_approach"  # e.g. front-door person detected
 #     profile: investigate
-#   - entity: "binary_sensor.front_door_approach"  # e.g. porch motion / doorbell approach
-#     profile: general
 #
-# Testing the gated/escalation paths without real softer-trigger entities:
-#   argus --once --profile general      # open a GATED General case, one tick, print it
-#   argus --once --profile investigate  # open a GATED Investigate case
+# Testing the gated/escalation path without a real softer-trigger entity:
+#   argus --once --profile investigate  # open a GATED Investigate case, one tick, print it
 # (a gated --once case spends no Opus and fires no klaxon/voice/PD).
 
 # Optional: the HA entity whose state is the human location that tripped the alarm
@@ -260,18 +257,3 @@ telemetry_entities: []
 #   - { ha_target: "kiosk09", dashboard_url: "http://atlas.shq.sh:8123/dashboard-kiosks/kiosk09?kiosk" }  # Sal Study
 #   - { ha_target: "kiosk10", dashboard_url: "http://atlas.shq.sh:8123/dashboard-kiosks/kiosk10?kiosk" }  # Dining Room
 #   - { ha_target: "kiosk11", dashboard_url: "http://atlas.shq.sh:8123/dashboard-kiosks/kiosk11?kiosk" }  # test unit (already live)
-
-# Resident reference photos (Phase 3 forensic anchoring). Each is attached to the
-# Opus forensic IDENTIFY call ONLY — NOT the high-frequency Sonnet live loop (that
-# would break the seed prompt-cache and inflate per-tick cost). They let Opus
-# anchor a confident resident match (→ NOT flagged as an intruder); the fail-toward-
-# intruder bias is preserved (a mere resemblance / uncertain match stays an
-# intruder). The real images are PRIVATE — they live on atlas only (under
-# ~/.config/argus/residents/), are NEVER committed to the public repo, and are
-# mirrored to shq-suite-config. A missing/unreadable file is logged + SKIPPED at
-# startup, never fatal — so a fresh checkout with no photos behaves exactly as
-# before (no extra images on the Opus call). Empty/absent = no anchoring.
-#
-# resident_photos:
-#   - { name: "Jordon",   path: "~/.config/argus/residents/jordon.jpg" }
-#   - { name: "Resident", path: "~/.config/argus/residents/resident.jpg" }

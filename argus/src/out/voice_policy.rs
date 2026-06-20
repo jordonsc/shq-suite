@@ -29,13 +29,7 @@
 //! (it diffs the timeline across `watch` updates). The gate itself holds no
 //! state — pacing/debounce live in the consumer, not here.
 
-use crate::case::{CaseState, InvestigateOutcome, TimelineEvent, TimelineKind, TriggerProfile};
-
-/// The reduced volume (0.0–1.0) the `Investigate` smart-alarm loop speaks its
-/// NON-escalation lines at — the calm announce + the stand-down lines. The
-/// escalation lines ("Threat detected!" / "Intruder detected!") use full volume
-/// (the configured `voice_volume`, i.e. `None`).
-const INVESTIGATE_VOLUME: f32 = 0.7;
+use crate::case::{CaseState, TimelineEvent, TimelineKind};
 
 /// A line Argus will speak via Overwatch `Verbalise`. Produced only by
 /// [`lines_for`]; there is no constructor that yields a "failure" line.
@@ -44,8 +38,7 @@ pub struct SpokenLine {
     /// The text handed to Overwatch's TTS.
     pub text: String,
     /// Per-line volume override (0.0–1.0). `None` = use the configured
-    /// `voice_volume` default (the full/normal level). The `Investigate` calm
-    /// announce + stand-down lines set `Some(0.7)`; everything else is `None`.
+    /// `voice_volume` default (the full/normal level).
     pub volume: Option<f32>,
 }
 
@@ -57,14 +50,6 @@ impl SpokenLine {
             volume: None,
         }
     }
-
-    /// A line at an explicit volume (the `Investigate` 0.7 loop lines).
-    fn at_volume(text: impl Into<String>, volume: f32) -> Self {
-        Self {
-            text: text.into(),
-            volume: Some(volume),
-        }
-    }
 }
 
 /// Map a timeline event to zero or more spoken lines (in order).
@@ -73,28 +58,13 @@ impl SpokenLine {
 /// line (the breach location, the intruder profile, an armed intruder's weapon).
 /// Pure — no state held. An empty `Vec` means silent.
 pub fn lines_for(event: &TimelineEvent, state: &CaseState) -> Vec<SpokenLine> {
-    // ── Investigate smart-alarm loop ─────────────────────────────────────────
-    // An `Investigate`-origin case is an AUDIBLE assessment (unlike `General`,
-    // which stays silent until escalated). It speaks a calm 0.7 announce on open,
-    // a 0.7 stand-down line when it resolves benign (Visitor/FalseAlarm/run-out),
-    // and a FULL-volume "Threat/Intruder detected!" at the escalation edge. The
-    // `trigger_profile` (how it OPENED) is the marker — `effective_profile` flips
-    // to `Alarm` on promotion, so `Escalated` arrives with it already `Alarm`.
-    if state.trigger_profile == TriggerProfile::Investigate {
-        if let Some(lines) = investigate_lines(event, state) {
-            return lines;
-        }
-    }
-
     match event.kind {
         // ── Breach announcement (rides with the klaxon) ─────────────────────
-        // `CaseOpened` fires it for a real `Alarm` case at open; `Escalated` (Phase
-        // 4b) fires the SAME breach line when a gated case is promoted to `Alarm`
-        // (the breach is announced retroactively at the promotion edge — the first
-        // justified moment to speak). A GATED `General` `CaseOpened` stays SILENT:
-        // since voice now always runs through this policy (the 0.32.0 gate split),
-        // the policy itself must keep a gated General quiet until it escalates.
-        // (`Investigate` is handled above; `Escalated` arrives already-ungated.)
+        // `CaseOpened` fires it for a real `Alarm` case at open; `Escalated` fires
+        // the SAME breach line when a gated `Investigate` case is promoted to
+        // `Alarm` (the breach is announced retroactively at the promotion edge — the
+        // first justified moment to speak). A GATED `Investigate` `CaseOpened` stays
+        // SILENT (the double-check is silent until it escalates).
         TimelineKind::CaseOpened if state.gated() => Vec::new(),
         TimelineKind::CaseOpened | TimelineKind::Escalated => {
             // Prefer the alarm's trigger location (the zone that tripped it), then
@@ -122,10 +92,10 @@ pub fn lines_for(event: &TimelineEvent, state: &CaseState) -> Vec<SpokenLine> {
             let id = event.detail.split(" identified").next().unwrap_or("").trim();
             // Speak the CONCISE summary, not the full forensic paragraph (which is
             // far too long for TTS). Fall back to descriptors only if absent.
-            let profile = state.intruders.iter().find(|i| i.id == id).and_then(|i| {
-                i.spoken_summary
+            let profile = state.persons.iter().find(|p| p.id == id).and_then(|p| {
+                p.spoken_summary
                     .as_deref()
-                    .or(Some(i.descriptors.as_str()))
+                    .or(Some(p.descriptors.as_str()))
                     .map(str::trim)
                     .filter(|d| !d.is_empty())
             });
@@ -166,10 +136,10 @@ pub fn lines_for(event: &TimelineEvent, state: &CaseState) -> Vec<SpokenLine> {
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "1".to_string());
             let weapon = state
-                .intruders
+                .persons
                 .iter()
-                .find(|i| i.id == id)
-                .and_then(|i| i.weapon.as_deref())
+                .find(|p| p.id == id)
+                .and_then(|p| p.weapon.as_deref())
                 .map(str::trim)
                 .filter(|w| !w.is_empty());
             match weapon {
@@ -179,6 +149,32 @@ pub fn lines_for(event: &TimelineEvent, state: &CaseState) -> Vec<SpokenLine> {
                 None => vec![SpokenLine::new(format!(
                     "Weapon detected! Intruder {number} is armed."
                 ))],
+            }
+        }
+        // ── Casualty: a person seen injured (once-off per person) ───────────
+        // Detail is "<id> appears injured: <injury>." — recover the injury and
+        // speak a terse casualty line; fall back to a generic line if absent.
+        TimelineKind::InjuryDetected => {
+            let injury = event
+                .detail
+                .split("appears injured:")
+                .nth(1)
+                .map(str::trim)
+                .map(|s| s.trim_end_matches('.').trim())
+                .filter(|s| !s.is_empty());
+            match injury {
+                Some(i) => vec![SpokenLine::new(format!("Casualty detected — {i}."))],
+                None => vec![SpokenLine::new("Casualty detected — a person appears injured.")],
+            }
+        }
+        // ── Malicious activity: a terse one-off line per distinct action ─────
+        // Detail is the action string itself (e.g. "breaking into car").
+        TimelineKind::MaliciousActivity => {
+            let action = event.detail.trim().trim_end_matches('.').trim();
+            if action.is_empty() {
+                Vec::new()
+            } else {
+                vec![SpokenLine::new(format!("Detected: {action}."))]
             }
         }
 
@@ -196,69 +192,10 @@ pub fn lines_for(event: &TimelineEvent, state: &CaseState) -> Vec<SpokenLine> {
     }
 }
 
-/// The `Investigate` smart-alarm loop's spoken lines, keyed on the event + the
-/// case's derived `investigate_outcome`. Returns `Some(lines)` for the events this
-/// loop owns (open / escalation / stand-down), or `None` to fall through to the
-/// generic gate (so post-promotion intruder-profile / weapon lines still flow).
-///
-/// - `CaseOpened` → 0.7 "Security alert, <location>, investigating."
-/// - `Escalated` (Threat/Intruder) → FULL "Threat detected!" / "Intruder detected!"
-/// - `Standdown` (benign outcome) → 0.7 "Visitors present, no duress, standing
-///   down." (Visitor) / "Only residents present, standing down." (FalseAlarm /
-///   Undetermined / anything benign).
-fn investigate_lines(event: &TimelineEvent, state: &CaseState) -> Option<Vec<SpokenLine>> {
-    match event.kind {
-        // The calm announce when the audible assessment opens.
-        TimelineKind::CaseOpened => {
-            let location = state
-                .trigger_location
-                .as_deref()
-                .map(str::trim)
-                .filter(|l| !l.is_empty());
-            let line = match location {
-                Some(l) => format!("Security alert, {l}, investigating."),
-                None => "Security alert, investigating.".to_string(),
-            };
-            Some(vec![SpokenLine::at_volume(line, INVESTIGATE_VOLUME)])
-        }
-        // The promotion edge — full-volume threat call keyed on WHY it escalated.
-        // (Intruder is the default for any non-Threat escalation, e.g. a generic
-        // prowler/critical promotion that didn't classify as a Threat.)
-        TimelineKind::Escalated => {
-            let line = match state.investigate_outcome {
-                InvestigateOutcome::Threat => "Threat detected!",
-                _ => "Intruder detected!",
-            };
-            Some(vec![SpokenLine::new(line)])
-        }
-        // The quiet stand-down line on a BENIGN resolution (Visitor / FalseAlarm /
-        // ran-out Undetermined) — only while the case is STILL gated (it never
-        // escalated). An Investigate case that PROMOTED to Alarm and is later
-        // disarmed must NOT speak the calm "only residents present" line — it falls
-        // through to the generic silent `Standdown` (+ the disarm path's "Alarm
-        // standing down."). Spoken at 0.7; `Cleared` stays silent so exactly one
-        // stand-down line is said.
-        TimelineKind::Standdown if state.gated() => {
-            let line = match state.investigate_outcome {
-                InvestigateOutcome::Visitor => "Visitors present, no duress, standing down.",
-                // FalseAlarm, Undetermined (deadline ran out → treat as benign), and
-                // any residual state stand down as "only residents present".
-                _ => "Only residents present, standing down.",
-            };
-            Some(vec![SpokenLine::at_volume(line, INVESTIGATE_VOLUME)])
-        }
-        TimelineKind::Cleared if state.gated() => Some(Vec::new()),
-        // Everything else (intruder-identified, weapon, zone movement, and any
-        // event on an already-PROMOTED Investigate case) falls through to the
-        // generic gate.
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::case::{CaseState, Intruder, TimelineKind};
+    use crate::case::{CaseState, Person, TimelineKind};
     use chrono::Utc;
 
     fn ev(kind: TimelineKind, detail: &str) -> TimelineEvent {
@@ -273,16 +210,20 @@ mod tests {
         CaseState::new("case-test".to_string(), Utc::now(), crate::case::TriggerProfile::Alarm)
     }
 
-    fn intruder(id: &str, descriptors: &str, armed: bool, weapon: Option<&str>) -> Intruder {
-        Intruder {
+    fn person(id: &str, descriptors: &str, armed: bool, weapon: Option<&str>) -> Person {
+        Person {
             id: id.to_string(),
             descriptors: descriptors.to_string(),
-            confidence: 0.9,
-            id_quality: 0.8,
+            resident_confidence: 0.1,
+            guest_confidence: 0.1,
+            intruder_confidence: 0.9,
+            id_score: 0.8,
             location: None,
             activity: None,
             armed,
             weapon: weapon.map(str::to_string),
+            injury: None,
+            in_duress: 0.0,
             best_stills: Vec::new(),
             identified: true,
             dossier: None,
@@ -309,8 +250,8 @@ mod tests {
         // The PROFILE is the intimidation piece (spoken), THEN a past-tense
         // "sent to responders" line.
         let mut s = case();
-        s.intruders
-            .push(intruder("subject-1", "tall, dark hoodie", false, None));
+        s.persons
+            .push(person("subject-1", "tall, dark hoodie", false, None));
         let lines = lines_for(&ev(TimelineKind::IntruderIdentified, "subject-1 identified: beard"), &s);
         assert_eq!(lines.len(), 2);
         // No spoken_summary yet → falls back to descriptors.
@@ -321,9 +262,9 @@ mod tests {
     #[test]
     fn intruder_identified_prefers_concise_spoken_summary() {
         let mut s = case();
-        let mut i = intruder("subject-1", "a very long forensic paragraph that runs on and on", false, None);
+        let mut i = person("subject-1", "a very long forensic paragraph that runs on and on", false, None);
         i.spoken_summary = Some("Caucasian male, forties, navy t-shirt, red beard.".to_string());
-        s.intruders.push(i);
+        s.persons.push(i);
         let lines = lines_for(&ev(TimelineKind::IntruderIdentified, "subject-1 identified: x"), &s);
         assert_eq!(lines[0].text, "Intruder identified. Caucasian male, forties, navy t-shirt, red beard.");
         assert!(!lines[0].text.contains("forensic paragraph"));
@@ -332,8 +273,8 @@ mod tests {
     #[test]
     fn weapon_detected_names_intruder_and_weapon() {
         let mut s = case();
-        s.intruders
-            .push(intruder("subject-1", "tall, dark hoodie", true, Some("kitchen knife")));
+        s.persons
+            .push(person("subject-1", "tall, dark hoodie", true, Some("kitchen knife")));
         let lines =
             lines_for(&ev(TimelineKind::WeaponDetected, "subject-1 is armed: kitchen knife"), &s);
         assert_eq!(lines.len(), 1);
@@ -383,5 +324,29 @@ mod tests {
             lines_for(&ev(TimelineKind::BestStillUpgraded, "clearer still"), &s).is_empty(),
             "best-still upgrades must be silent"
         );
+    }
+
+    #[test]
+    fn injury_speaks_casualty_line() {
+        let s = case();
+        let lines = lines_for(
+            &ev(TimelineKind::InjuryDetected, "subject-1 appears injured: stab wound."),
+            &s,
+        );
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, "Casualty detected — stab wound.");
+        // A bare detail still speaks a generic casualty line.
+        let generic = lines_for(&ev(TimelineKind::InjuryDetected, "subject-1"), &s);
+        assert_eq!(generic[0].text, "Casualty detected — a person appears injured.");
+    }
+
+    #[test]
+    fn malicious_activity_speaks_terse_line() {
+        let s = case();
+        let lines = lines_for(&ev(TimelineKind::MaliciousActivity, "breaking into car"), &s);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, "Detected: breaking into car.");
+        // Empty detail stays silent.
+        assert!(lines_for(&ev(TimelineKind::MaliciousActivity, ""), &s).is_empty());
     }
 }
