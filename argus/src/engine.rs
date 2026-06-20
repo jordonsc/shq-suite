@@ -1248,10 +1248,15 @@ impl Engine {
                  is a FALSE ALARM. Do not assume an intrusion — assess it."
             }
             TriggerProfile::General => {
-                "This is a QUICK doorstep check at a FRIENDLY zone (someone approaching). Assume a \
-                 benign visitor. Glance for OBVIOUS danger ONLY — a brandished weapon, a balaclava \
-                 or concealed face, or clear forced-entry behaviour. A delivery, a resident, or an \
-                 ordinary visitor is benign; do not over-read it."
+                "This is a QUICK doorstep check at a FRIENDLY zone (someone approaching) and is NOT \
+                 an active intrusion. Assume a benign visitor — a delivery, a resident, or an \
+                 ordinary caller. Look for CLEAR, unambiguous signs of danger ONLY: a plainly \
+                 visible weapon IN HAND (gun, knife, bat, crowbar, machete), a balaclava or \
+                 deliberately concealed face, or active forced entry. Set `threat_level` to \
+                 `critical` IF AND ONLY IF you CLEARLY see one of those; otherwise keep it low. Do \
+                 NOT set `armed` or `critical` for an ordinary carried item — a parcel, bag, phone, \
+                 keys, bottle, umbrella, or clipboard is NOT a weapon — nor for any ambiguous or \
+                 unclear object. When in ANY doubt, the visitor is benign: do not flag a threat."
             }
         };
         format!(
@@ -1985,9 +1990,16 @@ fn decide_promotion(active: &ActiveCase) -> PromotionDecision {
     match state.effective_profile {
         TriggerProfile::Alarm => PromotionDecision::Continue, // unreachable (gated ruled out)
         TriggerProfile::General => {
-            if obvious_threat(state) {
-                PromotionDecision::Promote("obvious threat at door")
-            } else if active.tick_count + 1 >= GENERAL_STANDDOWN_TICKS {
+            // General escalates ONLY via the structured always-escalate set above —
+            // an `armed` intruder, a model-set `threat_level == Critical`, or a
+            // resident in danger. These are explicit, high-confidence signals.
+            // It deliberately does NOT escalate on free-text scene description: that
+            // substring-matched "no weapon visible" → "weapon" and false-fired on a
+            // benign delivery driver (incident 2026-06-20). The doorstep prompt
+            // makes the model reserve `armed`/`critical` for a CLEARLY visible weapon
+            // or balaclava, so those structured signals are trustworthy here.
+            // Otherwise the shallow glance quietly stands down after its budget.
+            if active.tick_count + 1 >= GENERAL_STANDDOWN_TICKS {
                 // +1: this is the (tick_count)-th tick about to complete.
                 PromotionDecision::Standdown
             } else {
@@ -2101,13 +2113,41 @@ fn mark_promoted(active: &mut ActiveCase, reason: &str, now: DateTime<Utc>) -> b
 /// (`threats`) plus a one-line `summary`; the escalation policy scans both. Used
 /// to detect resident-in-danger / face-concealment / forced-entry indicators the
 /// structured fields don't capture as a boolean.
+/// Negation-aware keyword scan over the model's free text (summary + `threats`).
+/// Split into clauses so a needle only counts in a clause that is NOT negated —
+/// the model's "no weapon visible" / "no mask" narration must never fire an
+/// escalation (this exact substring false-match caused the 2026-06-20 false alarm).
 fn threats_mention(state: &CaseState, needles: &[&str]) -> bool {
+    const NEG: &[&str] = &[
+        "no ", "not ", "n't", "without", "nothing", "no sign", "benign",
+        "ordinary", "unremarkable",
+    ];
     let mut hay = state.summary.to_lowercase();
     for t in &state.threats {
         hay.push('\n');
         hay.push_str(&t.to_lowercase());
     }
-    needles.iter().any(|n| hay.contains(n))
+    hay.split(|c| matches!(c, '.' | ',' | ';' | '\n' | '!'))
+        .any(|clause| {
+            needles.iter().any(|n| clause.contains(n))
+                && !NEG.iter().any(|neg| clause.contains(neg))
+        })
+}
+
+/// Affirmative concealment / forced-entry sign for the softer profiles. WEAPONS are
+/// handled STRUCTURALLY via `Intruder.armed` (the model's explicit boolean), so
+/// weapon keywords are deliberately NOT scanned here — the old version substring-
+/// matched "no weapon visible" → "weapon" and promoted a benign delivery driver to
+/// a full house alarm (incident 2026-06-20). Negation-aware via `threats_mention`.
+fn obvious_threat(state: &CaseState) -> bool {
+    threats_mention(
+        state,
+        &[
+            "balaclava", "ski mask", "ski-mask", "masked", "face conceal",
+            "face cover", "covered face", "concealed face", "forced entry",
+            "forcing the", "prying", "jimmying", "crowbar", "breaking in",
+        ],
+    )
 }
 
 /// A resident appears to be in apparent danger — the always-escalate signal that
@@ -2132,28 +2172,6 @@ fn resident_in_danger(state: &CaseState) -> bool {
 /// a visibly brandished weapon, face concealment (balaclava / mask), or
 /// forced-entry behaviour. `armed`/`Critical` are handled by the always-escalate
 /// set; this catches the obvious-but-not-yet-Critical signals from the free text.
-fn obvious_threat(state: &CaseState) -> bool {
-    threats_mention(
-        state,
-        &[
-            "balaclava",
-            "mask",
-            "masked",
-            "face conceal",
-            "face cover",
-            "covered face",
-            "concealed face",
-            "hood pulled",
-            "weapon",
-            "knife",
-            "firearm",
-            "forced entry",
-            "forcing",
-            "prying",
-            "breaking",
-        ],
-    )
-}
 
 /// Ensure the subject counter is at least `n` (used when the model coins ids).
 fn self_next_subject_at_least(active: &mut ActiveCase, n: u32) {
@@ -2341,12 +2359,27 @@ mod tests {
     /// `General` escalates on an OBVIOUS threat indicator (e.g. a balaclava) read
     /// from the free-text threats — before the budget runs out.
     #[test]
-    fn general_promotes_on_obvious_threat() {
+    fn general_promotes_only_on_structured_danger() {
+        // A free-text concealment string ALONE no longer promotes General — that
+        // free-text path false-fired on a benign delivery driver (2026-06-20).
         let mut c = active_case(TriggerProfile::General);
         c.state.threats.push("person wearing a balaclava".to_string());
+        assert_eq!(decide_promotion(&c), PromotionDecision::Continue);
+
+        // The model's STRUCTURED Critical (set only for a clearly-visible weapon or
+        // balaclava per the doorstep prompt) promotes.
+        c.state.threat_level = ThreatLevel::Critical;
         assert_eq!(
             decide_promotion(&c),
-            PromotionDecision::Promote("obvious threat at door")
+            PromotionDecision::Promote("critical threat")
+        );
+
+        // An armed intruder (structured) promotes too.
+        let mut c2 = active_case(TriggerProfile::General);
+        c2.state.intruders.push(intruder("subject-1", true));
+        assert_eq!(
+            decide_promotion(&c2),
+            PromotionDecision::Promote("armed intruder")
         );
     }
 
@@ -2463,9 +2496,19 @@ mod tests {
         c.state.summary = "A resident appears to be in danger".to_string();
         assert!(resident_in_danger(&c.state));
 
+        // Concealment fires obvious_threat; a weapon does NOT (that's structural via
+        // `armed`), so obvious_threat is concealment/forced-entry only.
         let mut c2 = active_case(TriggerProfile::General);
-        c2.state.threats.push("visible KNIFE in hand".to_string());
+        c2.state.threats.push("subject is wearing a balaclava".to_string());
         assert!(obvious_threat(&c2.state));
+
+        // Regression for the 2026-06-20 false alarm: a NEGATED danger mention in the
+        // model's narration must NOT fire (substring "weapon" inside "no weapon").
+        let mut c3 = active_case(TriggerProfile::General);
+        c3.state.summary = "no weapon or threatening behaviour visible".to_string();
+        assert!(!obvious_threat(&c3.state));
+        c3.state.threats.push("no mask or face concealment".to_string());
+        assert!(!obvious_threat(&c3.state));
     }
 
     /// PERSISTENCE GATE (a): a gated case whose escalate condition holds on a
