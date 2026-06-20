@@ -13,39 +13,53 @@
 > history below. **The remaining six M1 items were then built in an overnight autonomous
 > pass (2026-06-20) → argus 0.30.0 / Overwatch 0.4.0 / nyx 1.2.0 — see
 > [§ M1 completion build](#m1-completion-build--overnight-autonomous-session-2026-06-20) for the
-> per-phase summary + the morning to-do (deploys are NOT yet on atlas).**
+> per-phase summary. **DEPLOYED + cut over to PRODUCTION 2026-06-20** (argus 0.30.1 /
+> Overwatch 0.4.1 / nyx 1.2.0 / shq_display 1.2.0; Argus owns voice+klaxon+PD+kiosks; softer
+> triggers live) — see the PRODUCTION posture section below.**
 
-## ⚠️ CURRENT HOUSE POSTURE — TEST MODE (left deliberately, must restore later)
+## ✅ CURRENT HOUSE POSTURE — PRODUCTION (2026-06-20 cutover; Argus owns the alarm response)
 
-The premises were left in a **degraded test posture** at the user's request so
-development can continue. **A real intrusion right now gets a reduced response.**
-To restore production:
+The overnight M1 build was deployed and the house cut over to **Argus-as-primary**. Argus
+now owns the alarm outputs (voice, klaxon, PagerDuty, kiosk takeover); the legacy HA paths
+are retired. State:
 
-1. **Re-enable** `automation.alarm_trigger_2` ("Alarm Triggered") — currently
-   **DISABLED** (so the legacy klaxon + PagerDuty page do NOT fire on a real
-   trigger; Argus was taking over those outputs). `automation.alarm_trigger`
-   ("Alarm Sensors", sets `input_text.alarm_trigger_room` + triggers the panel) and
-   `stand_down_alarm` are still enabled.
-2. **Flip `~/.config/argus/config.yaml` `overwatch:` back to production:**
-   `klaxon_enabled: true`, `klaxon_volume: 0.9`, `voice_volume: 1.0`
-   (currently `false` / `0.1` / `0.6` for dog-friendly low-volume testing).
-3. **HA `arming_time`** was set to **5s** (was 3 min) in
-   `deploy/config/ha/configuration.yaml` for fast test re-arms — restore if desired
-   (deployed via `./setup ha --restart`).
-4. Decide the **production model**: does Argus *replace* the legacy
-   `script.alarm_trigger_actions` voice/klaxon/PD, or run alongside it? (We disabled
-   the legacy output to avoid a double klaxon; the lighting scene + legacy PD also
-   went with it.) This is a design decision for M2.
-5. **Overwatch voice is MUTED on atlas (session of 2026-06-19 PM):** the
-   `~/.config/argus/config.yaml` `overwatch:` key was renamed (→ no voice channel
-   spawns) so trigger-testing stays silent (people sleeping). Restore from
-   `~/.config/argus/config.yaml.voicebak`, or rename the key back, + restart. **While
-   muted the Argus disarm voice + klaxon-off are DORMANT** (the outputs consumer isn't
-   spawned) — verify them once voice is back.
-6. **HA "Alarm Disarmed" automation** had its `overwatch.verbalise "Security
-   disarmed"` action removed (now Argus's job). Backup: `/tmp/alarm_disarmed.bak.json`.
-   The redundant HA klaxon-off (`script.alarm_stand_down`) is intentionally LEFT as a
-   safety net until Argus's klaxon control is live-verified.
+1. **Overwatch voice + klaxon LIVE.** Atlas `~/.config/argus/config.yaml` `overwatch:`
+   block restored to production (`klaxon_enabled: true`, `klaxon_volume: 0.9`,
+   `voice_volume: 1.0`, `duck_factor: 0.5` — the new halving duck, Overwatch 0.4.1). The
+   mute-rename is undone. (Assumes the Overwatch amp is back on.)
+2. **PagerDuty LIVE.** Argus `pagerduty:` block added with the **real** Events v2 routing
+   key (same integration as the old HA `rest_command.pagerduty_message`; secret in
+   `~/.config/argus/argus.env` → `PAGERDUTY_ROUTING_KEY`). ⚠️ A real escalation now pages a
+   human.
+3. **Legacy `automation.alarm_trigger_2` ("Alarm Triggered") stays DISABLED** — Argus
+   replaces it (resolves the old "production model" question: Argus *replaces* the legacy
+   voice/klaxon/PD). `automation.alarm_trigger` ("Alarm Sensors") + `stand_down_alarm`
+   remain enabled.
+4. **Softer triggers wired (Phase 7 LIVE).** "Perimeter Security: Outdoor Movement" now
+   pulses `input_boolean.argus_investigate` (replacing `script.perimeter_security_alert`,
+   which also fired a real PD page — now removed); "Visitor Approaching" also pulses
+   `input_boolean.argus_general` (beep kept). A companion "Argus Trigger Reset" automation
+   resets the booleans 2s after firing. Argus `triggers:` maps alarm→alarm, the two
+   booleans→investigate/general. ⚠️ A self-escalation goes FULL Alarm and **trips the real
+   `alarm_control_panel`**.
+5. **Kiosks 02–11 cut over to Argus takeover.** `script.kiosks_alarm` (from "Alarm Armed")
+   and `script.kiosks_dashboard` (from "Alarm Disarmed") calls REMOVED; Argus drives all
+   10 kiosks (`kiosks:` 02–11). nyx 1.2.0 reflashed to the fleet (wake/keep_awake).
+6. **Still test-ish:** HA `arming_time` was set to 5s (was 3 min) for fast re-arms —
+   restore in `deploy/config/ha/configuration.yaml` if desired (`./setup ha --restart`).
+7. **Backups:** atlas `~/.config/argus/config.yaml.bak-pre-cutover-20260620` (pre-cutover);
+   `config.yaml.voicebak` (older muted). The redundant HA klaxon-off
+   (`script.alarm_stand_down`) is LEFT as a safety net.
+
+**⚠️ OPEN PRECISION RISK:** General/Investigate currently escalate on a single-frame
+obvious-threat read, with real PD + whole-house trip LIVE. The **General/Investigate
+precision pass** — ≥2-tick **persistence** on the threat indicator + time / arm-state /
+resident-presence / recent-door-access context + resident photos + per-profile seed
+guidance — is the priority follow-up (see "Open findings"). Until it lands, a vision
+false-positive (e.g. a phone read as a blade) could page + trip the house.
+
+**Owed:** mirror the live atlas `config.yaml` + `argus.env` (PD key) and the HA
+`configuration.yaml`/automation changes to the private `shq-suite-config`.
 
 **Argus now runs CONTAINERISED on atlas** (systemd `--user` Quadlet, `argus.service`)
 watching `alarm_control_panel.shq_alarm` — the old Valerie shell daemon was retired.
