@@ -49,6 +49,31 @@ pub struct Config {
     /// open to drive the spoken breach line. Absent = the breach line is generic.
     #[serde(default)]
     pub trigger_location_entity: Option<String>,
+    /// Optional HA entity that, on ANY state change, requests a panel-independent
+    /// STANDDOWN of the active case (the kill switch). Typically an
+    /// `input_button` (e.g. `input_button.argus_stand_down`) — pressing it changes
+    /// its state to a fresh timestamp, so the WS treats *any* `state_changed` on it
+    /// as a press and emits [`crate::ha::HaEvent::StandDownRequested`]. This is the
+    /// off-switch for the klaxon/PD/kiosk when the manual alarm panel was DISARMED
+    /// and so never entered `triggered` (no panel edge to disarm). Absent = no kill
+    /// switch (the panel disarm + the Phase-5 control WS remain the only standdowns).
+    #[serde(default)]
+    pub standdown_entity: Option<String>,
+    /// Optional HA script (name only, e.g. `argus_alarm` → `script.argus_alarm`)
+    /// that trips the real alarm panel WITH the secret code, HA-side. When set, an
+    /// escalation calls `script.<name>` instead of `alarm_control_panel.alarm_trigger`
+    /// — the trip code then lives in HA, not in Argus's config/seed. Absent = fall
+    /// back to the direct `alarm_trigger` on the primary alarm entity.
+    #[serde(default)]
+    pub escalation_alarm_script: Option<String>,
+    /// Optional HA entity whose state is the human location for an `Investigate`
+    /// (perimeter-security) case — mirrors `trigger_location_entity` but for the
+    /// softer perimeter path (the perimeter automation sets
+    /// `input_text.perimeter_security_last_area`). Read once at an `Investigate`
+    /// case open to name the area in the calm "Security alert, <area>,
+    /// investigating." announce. Absent = the announce omits the location.
+    #[serde(default)]
+    pub investigate_location_entity: Option<String>,
     /// The assessment-loop cadence + guardrails (Phase 2).
     #[serde(default)]
     pub loop_config: LoopConfig,
@@ -240,10 +265,21 @@ pub struct PagerDutyConfig {
     /// PagerDuty `payload.source` (a fixed dedup-independent label).
     #[serde(default = "default_pd_source")]
     pub source: String,
+    /// STABLE Events v2 `dedup_key` — a fixed string shared by every
+    /// trigger/update/acknowledge/resolve for the active alarm (NOT the per-case
+    /// `case_id`). One incident at a time is correct for a single-home alarm, and a
+    /// stable key lets HA resolve the page itself (same key) even if Argus is down
+    /// — so a klaxon/PD left running with Argus restarted can still be closed.
+    #[serde(default = "default_pd_dedup_key")]
+    pub dedup_key: String,
 }
 
 fn default_pd_source() -> String {
     "argus@atlas".to_string()
+}
+
+fn default_pd_dedup_key() -> String {
+    "argus-shq-alarm".to_string()
 }
 
 /// Real-time offsite replication of the case dir to S3 (Phase 2a).

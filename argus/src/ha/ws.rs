@@ -44,6 +44,13 @@ pub enum HaEvent {
         entity_id: String,
         profile: TriggerProfile,
     },
+    /// The panel-independent STANDDOWN kill switch fired (any `state_changed` on
+    /// the configured `standdown_entity` — typically an `input_button`, whose press
+    /// changes its state to a fresh timestamp). The engine stands down the active
+    /// case (same path as the Phase-5 `ControlCommand::Standdown` / a panel disarm).
+    /// Off-switch for the klaxon/PD/kiosk when the panel was DISARMED and so never
+    /// produced a `triggered` edge to disarm.
+    StandDownRequested { entity_id: String },
 }
 
 /// Connect, authenticate, subscribe, and forward alarm-trigger transitions over
@@ -57,16 +64,29 @@ pub enum HaEvent {
 /// active (on/detected) fires a one-shot `HaEvent::TriggerFired` that opens a
 /// gated case. The softer map is typically empty (the live atlas config has only
 /// the alarm entity) — those entities are user-owned and wired at test time.
+///
+/// `standdown_entity` (the kill switch) is observed on ANY `state_changed` and
+/// emits a one-shot `HaEvent::StandDownRequested`; absent = no kill switch.
 pub async fn run(
     ws_url: String,
     token: String,
     alarm_entity: String,
     softer_triggers: HashMap<String, TriggerProfile>,
+    standdown_entity: Option<String>,
     tx: mpsc::Sender<HaEvent>,
 ) {
     let mut backoff = INITIAL_BACKOFF;
     loop {
-        match connect_and_listen(&ws_url, &token, &alarm_entity, &softer_triggers, &tx).await {
+        match connect_and_listen(
+            &ws_url,
+            &token,
+            &alarm_entity,
+            &softer_triggers,
+            standdown_entity.as_deref(),
+            &tx,
+        )
+        .await
+        {
             Ok(()) => {
                 warn!("HA WebSocket connection closed; reconnecting");
                 backoff = INITIAL_BACKOFF;
@@ -85,6 +105,7 @@ async fn connect_and_listen(
     token: &str,
     alarm_entity: &str,
     softer_triggers: &HashMap<String, TriggerProfile>,
+    standdown_entity: Option<&str>,
     tx: &mpsc::Sender<HaEvent>,
 ) -> Result<()> {
     info!("Connecting to HA WebSocket at {ws_url}");
@@ -145,6 +166,7 @@ async fn connect_and_listen(
                         &v,
                         alarm_entity,
                         softer_triggers,
+                        standdown_entity,
                         &mut tracker,
                         &mut softer_active,
                         tx,
@@ -170,6 +192,7 @@ async fn handle_message(
     v: &Value,
     alarm_entity: &str,
     softer_triggers: &HashMap<String, TriggerProfile>,
+    standdown_entity: Option<&str>,
     tracker: &mut AlarmTracker,
     softer_active: &mut HashMap<String, bool>,
     tx: &mpsc::Sender<HaEvent>,
@@ -186,6 +209,20 @@ async fn handle_message(
         return;
     };
     let new_state = data["new_state"]["state"].as_str().unwrap_or("unknown");
+
+    // ── Kill switch: ANY change to the standdown entity is a standdown request ─
+    // An `input_button` press changes its state to a fresh timestamp, so there is
+    // no "value" to compare — treat every `state_changed` on it as a press.
+    if standdown_entity == Some(entity_id) {
+        info!("standdown kill switch {entity_id} changed ({new_state}) → standdown requested");
+        let event = HaEvent::StandDownRequested {
+            entity_id: entity_id.to_string(),
+        };
+        if tx.send(event).await.is_err() {
+            warn!("event channel closed; dropping standdown request");
+        }
+        return;
+    }
 
     // ── Primary alarm panel: the full arm/disarm mode machine ────────────────
     if entity_id == alarm_entity {

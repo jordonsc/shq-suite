@@ -1,7 +1,9 @@
 //! Phase 3 — PagerDuty Events v2 security-station dispatch.
 //!
 //! Posts a dossier to PagerDuty (`POST https://events.pagerduty.com/v2/enqueue`)
-//! keyed on `case_id` (the dedup key):
+//! keyed on a STABLE config `dedup_key` (default `"argus-shq-alarm"`, NOT the
+//! per-case `case_id`) — one alarm incident at a time, so HA can resolve the same
+//! incident itself (same key) even if Argus is down:
 //! - **`trigger`** on case open, and re-sent (same dedup_key) on a *material
 //!   change* (new intruder, `intruder_identified`, threat escalation) so the
 //!   open incident always reflects the latest dossier.
@@ -72,11 +74,18 @@ pub struct Payload {
     pub custom_details: Value,
 }
 
-/// The PagerDuty sink. Holds the routing key + source; reused across a case.
+/// The PagerDuty sink. Holds the routing key + source + STABLE dedup key; reused
+/// across cases (one alarm incident at a time on a fixed `dedup_key`).
 #[derive(Clone)]
 pub struct PagerDuty {
     routing_key: String,
     source: String,
+    /// STABLE Events v2 dedup key (config `pagerduty.dedup_key`, default
+    /// `"argus-shq-alarm"`) — NOT the per-case `case_id`. Every trigger/update/
+    /// acknowledge/resolve for the active alarm shares it, so HA can resolve the
+    /// same incident itself (same key) even if Argus is down (the kill-switch
+    /// rationale).
+    dedup_key: String,
     http: reqwest::Client,
 }
 
@@ -84,10 +93,11 @@ impl PagerDuty {
     /// Construct from config. An empty `routing_key` means the caller should not
     /// have spawned this at all — but [`PagerDuty::send`] also guards against it
     /// defensively (logs + no-op) so a misconfiguration can never page blindly.
-    pub fn new(routing_key: String, source: String) -> Self {
+    pub fn new(routing_key: String, source: String, dedup_key: String) -> Self {
         Self {
             routing_key,
             source,
+            dedup_key,
             http: reqwest::Client::new(),
         }
     }
@@ -115,7 +125,10 @@ impl PagerDuty {
         EventBody {
             routing_key: self.routing_key.clone(),
             event_action: action.as_str(),
-            dedup_key: state.case_id.clone(),
+            // STABLE key (config), NOT `state.case_id` — every trigger/update/ack/
+            // resolve for the active alarm shares it, so HA can resolve the same
+            // incident even if Argus is down.
+            dedup_key: self.dedup_key.clone(),
             payload,
         }
     }
@@ -246,6 +259,10 @@ mod tests {
     use crate::case::{CaseState, TriggerProfile};
     use chrono::Utc;
 
+    /// A fixed STABLE dedup key for the tests (distinct from any `case_id`, so a
+    /// test that asserts the body's `dedup_key` proves the per-case id is NOT used).
+    const TEST_DEDUP: &str = "argus-shq-alarm";
+
     fn case() -> CaseState {
         let mut s = CaseState::new(
             "case-20260618T120000Z".to_string(),
@@ -256,12 +273,23 @@ mod tests {
         s
     }
 
+    fn pd() -> PagerDuty {
+        PagerDuty::new(
+            "ROUTING_KEY_PLACEHOLDER".to_string(),
+            "argus@atlas".to_string(),
+            TEST_DEDUP.to_string(),
+        )
+    }
+
     #[test]
     fn trigger_body_shape() {
-        let pd = PagerDuty::new("ROUTING_KEY_PLACEHOLDER".to_string(), "argus@atlas".to_string());
+        let pd = pd();
         let body = pd.build_event(&case(), Action::Trigger, None);
         assert_eq!(body.event_action, "trigger");
-        assert_eq!(body.dedup_key, "case-20260618T120000Z");
+        // STABLE dedup key (config), NOT the case_id — even though the case_id is
+        // "case-20260618T120000Z", the body keys on the fixed alarm key.
+        assert_eq!(body.dedup_key, TEST_DEDUP);
+        assert_ne!(body.dedup_key, case().case_id, "must NOT use the case_id");
         let p = body.payload.as_ref().expect("trigger has payload");
         assert_eq!(p.source, "argus@atlas");
         // Default ThreatLevel for a new case is Elevated → "warning".
@@ -269,13 +297,27 @@ mod tests {
         // Serialises cleanly to the Events v2 shape.
         let v = serde_json::to_value(&body).unwrap();
         assert_eq!(v["event_action"], "trigger");
-        assert_eq!(v["dedup_key"], "case-20260618T120000Z");
+        assert_eq!(v["dedup_key"], TEST_DEDUP);
         assert!(v["payload"]["custom_details"]["timeline"].is_array());
+    }
+
+    /// The whole alarm lifecycle (trigger → acknowledge → resolve) shares ONE
+    /// stable dedup key, so PagerDuty (and HA, if Argus is down) move/close the
+    /// SAME incident.
+    #[test]
+    fn lifecycle_shares_stable_dedup_key() {
+        let pd = pd();
+        let c = case();
+        for action in [Action::Trigger, Action::Acknowledge, Action::Resolve] {
+            let body = pd.build_event(&c, action, None);
+            assert_eq!(body.dedup_key, TEST_DEDUP, "{action:?} must use the stable key");
+            assert_ne!(body.dedup_key, c.case_id, "{action:?} must NOT use the case_id");
+        }
     }
 
     #[test]
     fn trigger_embeds_s3_prefix_when_offsite_enabled() {
-        let pd = PagerDuty::new("ROUTING_KEY_PLACEHOLDER".to_string(), "argus@atlas".to_string());
+        let pd = pd();
         let mut off = OffsiteConfig::default();
         off.enabled = true;
         off.bucket = "shq-argus-cases".to_string();
@@ -290,11 +332,11 @@ mod tests {
 
     #[test]
     fn acknowledge_body_has_no_payload() {
-        let pd = PagerDuty::new("ROUTING_KEY_PLACEHOLDER".to_string(), "argus@atlas".to_string());
+        let pd = pd();
         let body = pd.build_event(&case(), Action::Acknowledge, None);
         assert_eq!(body.event_action, "acknowledge");
         // Same stable dedup_key as trigger/resolve → moves the SAME incident.
-        assert_eq!(body.dedup_key, "case-20260618T120000Z");
+        assert_eq!(body.dedup_key, TEST_DEDUP);
         assert!(body.payload.is_none());
         let v = serde_json::to_value(&body).unwrap();
         assert_eq!(v["event_action"], "acknowledge");
@@ -303,7 +345,7 @@ mod tests {
 
     #[test]
     fn resolve_body_has_no_payload() {
-        let pd = PagerDuty::new("ROUTING_KEY_PLACEHOLDER".to_string(), "argus@atlas".to_string());
+        let pd = pd();
         let body = pd.build_event(&case(), Action::Resolve, None);
         assert_eq!(body.event_action, "resolve");
         assert!(body.payload.is_none());

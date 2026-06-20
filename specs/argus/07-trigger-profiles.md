@@ -150,8 +150,8 @@ The HA side owns *classifying* the trigger (it already sets
   (pure, unit-tested) consumed by `evaluate_promotion` at the end of `run_tick`.
   `promote()` is idempotent (guards on `escalated`): flips `effective_profile` to
   `Alarm`, pushes `TimelineKind::Escalated`, broadcasts the now-ungated state, then
-  **trips the real alarm** via `rest.call_service("alarm_control_panel",
-  "alarm_trigger", {entity_id})`. The resulting `Triggered` is no-op'd by `handle`
+  **trips the real alarm** — see the standdown-robustness pass (0.32.0) below for
+  the script-based trip; either way the resulting `Triggered` is no-op'd by `handle`
   (a case is already active → no double-open; the existing 4a guard).
 - **Escalation rules.** Always-escalate (any profile): armed intruder / `Critical`
   / resident-in-danger. `General`: also escalate on an OBVIOUS threat
@@ -228,3 +228,38 @@ touching the real `Alarm` path:
 - Validate `--once --profile investigate` / `--profile general` against atlas
   (needs `ANTHROPIC_API_KEY`) for a gated `CaseState` first (no Opus, fast close),
   THEN a controlled softer-trigger fire, THEN a controlled escalation.
+
+## Standdown robustness pass (argus 0.32.0 — kill switch + script trip)
+
+Triggered by a real failure: an escalation tried to trip the manual alarm panel
+but it was **DISARMED**, so the panel ignored the trip — there was no `triggered`
+state to disarm and no off-switch. The klaxon / PagerDuty / kiosk ran with no way
+to stop them except restarting Argus (which left PagerDuty un-resolved). Four
+panel-independent fixes:
+
+- **Panel-independent STANDDOWN control (the kill switch).** `standdown_entity`
+  (top-level config, an `input_button` like `input_button.argus_stand_down`): ANY
+  `state_changed` on it (a press changes its state to a fresh timestamp → treated as
+  a press) emits `HaEvent::StandDownRequested`; `engine::handle` calls the existing
+  `standdown()` if a case is active (klaxon off + PD resolve + kiosks restore),
+  logging either way. So an escalation can be cancelled WITHOUT a panel that ever
+  reached `triggered`. **A disarm OR the standdown control both stand the case down.**
+- **Klaxon-off on ANY case-clear.** `out::route_event` now stops the klaxon
+  out-of-band (`voice.set_alarm(false)`) on a `Standdown`/`Cleared` TIMELINE event —
+  not just the alarm-mode active→disarmed edge `standdown_voice` covered — so a
+  control / deadline / kill-switch standdown (no mode edge) silences the siren. It is
+  idempotent (a redundant `SetAlarm(false)` is harmless) and runs alongside the
+  mode-edge path + the independent PD `resolve`.
+- **Stable PagerDuty dedup key.** `pagerduty.dedup_key` (default `"argus-shq-alarm"`,
+  NOT the per-case `case_id`) is used for every trigger/update/ack/resolve. One alarm
+  incident at a time (correct for a single home), and — crucially — **HA can resolve
+  the same page itself (same key) even if Argus is down**, so a page left open by a
+  crashed/restarted Argus is still closable from HA.
+- **Script-based panel trip.** `escalation_alarm_script` (top-level config, e.g.
+  `argus_alarm` → `script.argus_alarm`): when set, `promote()` trips the panel by
+  calling that script (which arms/triggers the panel WITH the secret code, HA-side)
+  instead of `alarm_control_panel.alarm_trigger` — the trip code lives in HA, not in
+  Argus's config/seed. Unset = the direct `alarm_trigger` fallback (unchanged). **The
+  no-loop guard is intact:** `mark_promoted` (idempotent on `ActiveCase.escalated`)
+  flips the case ungated FIRST, so the script-raised panel `Triggered` is RECONCILED
+  by `handle` (a case is already active → no second case, no re-open).

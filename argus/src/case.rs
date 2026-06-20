@@ -61,6 +61,54 @@ impl TriggerProfile {
     }
 }
 
+// ───────────────────────────── Investigate smart-alarm outcome ──────────────
+
+/// The smart-alarm classification the engine derives each tick for an active
+/// `Investigate` case — the "what is this perimeter activity?" verdict that drives
+/// the audible investigate loop (announce → assess → resolve). Distinct from
+/// `ThreatLevel` (severity) and `TriggerProfile` (posture): it is the *decision*.
+///
+/// - `Threat`/`Intruder` resolve to **promote** (full `Alarm` + real-alarm trip,
+///   subject to the ≥2-tick persistence gate).
+/// - `Visitor`/`FalseAlarm` resolve to a **quiet stand down** (no alarm).
+/// - `Undetermined` keeps assessing until the investigate deadline, then stands
+///   down (treated as benign).
+///
+/// `#[serde(rename_all="snake_case")]` for the journal; Default `Undetermined`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum InvestigateOutcome {
+    /// A new (non-resident) person AND residents are absent OR present-but-unaware.
+    Intruder,
+    /// A weapon / ski-mask / face-concealment on a new (non-resident) person.
+    Threat,
+    /// A new person BUT residents are present and visibly engaging them.
+    Visitor,
+    /// The person who tripped it is actually a resident — no genuine stranger.
+    FalseAlarm,
+    /// Not enough signal yet; keep assessing.
+    #[default]
+    Undetermined,
+}
+
+/// The model's read of whether the residents are present and AWARE of / engaging
+/// the newcomer — the signal that separates a `Visitor` (engaged) from an
+/// `Intruder` (absent or oblivious). Optional on the live assessment; only the
+/// `Investigate` outcome classifier consumes it. Default `Unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ResidentAwareness {
+    /// No residents visible / present in the scene.
+    ResidentsAbsent,
+    /// Residents are present but oblivious to the newcomer (not interacting).
+    ResidentsPresentUnaware,
+    /// Residents are present AND engaging the newcomer (waving, talking, relaxed).
+    ResidentsPresentEngaging,
+    /// Can't tell from this frame.
+    #[default]
+    Unknown,
+}
+
 impl std::str::FromStr for TriggerProfile {
     type Err = String;
 
@@ -105,6 +153,11 @@ pub struct CaseState {
     /// breach line. `None` if no such entity is configured / set.
     #[serde(default)]
     pub trigger_location: Option<String>,
+    /// For an `Investigate` case: the engine's latest derived smart-alarm
+    /// classification (`classify_investigate`) — journalled so the HUD / record
+    /// shows the verdict. Ignored (left `Undetermined`) for the other profiles.
+    #[serde(default)]
+    pub investigate_outcome: InvestigateOutcome,
     /// What each camera currently sees (replaced each tick).
     pub locations: Vec<LocationObservation>,
     /// Detected intruders, reconciled by stable `id` across ticks.
@@ -273,6 +326,7 @@ impl CaseState {
             trigger_profile: profile,
             effective_profile: profile,
             trigger_location: None,
+            investigate_outcome: InvestigateOutcome::Undetermined,
             locations: Vec::new(),
             intruders: Vec::new(),
             threats: Vec::new(),
@@ -322,6 +376,13 @@ pub struct LiveAssessment {
     /// re-baselines `CaseState.threats` from this on a full sweep, unions on a
     /// partial tick.
     pub threats: Vec<String>,
+    /// Whether residents are present and ENGAGING the newcomer (the `Investigate`
+    /// smart-alarm signal — separates a welcomed visitor from an unnoticed/absent-
+    /// resident intruder). Optional: the model may omit it (older schema / non-
+    /// investigate runs) → `None`, which the classifier reads as `Unknown`. The
+    /// non-investigate profiles ignore it entirely.
+    #[serde(default)]
+    pub resident_awareness: Option<ResidentAwareness>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -420,9 +481,14 @@ pub fn live_assessment_schema() -> Value {
                 "type": "array",
                 "items": { "type": "string" },
                 "description": "Weapons, threatening objects, aggression, residents in apparent danger, or signs of forced entry visible this tick. Empty if none."
+            },
+            "resident_awareness": {
+                "type": ["string", "null"],
+                "enum": ["residents_absent", "residents_present_unaware", "residents_present_engaging", "unknown", null],
+                "description": "PERIMETER-SECURITY signal: are the residents present and ENGAGING any newcomer? 'residents_present_engaging' = a resident is visibly interacting with the newcomer — waving, talking, walking together, relaxed close proximity (a welcomed guest). 'residents_present_unaware' = a resident is in view but oblivious / not interacting (e.g. indoors, back turned, unaware someone has approached). 'residents_absent' = NO resident is present in the scene at all (a lone newcomer). 'unknown' or null = you cannot tell from this frame. Judge engagement generously toward 'engaging' ONLY when the interaction is genuinely relaxed and mutual; a stranger alone, or residents who plainly haven't noticed them, is NOT engaging."
             }
         },
-        "required": ["summary", "threat_level", "person_detected", "locations", "intruders", "threats"]
+        "required": ["summary", "threat_level", "person_detected", "locations", "intruders", "threats", "resident_awareness"]
     })
 }
 

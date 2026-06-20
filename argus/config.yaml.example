@@ -78,7 +78,7 @@ alarm_entity: "alarm_control_panel.shq_alarm"
 #                 unless escalated); promotes on an OBVIOUS threat (weapon / concealed
 #                 face / forced entry), else quiet standdown after a few ticks.
 # An escalation always goes to FULL alarm posture (klaxon included) and trips the
-# real house alarm — there is no softer "voice-only" escalation and no opt-out.
+# real house alarm — see `escalation_alarm_script` below for HOW it trips the panel.
 # OMIT `triggers` (or leave it empty) and the `alarm_entity` above is synthesised
 # into a single `alarm`-profile source — i.e. exactly today's behaviour. The softer
 # sources below are USER-OWNED placeholders (the real perimeter/front-door entities
@@ -101,6 +101,25 @@ alarm_entity: "alarm_control_panel.shq_alarm"
 # (e.g. set by an "Alarm Sensors" automation to area_name(trigger.entity_id)). Read
 # once at case open to name the location in the spoken breach line. Omit = generic.
 trigger_location_entity: "input_text.alarm_trigger_room"
+
+# Optional: a PANEL-INDEPENDENT standdown kill switch. ANY state change to this
+# entity stands down the active case (klaxon off, PagerDuty resolve, kiosks
+# restore) — the off-switch for an escalation that ran without ever tripping the
+# manual alarm panel (so there was no `triggered` state to disarm). Typically an
+# `input_button`: a press changes its state to a fresh timestamp, so Argus treats
+# EVERY change as a press. Omit = no kill switch (the panel disarm + the HA control
+# WS remain the only standdowns). Wire an HA dashboard button / the `argus` card to
+# press it.
+# standdown_entity: "input_button.argus_stand_down"
+
+# Optional: an HA SCRIPT that trips the real alarm panel on escalation, WITH the
+# secret code — so the trip code lives HA-side, not in Argus's config/seed. Give the
+# script NAME only (no `script.` prefix), e.g. `argus_alarm` → `script.argus_alarm`.
+# When set, an escalation calls this script; when UNSET, Argus falls back to a direct
+# `alarm_control_panel.alarm_trigger` on the primary alarm entity. Either way the
+# resulting panel `triggered` is RECONCILED (a case is already active → no second
+# case, no loop).
+# escalation_alarm_script: "argus_alarm"
 
 # Assessment-loop cadence + cost guardrails (Phase 2).
 loop_config:
@@ -182,6 +201,11 @@ telemetry_entities: []
 # pagerduty:
 #   routing_key: "${PAGERDUTY_ROUTING_KEY}"   # Events v2 integration key; empty = disabled
 #   source: "argus@atlas"                     # payload.source label
+#   dedup_key: "argus-shq-alarm"              # STABLE dedup key shared by every trigger/
+#                                             # update/ack/resolve (NOT the per-case id) —
+#                                             # one alarm incident at a time, so HA can
+#                                             # resolve the SAME page itself (same key) even
+#                                             # if Argus is down. Default "argus-shq-alarm".
 
 # Kiosk HUD HTTP/WS server + takeover (Phase 4) + the HA control WS (Phase 5).
 # When `web:` is present Argus serves the sci-fi HUD web app at /alarm, the case

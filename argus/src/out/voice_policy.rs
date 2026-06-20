@@ -29,19 +29,41 @@
 //! (it diffs the timeline across `watch` updates). The gate itself holds no
 //! state — pacing/debounce live in the consumer, not here.
 
-use crate::case::{CaseState, TimelineEvent, TimelineKind};
+use crate::case::{CaseState, InvestigateOutcome, TimelineEvent, TimelineKind, TriggerProfile};
+
+/// The reduced volume (0.0–1.0) the `Investigate` smart-alarm loop speaks its
+/// NON-escalation lines at — the calm announce + the stand-down lines. The
+/// escalation lines ("Threat detected!" / "Intruder detected!") use full volume
+/// (the configured `voice_volume`, i.e. `None`).
+const INVESTIGATE_VOLUME: f32 = 0.7;
 
 /// A line Argus will speak via Overwatch `Verbalise`. Produced only by
 /// [`lines_for`]; there is no constructor that yields a "failure" line.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SpokenLine {
     /// The text handed to Overwatch's TTS.
     pub text: String,
+    /// Per-line volume override (0.0–1.0). `None` = use the configured
+    /// `voice_volume` default (the full/normal level). The `Investigate` calm
+    /// announce + stand-down lines set `Some(0.7)`; everything else is `None`.
+    pub volume: Option<f32>,
 }
 
 impl SpokenLine {
+    /// A line at the configured default voice volume.
     fn new(text: impl Into<String>) -> Self {
-        Self { text: text.into() }
+        Self {
+            text: text.into(),
+            volume: None,
+        }
+    }
+
+    /// A line at an explicit volume (the `Investigate` 0.7 loop lines).
+    fn at_volume(text: impl Into<String>, volume: f32) -> Self {
+        Self {
+            text: text.into(),
+            volume: Some(volume),
+        }
     }
 }
 
@@ -51,12 +73,29 @@ impl SpokenLine {
 /// line (the breach location, the intruder profile, an armed intruder's weapon).
 /// Pure — no state held. An empty `Vec` means silent.
 pub fn lines_for(event: &TimelineEvent, state: &CaseState) -> Vec<SpokenLine> {
+    // ── Investigate smart-alarm loop ─────────────────────────────────────────
+    // An `Investigate`-origin case is an AUDIBLE assessment (unlike `General`,
+    // which stays silent until escalated). It speaks a calm 0.7 announce on open,
+    // a 0.7 stand-down line when it resolves benign (Visitor/FalseAlarm/run-out),
+    // and a FULL-volume "Threat/Intruder detected!" at the escalation edge. The
+    // `trigger_profile` (how it OPENED) is the marker — `effective_profile` flips
+    // to `Alarm` on promotion, so `Escalated` arrives with it already `Alarm`.
+    if state.trigger_profile == TriggerProfile::Investigate {
+        if let Some(lines) = investigate_lines(event, state) {
+            return lines;
+        }
+    }
+
     match event.kind {
         // ── Breach announcement (rides with the klaxon) ─────────────────────
         // `CaseOpened` fires it for a real `Alarm` case at open; `Escalated` (Phase
         // 4b) fires the SAME breach line when a gated case is promoted to `Alarm`
-        // (the gate suppressed `CaseOpened`, so the breach is announced retroactively
-        // at the promotion edge — the first justified moment to speak).
+        // (the breach is announced retroactively at the promotion edge — the first
+        // justified moment to speak). A GATED `General` `CaseOpened` stays SILENT:
+        // since voice now always runs through this policy (the 0.32.0 gate split),
+        // the policy itself must keep a gated General quiet until it escalates.
+        // (`Investigate` is handled above; `Escalated` arrives already-ungated.)
+        TimelineKind::CaseOpened if state.gated() => Vec::new(),
         TimelineKind::CaseOpened | TimelineKind::Escalated => {
             // Prefer the alarm's trigger location (the zone that tripped it), then
             // any camera person-present fix; else a generic breach line.
@@ -154,6 +193,65 @@ pub fn lines_for(event: &TimelineEvent, state: &CaseState) -> Vec<SpokenLine> {
         | TimelineKind::Acknowledged
         | TimelineKind::Standdown
         | TimelineKind::Cleared => Vec::new(),
+    }
+}
+
+/// The `Investigate` smart-alarm loop's spoken lines, keyed on the event + the
+/// case's derived `investigate_outcome`. Returns `Some(lines)` for the events this
+/// loop owns (open / escalation / stand-down), or `None` to fall through to the
+/// generic gate (so post-promotion intruder-profile / weapon lines still flow).
+///
+/// - `CaseOpened` → 0.7 "Security alert, <location>, investigating."
+/// - `Escalated` (Threat/Intruder) → FULL "Threat detected!" / "Intruder detected!"
+/// - `Standdown` (benign outcome) → 0.7 "Visitors present, no duress, standing
+///   down." (Visitor) / "Only residents present, standing down." (FalseAlarm /
+///   Undetermined / anything benign).
+fn investigate_lines(event: &TimelineEvent, state: &CaseState) -> Option<Vec<SpokenLine>> {
+    match event.kind {
+        // The calm announce when the audible assessment opens.
+        TimelineKind::CaseOpened => {
+            let location = state
+                .trigger_location
+                .as_deref()
+                .map(str::trim)
+                .filter(|l| !l.is_empty());
+            let line = match location {
+                Some(l) => format!("Security alert, {l}, investigating."),
+                None => "Security alert, investigating.".to_string(),
+            };
+            Some(vec![SpokenLine::at_volume(line, INVESTIGATE_VOLUME)])
+        }
+        // The promotion edge — full-volume threat call keyed on WHY it escalated.
+        // (Intruder is the default for any non-Threat escalation, e.g. a generic
+        // prowler/critical promotion that didn't classify as a Threat.)
+        TimelineKind::Escalated => {
+            let line = match state.investigate_outcome {
+                InvestigateOutcome::Threat => "Threat detected!",
+                _ => "Intruder detected!",
+            };
+            Some(vec![SpokenLine::new(line)])
+        }
+        // The quiet stand-down line on a BENIGN resolution (Visitor / FalseAlarm /
+        // ran-out Undetermined) — only while the case is STILL gated (it never
+        // escalated). An Investigate case that PROMOTED to Alarm and is later
+        // disarmed must NOT speak the calm "only residents present" line — it falls
+        // through to the generic silent `Standdown` (+ the disarm path's "Alarm
+        // standing down."). Spoken at 0.7; `Cleared` stays silent so exactly one
+        // stand-down line is said.
+        TimelineKind::Standdown if state.gated() => {
+            let line = match state.investigate_outcome {
+                InvestigateOutcome::Visitor => "Visitors present, no duress, standing down.",
+                // FalseAlarm, Undetermined (deadline ran out → treat as benign), and
+                // any residual state stand down as "only residents present".
+                _ => "Only residents present, standing down.",
+            };
+            Some(vec![SpokenLine::at_volume(line, INVESTIGATE_VOLUME)])
+        }
+        TimelineKind::Cleared if state.gated() => Some(Vec::new()),
+        // Everything else (intruder-identified, weapon, zone movement, and any
+        // event on an already-PROMOTED Investigate case) falls through to the
+        // generic gate.
+        _ => None,
     }
 }
 

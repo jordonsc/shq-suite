@@ -21,8 +21,9 @@ use tracing::{error, info, warn};
 
 use crate::case::{
     default_case_base, identification_schema, live_assessment_schema, CaseDir, CaseState,
-    CaseStatus, Identification, Intruder, IntruderDelta, LiveAssessment, LocationDelta,
-    LocationObservation, StillRef, ThreatLevel, TimelineKind, TriggerProfile,
+    CaseStatus, Identification, Intruder, IntruderDelta, InvestigateOutcome, LiveAssessment,
+    LocationDelta, LocationObservation, ResidentAwareness, StillRef, ThreatLevel, TimelineKind,
+    TriggerProfile,
 };
 use crate::config::{Config, ResidentPhoto};
 use crate::ha::{HaEvent, RestClient};
@@ -535,6 +536,18 @@ impl Engine {
                     error!("first assessment tick failed: {e:#}");
                 }
             }
+            // The panel-independent STANDDOWN kill switch: stand down the active
+            // case (klaxon off, PD resolve, kiosk restore — same path as the
+            // Phase-5 control standdown / a panel disarm). Logged either way; a
+            // press with no active case is a harmless no-op.
+            HaEvent::StandDownRequested { entity_id } => {
+                if self.active.is_some() {
+                    info!("kill switch {entity_id}: standing down active case");
+                    self.standdown().await;
+                } else {
+                    info!("kill switch {entity_id}: no active case (no-op)");
+                }
+            }
         }
     }
 
@@ -625,8 +638,18 @@ impl Engine {
             .context("creating case dir")?;
         let mut state = CaseState::new(case_id.clone(), now, profile);
         // Read the human location that tripped the alarm (set by the HA "Alarm
-        // Sensors" automation) so the spoken breach line can name it.
-        state.trigger_location = self.read_trigger_location().await;
+        // Sensors" automation) so the spoken breach line can name it. For an
+        // `Investigate` case the perimeter automation sets a SEPARATE entity
+        // (`investigate_location_entity`); fall back to the alarm one if unset.
+        let location_entity = match profile {
+            TriggerProfile::Investigate => self
+                .cfg
+                .investigate_location_entity
+                .as_deref()
+                .or(self.cfg.trigger_location_entity.as_deref()),
+            _ => self.cfg.trigger_location_entity.as_deref(),
+        };
+        state.trigger_location = self.read_location(location_entity).await;
         // The case-open detail reflects the profile. For a gated profile the
         // `CaseOpened` event is suppressed by the output gate (no voice/PD), so
         // this text only surfaces on the journal + HUD — but it must not say "Alarm
@@ -688,11 +711,11 @@ impl Engine {
         Ok(())
     }
 
-    /// Read the configured trigger-location entity (e.g.
-    /// `input_text.alarm_trigger_room`). `None` if unconfigured, unreadable, or a
-    /// placeholder state (`unknown`/`unavailable`/empty).
-    async fn read_trigger_location(&self) -> Option<String> {
-        let entity = self.cfg.trigger_location_entity.as_deref()?;
+    /// Read a configured location entity (the alarm `trigger_location_entity` or
+    /// the perimeter `investigate_location_entity`). `None` if unconfigured,
+    /// unreadable, or a placeholder state (`unknown`/`unavailable`/empty).
+    async fn read_location(&self, entity: Option<&str>) -> Option<String> {
+        let entity = entity?;
         match self.rest.state(entity).await {
             Ok(Some(s)) => {
                 let s = s.trim();
@@ -907,9 +930,21 @@ impl Engine {
         let person_seen = live.person_detected
             || !live.intruders.is_empty()
             || live.locations.iter().any(|l| l.person_present);
+        // Capture the merged resident-awareness BEFORE `merge_live` consumes `live`
+        // — the Investigate classifier reads it below (None ⇒ Unknown).
+        let resident_awareness = live.resident_awareness.unwrap_or_default();
 
         // 4. Merge the delta into CaseState (does NOT touch threat level).
         self.merge_live(active, live, full, now);
+
+        // 4a. Investigate smart-alarm classification (only for an Investigate case;
+        // a no-op verdict-store otherwise). Derived AFTER the merge so it reads the
+        // up-to-date intruder roster + threats. Drives the escalation/standdown
+        // decision + the spoken stand-down line.
+        if active.state.trigger_profile == TriggerProfile::Investigate {
+            active.state.investigate_outcome =
+                classify_investigate(&active.state, resident_awareness);
+        }
         // Announce intruder movement into a fresh zone (off this tick's per-camera
         // sightings — earliest reliable signal).
         self.announce_zone_entries(active, &zones_seen, now);
@@ -1041,20 +1076,37 @@ impl Engine {
         if let Err(e) = self.persist_and_broadcast(active) {
             error!("failed to flush escalation: {e:#}");
         }
-        // Trip the real house alarm — the locked decision. This produces an
-        // `AlarmModeChanged{Triggered}` which `handle` no-ops (a case is already
-        // active), so it never opens a second case.
-        let entity = self.cfg.primary_alarm_entity();
-        if let Err(e) = self
-            .rest
-            .call_service(
-                "alarm_control_panel",
-                "alarm_trigger",
-                serde_json::json!({ "entity_id": entity }),
-            )
-            .await
-        {
-            error!("failed to trip the real alarm panel {entity}: {e:#}");
+        // Trip the real house alarm — the locked decision. This RAISES the real
+        // panel; the resulting `alarm_control_panel` → `Triggered` is then RECONCILED
+        // by `handle(AlarmModeChanged{Triggered})`, which no-ops because a case is
+        // already active (`mark_promoted` flipped this case ungated above) — so the
+        // panel trip is NOT re-opened as a second case. There is NO loop.
+        //
+        // Prefer a configurable HA SCRIPT (`escalation_alarm_script`) when set: a
+        // `script.<name>` arms/triggers the panel WITH the secret code HA-side, so
+        // the trip code never lives in Argus's config/seed. When unset, fall back to
+        // the direct `alarm_control_panel.alarm_trigger` on the primary entity.
+        let trip = match self.cfg.escalation_alarm_script.as_deref() {
+            Some(script) => {
+                self.rest
+                    .call_service("script", script, serde_json::json!({}))
+                    .await
+                    .map_err(|e| format!("script.{script}: {e:#}"))
+            }
+            None => {
+                let entity = self.cfg.primary_alarm_entity();
+                self.rest
+                    .call_service(
+                        "alarm_control_panel",
+                        "alarm_trigger",
+                        serde_json::json!({ "entity_id": entity }),
+                    )
+                    .await
+                    .map_err(|e| format!("alarm_trigger {entity}: {e:#}"))
+            }
+        };
+        if let Err(e) = trip {
+            error!("failed to trip the real alarm panel ({e})");
         }
     }
 
@@ -1176,12 +1228,24 @@ impl Engine {
                 "The intruder alarm is active; assume an intrusion is in progress."
             }
             TriggerProfile::Investigate => {
-                "This is a PERIMETER SECURITY assessment while the premises is secured. Activity \
-                 has been detected on an external camera. Your job is to vet whether this is a \
-                 PROWLER (a non-resident loitering, trying doors or windows, attempting entry, \
-                 masked, or otherwise behaving like an intruder) versus a benign presence (a \
-                 resident arriving home, a known visitor, or a delivery). Do not assume an \
-                 intrusion — assess it."
+                "This is a PERIMETER SECURITY smart-alarm assessment while the premises is \
+                 secured. Activity has been detected on an external camera. Your job is the \
+                 smart-alarm decision: is this an INTRUDER, a THREAT, a welcomed VISITOR, or a \
+                 FALSE ALARM (a resident)? Three things matter:\n\
+                 (a) RESIDENT AWARENESS — set `resident_awareness`. Are the residents present and \
+                 ENGAGING any newcomer? 'residents_present_engaging' = a resident is visibly \
+                 interacting with them (waving, talking, walking together, relaxed close \
+                 proximity) — a welcomed guest. 'residents_present_unaware' = a resident is in \
+                 view but oblivious / not interacting. 'residents_absent' = no resident is in the \
+                 scene at all (a lone newcomer). Only say 'engaging' when the interaction is \
+                 genuinely relaxed and mutual.\n\
+                 (b) WEAPON / CONCEALMENT — hunt for a weapon, a ski-mask / balaclava, or any \
+                 face concealment on a newcomer (see the WEAPONS & THREATS clause below). Note it \
+                 in `threats`.\n\
+                 (c) FRAMING — an INTRUDER is a non-resident the residents are NOT aware of (or \
+                 are absent); a VISITOR is a non-resident the residents ARE engaging; a weapon or \
+                 mask on a non-resident is a THREAT; if the only person present is a resident, it \
+                 is a FALSE ALARM. Do not assume an intrusion — assess it."
             }
             TriggerProfile::General => {
                 "This is a QUICK doorstep check at a FRIENDLY zone (someone approaching). Assume a \
@@ -1699,6 +1763,15 @@ fn merge_camera_assessments(results: Vec<LiveAssessment>) -> LiveAssessment {
         summaries.join("; ")
     };
 
+    // Resident-awareness (the Investigate signal): take the MOST engaged read any
+    // camera reported this tick — a resident engaging the newcomer on ANY frame is
+    // the decisive signal, and it shouldn't be diluted by another camera that just
+    // sees the stranger alone. `engage > unaware > absent > unknown`.
+    let resident_awareness = results
+        .iter()
+        .filter_map(|r| r.resident_awareness)
+        .max_by_key(|a| awareness_rank(*a));
+
     LiveAssessment {
         summary,
         threat_level,
@@ -1706,6 +1779,18 @@ fn merge_camera_assessments(results: Vec<LiveAssessment>) -> LiveAssessment {
         locations,
         intruders,
         threats,
+        resident_awareness,
+    }
+}
+
+/// Rank a `ResidentAwareness` for the "most engaged read wins" merge across
+/// cameras. Higher = more decisive for distinguishing a welcomed visitor.
+fn awareness_rank(a: ResidentAwareness) -> u8 {
+    match a {
+        ResidentAwareness::ResidentsPresentEngaging => 3,
+        ResidentAwareness::ResidentsPresentUnaware => 2,
+        ResidentAwareness::ResidentsAbsent => 1,
+        ResidentAwareness::Unknown => 0,
     }
 }
 
@@ -1813,6 +1898,51 @@ fn format_local_time(now: DateTime<Utc>, tz_name: &str) -> String {
     format!("{} ({})", local.format("%A %-d %B %Y, %H:%M"), tz_name)
 }
 
+/// Derive the `Investigate` smart-alarm verdict for the current case state +
+/// the merged `resident_awareness` of this tick. Pure (no IO), so unit-testable.
+///
+/// Precedence (most severe first):
+/// 1. **Threat** — a weapon / mask / face-concealment on a person (armed intruder,
+///    or an obvious-threat keyword in the model's free text).
+/// 2. **Intruder** — a genuine stranger present (a non-resident on the roster —
+///    the model excludes near-certain residents) AND residents are ABSENT or
+///    PRESENT-but-UNAWARE (`Unknown` falls here too: fail toward intruder).
+/// 3. **Visitor** — a stranger present BUT residents are present and ENGAGING them.
+/// 4. **FalseAlarm** — NO genuine stranger, but a person was seen (it was a
+///    resident → no real stranger).
+/// 5. **Undetermined** — nothing of note yet (no stranger, no person) — keep going.
+fn classify_investigate(state: &CaseState, awareness: ResidentAwareness) -> InvestigateOutcome {
+    let stranger_present = !state.intruders.is_empty();
+
+    // 1. Threat — a weapon/mask on a person. An armed intruder, or a free-text
+    //    face-concealment/weapon indicator while a stranger is present.
+    let armed = state.intruders.iter().any(|i| i.armed);
+    if stranger_present && (armed || obvious_threat(state)) {
+        return InvestigateOutcome::Threat;
+    }
+
+    if stranger_present {
+        // 2/3. A genuine stranger: engaging residents ⇒ Visitor; otherwise (absent /
+        //      unaware / unknown) ⇒ Intruder. Fail toward intruder on `Unknown`.
+        return match awareness {
+            ResidentAwareness::ResidentsPresentEngaging => InvestigateOutcome::Visitor,
+            ResidentAwareness::ResidentsAbsent
+            | ResidentAwareness::ResidentsPresentUnaware
+            | ResidentAwareness::Unknown => InvestigateOutcome::Intruder,
+        };
+    }
+
+    // 4. No stranger, but a person was seen this case (the model classed them a
+    //    resident → no genuine stranger): a false alarm.
+    let person_seen = state.locations.iter().any(|l| l.person_present);
+    if person_seen {
+        return InvestigateOutcome::FalseAlarm;
+    }
+
+    // 5. Nothing yet.
+    InvestigateOutcome::Undetermined
+}
+
 /// The Phase-4b per-tick escalation verdict for a gated case (pure of IO so it is
 /// unit-testable; [`Engine::evaluate_promotion`] acts on it).
 #[derive(Debug, PartialEq, Eq)]
@@ -1865,15 +1995,27 @@ fn decide_promotion(active: &ActiveCase) -> PromotionDecision {
             }
         }
         TriggerProfile::Investigate => {
-            if intruder_behaviour(state) {
-                PromotionDecision::Promote("prowler behaviour")
-            } else if active
-                .investigate_deadline
-                .is_some_and(|d| Instant::now() >= d)
-            {
-                PromotionDecision::Standdown
-            } else {
-                PromotionDecision::Continue
+            // The smart-alarm outcome (derived each tick in `run_tick`) drives the
+            // resolution: a Threat/Intruder promotes (full Alarm + real-alarm trip,
+            // persistence-gated); a Visitor/FalseAlarm quietly stands down; an
+            // Undetermined keeps assessing until the deadline, then stands down
+            // (treated as benign — residents/visitor, never an alarm).
+            match state.investigate_outcome {
+                InvestigateOutcome::Threat => PromotionDecision::Promote("threat detected"),
+                InvestigateOutcome::Intruder => PromotionDecision::Promote("intruder detected"),
+                InvestigateOutcome::Visitor | InvestigateOutcome::FalseAlarm => {
+                    PromotionDecision::Standdown
+                }
+                InvestigateOutcome::Undetermined => {
+                    if active
+                        .investigate_deadline
+                        .is_some_and(|d| Instant::now() >= d)
+                    {
+                        PromotionDecision::Standdown
+                    } else {
+                        PromotionDecision::Continue
+                    }
+                }
             }
         }
     }
@@ -2011,34 +2153,6 @@ fn obvious_threat(state: &CaseState) -> bool {
             "breaking",
         ],
     )
-}
-
-/// A confirmed non-resident behaving as an intruder (the `Investigate` escalation
-/// bar): a detected intruder present AND behaving like a prowler — trying doors /
-/// windows, attempted entry, loitering at an access point, or the obvious-threat
-/// signals. A bare person on a perimeter camera is NOT enough; the model must read
-/// intruder-like behaviour (it excludes near-certain residents from `intruders`).
-fn intruder_behaviour(state: &CaseState) -> bool {
-    if state.intruders.is_empty() {
-        return false;
-    }
-    obvious_threat(state)
-        || threats_mention(
-            state,
-            &[
-                "trying door",
-                "trying the door",
-                "trying window",
-                "attempted entry",
-                "attempting entry",
-                "tampering",
-                "loitering",
-                "prowler",
-                "casing",
-                "climbing",
-                "intruder",
-            ],
-        )
 }
 
 /// Ensure the subject counter is at least `n` (used when the model coins ids).
@@ -2236,23 +2350,108 @@ mod tests {
         );
     }
 
-    /// `Investigate` escalates on a detected intruder behaving as a prowler (trying
-    /// a door), NOT on a bare presence.
+    /// `Investigate` escalation/standdown is driven by the derived
+    /// `investigate_outcome`: Threat/Intruder → promote; Visitor/FalseAlarm →
+    /// quiet standdown; Undetermined → keep assessing until the deadline.
     #[test]
-    fn investigate_promotes_on_prowler_behaviour() {
-        // Bare presence with no intruder roster → keep assessing.
+    fn investigate_promotion_keys_on_outcome() {
+        // Intruder → promote.
         let mut c = active_case(TriggerProfile::Investigate);
-        c.state.threats.push("someone trying the door handle".to_string());
+        c.state.investigate_outcome = InvestigateOutcome::Intruder;
         assert_eq!(
             decide_promotion(&c),
-            PromotionDecision::Continue,
-            "no detected intruder yet → don't escalate on text alone"
+            PromotionDecision::Promote("intruder detected")
         );
-        // With a detected (non-resident) intruder + prowler behaviour → promote.
-        c.state.intruders.push(intruder("subject-1", false));
+
+        // Threat → promote (distinct reason for the spoken line keying).
+        let mut t = active_case(TriggerProfile::Investigate);
+        t.state.investigate_outcome = InvestigateOutcome::Threat;
         assert_eq!(
-            decide_promotion(&c),
-            PromotionDecision::Promote("prowler behaviour")
+            decide_promotion(&t),
+            PromotionDecision::Promote("threat detected")
+        );
+
+        // Visitor / FalseAlarm → quiet standdown (no alarm).
+        for benign in [InvestigateOutcome::Visitor, InvestigateOutcome::FalseAlarm] {
+            let mut b = active_case(TriggerProfile::Investigate);
+            b.state.investigate_outcome = benign;
+            assert_eq!(
+                decide_promotion(&b),
+                PromotionDecision::Standdown,
+                "{benign:?} must stand down quietly"
+            );
+        }
+
+        // Undetermined before the deadline → keep assessing.
+        let mut u = active_case(TriggerProfile::Investigate);
+        u.state.investigate_outcome = InvestigateOutcome::Undetermined;
+        assert_eq!(decide_promotion(&u), PromotionDecision::Continue);
+        // …and once the deadline passes, a quiet standdown (treated as benign).
+        u.investigate_deadline = Some(Instant::now() - Duration::from_secs(1));
+        assert_eq!(decide_promotion(&u), PromotionDecision::Standdown);
+    }
+
+    /// `classify_investigate` returns each of the four outcomes for the right
+    /// inputs (plus Undetermined when there's nothing yet).
+    #[test]
+    fn classify_investigate_covers_all_outcomes() {
+        // Threat — a weapon/mask on a present stranger (armed intruder).
+        let mut threat = active_case(TriggerProfile::Investigate);
+        threat.state.intruders.push(intruder("subject-1", true));
+        assert_eq!(
+            classify_investigate(&threat.state, ResidentAwareness::ResidentsAbsent),
+            InvestigateOutcome::Threat
+        );
+        // Threat also via a free-text face-concealment indicator on a stranger.
+        let mut masked = active_case(TriggerProfile::Investigate);
+        masked.state.intruders.push(intruder("subject-1", false));
+        masked.state.threats.push("newcomer wearing a balaclava".to_string());
+        assert_eq!(
+            classify_investigate(&masked.state, ResidentAwareness::Unknown),
+            InvestigateOutcome::Threat
+        );
+
+        // Intruder — a stranger, residents absent/unaware (or unknown → fail toward
+        // intruder).
+        let mut intr = active_case(TriggerProfile::Investigate);
+        intr.state.intruders.push(intruder("subject-1", false));
+        for aware in [
+            ResidentAwareness::ResidentsAbsent,
+            ResidentAwareness::ResidentsPresentUnaware,
+            ResidentAwareness::Unknown,
+        ] {
+            assert_eq!(
+                classify_investigate(&intr.state, aware),
+                InvestigateOutcome::Intruder,
+                "stranger + {aware:?} ⇒ Intruder"
+            );
+        }
+
+        // Visitor — a stranger, residents present and ENGAGING them.
+        assert_eq!(
+            classify_investigate(&intr.state, ResidentAwareness::ResidentsPresentEngaging),
+            InvestigateOutcome::Visitor
+        );
+
+        // FalseAlarm — no stranger, but a person was seen (a resident tripped it).
+        let mut fa = active_case(TriggerProfile::Investigate);
+        fa.state.locations.push(LocationObservation {
+            camera: "camera.x".to_string(),
+            label: "Front Yard".to_string(),
+            activity: "a resident walking up".to_string(),
+            person_present: true,
+            last_seen: Utc::now(),
+        });
+        assert_eq!(
+            classify_investigate(&fa.state, ResidentAwareness::ResidentsPresentEngaging),
+            InvestigateOutcome::FalseAlarm
+        );
+
+        // Undetermined — nothing detected yet.
+        let empty = active_case(TriggerProfile::Investigate);
+        assert_eq!(
+            classify_investigate(&empty.state, ResidentAwareness::Unknown),
+            InvestigateOutcome::Undetermined
         );
     }
 

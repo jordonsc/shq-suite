@@ -170,8 +170,12 @@ async fn main() -> Result<()> {
             info!("PagerDuty configured but routing_key empty; PagerDuty output disabled");
             None
         } else {
-            info!(source = %p.source, "PagerDuty output enabled (Events v2)");
-            Some(out::pagerduty::PagerDuty::new(p.routing_key.clone(), p.source.clone()))
+            info!(source = %p.source, dedup_key = %p.dedup_key, "PagerDuty output enabled (Events v2)");
+            Some(out::pagerduty::PagerDuty::new(
+                p.routing_key.clone(),
+                p.source.clone(),
+                p.dedup_key.clone(),
+            ))
         }
     });
     if voice.is_some() || pagerduty.is_some() {
@@ -241,8 +245,9 @@ async fn run_daemon(
         .into_iter()
         .filter(|(e, _)| *e != alarm_entity)
         .collect();
+    let standdown_entity = cfg.standdown_entity.clone();
     tokio::spawn(async move {
-        ha::ws::run(ws_url, token, alarm_entity, softer_triggers, tx).await;
+        ha::ws::run(ws_url, token, alarm_entity, softer_triggers, standdown_entity, tx).await;
     });
 
     info!(

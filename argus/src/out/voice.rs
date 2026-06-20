@@ -143,9 +143,13 @@ impl VoiceClient {
     /// Speak a line via `Verbalise` (AWS Polly TTS on Overwatch). Logs + returns
     /// on failure; never panics. No notification tone is prefixed (positive-only
     /// speech is meant to be calm and authoritative, not alerting).
-    pub async fn verbalise(&self, text: &str) {
+    ///
+    /// `volume` is the per-line override (the Investigate loop speaks its calm
+    /// announce / stand-down lines at 0.7); `None` = the configured `voice_volume`.
+    pub async fn verbalise(&self, text: &str, volume: Option<f32>) {
+        let volume = volume.unwrap_or(self.voice_volume);
         if self.dry {
-            info!("[DRY VOICE] would speak: {text:?}");
+            info!("[DRY VOICE] would speak (volume {volume}): {text:?}");
             return;
         }
         let Some(mut client) = self.connect().await else {
@@ -155,7 +159,7 @@ impl VoiceClient {
             text: text.to_string(),
             notification_tone_id: None,
             voice_id: Some(self.voice_id.clone()),
-            volume: Some(self.voice_volume),
+            volume: Some(volume),
             // Block until Overwatch finishes PLAYING the clip (not just synthesis),
             // so the serial voice worker paces itself and lines never overlap — no
             // local timing estimate needed.
