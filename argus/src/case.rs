@@ -483,9 +483,9 @@ pub fn live_assessment_schema() -> Value {
                 "description": "Weapons, threatening objects, aggression, residents in apparent danger, or signs of forced entry visible this tick. Empty if none."
             },
             "resident_awareness": {
-                "type": ["string", "null"],
-                "enum": ["residents_absent", "residents_present_unaware", "residents_present_engaging", "unknown", null],
-                "description": "PERIMETER-SECURITY signal: are the residents present and ENGAGING any newcomer? 'residents_present_engaging' = a resident is visibly interacting with the newcomer — waving, talking, walking together, relaxed close proximity (a welcomed guest). 'residents_present_unaware' = a resident is in view but oblivious / not interacting (e.g. indoors, back turned, unaware someone has approached). 'residents_absent' = NO resident is present in the scene at all (a lone newcomer). 'unknown' or null = you cannot tell from this frame. Judge engagement generously toward 'engaging' ONLY when the interaction is genuinely relaxed and mutual; a stranger alone, or residents who plainly haven't noticed them, is NOT engaging."
+                "type": "string",
+                "enum": ["residents_absent", "residents_present_unaware", "residents_present_engaging", "unknown"],
+                "description": "PERIMETER-SECURITY signal: are the residents present and ENGAGING any newcomer? 'residents_present_engaging' = a resident is visibly interacting with the newcomer — waving, talking, walking together, relaxed close proximity (a welcomed guest). 'residents_present_unaware' = a resident is in view but oblivious / not interacting (e.g. indoors, back turned, unaware someone has approached). 'residents_absent' = NO resident is present in the scene at all (a lone newcomer). 'unknown' = you cannot tell from this frame. Judge engagement generously toward 'engaging' ONLY when the interaction is genuinely relaxed and mutual; a stranger alone, or residents who plainly haven't noticed them, is NOT engaging."
             }
         },
         "required": ["summary", "threat_level", "person_detected", "locations", "intruders", "threats", "resident_awareness"]
