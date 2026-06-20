@@ -23,6 +23,7 @@ use crate::case::{
     default_case_base, identification_schema, live_assessment_schema, CaseDir, CaseState,
     CaseStatus, Identification, LiveAssessment, LocationDelta, LocationObservation, Person,
     PersonDelta, StillRef, ThreatLevel, TimelineKind, TriggerProfile, CONCERN_INTRUDER_FLOOR,
+    DURESS_FLOOR,
 };
 use crate::config::Config;
 use crate::ha::{HaEvent, RestClient};
@@ -79,11 +80,9 @@ const AUTHORISED_DWELL_SECS: u64 = 15;
 /// front-door visitor / delivery), so it must stay cheap and silent.
 const INVESTIGATE_STANDDOWN_TICKS: u64 = 4;
 
-/// `in_duress` confidence at or above which a person counts as a structured
-/// duress signal — lifts the threat to `LifeThreatening` (the structured set that
-/// can reach the top tier) and escalates a gated `Investigate` case. A high bar:
-/// only a confident duress read forces it; a faint/uncertain read does not.
-const DURESS_FLOOR: f32 = 0.75;
+// `DURESS_FLOOR` (the structured-duress threshold that lifts threat to
+// `LifeThreatening`, escalates a gated case, and now makes a person
+// `warrants_attention`) is defined once in `case.rs` and imported above.
 
 /// **Escalation persistence gate (the production false-escalation safety win).**
 /// A GATED (`Investigate`/`General`) case must see its escalate condition hold for
@@ -282,7 +281,7 @@ struct ActiveCase {
     /// Rank of the MAIN-image still currently held for the HUD primary pane
     /// (life_threatening=3 / malicious=2 / intruder=1 / any=0). Reset per case;
     /// a newer still only replaces the main image when its rank ≥ this
-    /// (sticky-downward — see [`should_replace_main`] / [`compute_main_rank`]).
+    /// (sticky-downward — see [`should_replace_main`] / [`rank_frame`]).
     main_still_rank: u8,
 }
 
@@ -894,17 +893,19 @@ impl Engine {
         let lc = &self.cfg.loop_config;
         let base_full = active.tick_count == 0
             || (lc.full_sweep_every > 0 && active.tick_count % lc.full_sweep_every as u64 == 0);
-        // While actively tracking an intruder (someone on the roster, seen within
-        // the active window), assess EVERY camera each tick — don't let motion-
-        // gating hold back the room an intruder has just walked into (that gate +
-        // the periodic-sweep interval was the main lag in room-change detection).
-        // Cost is acceptable during a live intrusion; it reverts to motion-gating
-        // once the case goes quiet (decays off Critical).
+        // While actively tracking a person who WARRANTS ATTENTION (a subject of
+        // concern OR anyone in structured danger — armed/injured/in-duress — seen
+        // within the active window), assess EVERY camera each tick — don't let
+        // motion-gating hold back the room they've just walked into (that gate + the
+        // periodic-sweep interval was the main lag in room-change detection). Using
+        // `warrants_attention` (not just concern) keeps an ARMED resident tracked
+        // promptly room-to-room. Cost is acceptable during a live incident; it
+        // reverts to motion-gating once the case goes quiet (decays off Critical).
         let actively_tracking = active
             .state
             .persons
             .iter()
-            .any(|p| p.is_subject_of_concern())
+            .any(|p| p.warrants_attention())
             && (now - active.last_activity).num_seconds() < DECAY_ELEVATED_SECS;
         let full = base_full || actively_tracking;
         let cameras = if full {
@@ -1007,13 +1008,24 @@ impl Engine {
         // camera becomes the dominant view.
         let mut zones_seen: Vec<String> = Vec::new();
         for (label, a) in &labelled {
-            if a.persons.iter().any(delta_is_concern) {
+            if a.persons.iter().any(delta_warrants_attention) {
                 let zone = self.zone_for_label(label);
                 if !zones_seen.contains(&zone) {
                     zones_seen.push(zone);
                 }
             }
         }
+
+        // MAIN image candidate — ranked PER FRAME (not off the latched, case-level
+        // threat_level, which made every post-weapon tick rank 3 and churned the
+        // pane through unarmed/empty frames). Each captured frame is ranked by what
+        // the model saw IN THAT FRAME this tick; we pick the highest-ranked frame
+        // and (below, after the merge) capture it only if it's sticky-downward
+        // eligible. A frame with no person → no candidate (never an empty pane).
+        let main_candidate: Option<(u8, &'static str, String)> = labelled
+            .iter()
+            .filter_map(|(label, a)| rank_frame(a).map(|(r, c)| (r, c, label.clone())))
+            .max_by_key(|(r, _, _)| *r);
 
         // Merge the per-camera assessments into one delta the existing machinery
         // consumes unchanged.
@@ -1081,69 +1093,33 @@ impl Engine {
         // 8. MAIN image for the HUD primary pane. NOT concern-gated and NOT
         //    output-gated — the HUD/journal are never gated, so the kiosk is never
         //    blank when there is ANY activity (even an ambiguous/resident-only
-        //    frame). Reuse the frames ALREADY captured this tick (no extra HA
-        //    snapshot, no LLM call). Priority-ranked + sticky-downward: a newer
-        //    still only replaces the held one when its rank ≥ the current rank.
-        if let Some((tick_rank, category)) = compute_main_rank(&active.state) {
+        //    frame). `main_candidate` was ranked PER FRAME above (off this tick's
+        //    sightings, not the latched threat_level) and names the exact camera to
+        //    show; capture it (reusing the already-grabbed `stills` — no extra HA
+        //    snapshot/LLM) only if it's sticky-downward eligible: a newer still
+        //    replaces the held one only when its rank ≥ the current main rank, so an
+        //    unarmed/lower-threat frame never displaces a held weapon/intruder shot.
+        if let Some((tick_rank, category, label)) = main_candidate {
             if should_replace_main(active.main_still_rank, tick_rank) {
-                // Pick the camera label whose frame to show. For a person of concern
-                // (rank ≥ 1), prefer a concern person's best_camera then location;
-                // for rank 0 (or if no concern frame resolves) any person-present
-                // location; final fallback: the sole captured frame. Mirrors the
-                // spirit of `pick_still_label`.
-                let mut label: Option<String> = None;
-                if tick_rank >= 1 {
-                    for p in &active.state.persons {
-                        if !p.is_subject_of_concern() {
-                            continue;
+                if let Some(jpeg) = stills.get(&label) {
+                    let still_id = format!("main-{:04}", active.next_still);
+                    active.next_still += 1;
+                    match active.dir.save_still(&still_id, jpeg) {
+                        Ok(_) => {
+                            let camera = self
+                                .label_to_entity
+                                .get(&label)
+                                .cloned()
+                                .unwrap_or_else(|| label.clone());
+                            active.state.main_still = Some(StillRef {
+                                id: still_id,
+                                camera,
+                                captured_at: now,
+                            });
+                            active.state.main_still_category = Some(category.to_string());
+                            active.main_still_rank = tick_rank;
                         }
-                        if let Some(bc) = &p.best_camera {
-                            if stills.contains_key(bc) {
-                                label = Some(bc.clone());
-                                break;
-                            }
-                        }
-                        if let Some(loc) = &p.location {
-                            if stills.contains_key(loc) {
-                                label = Some(loc.clone());
-                                break;
-                            }
-                        }
-                    }
-                }
-                if label.is_none() {
-                    for l in &active.state.locations {
-                        if l.person_present && stills.contains_key(&l.label) {
-                            label = Some(l.label.clone());
-                            break;
-                        }
-                    }
-                }
-                if label.is_none() && stills.len() == 1 {
-                    label = stills.keys().next().cloned();
-                }
-                // Only proceed if we resolved a label that has a frame this tick.
-                if let Some(label) = label {
-                    if let Some(jpeg) = stills.get(&label) {
-                        let still_id = format!("main-{:04}", active.next_still);
-                        active.next_still += 1;
-                        match active.dir.save_still(&still_id, jpeg) {
-                            Ok(_) => {
-                                let camera = self
-                                    .label_to_entity
-                                    .get(&label)
-                                    .cloned()
-                                    .unwrap_or_else(|| label.clone());
-                                active.state.main_still = Some(StillRef {
-                                    id: still_id,
-                                    camera,
-                                    captured_at: now,
-                                });
-                                active.state.main_still_category = Some(category.to_string());
-                                active.main_still_rank = tick_rank;
-                            }
-                            Err(e) => error!("failed to save main still {still_id}: {e:#}"),
-                        }
+                        Err(e) => error!("failed to save main still {still_id}: {e:#}"),
                     }
                 }
             }
@@ -1684,9 +1660,12 @@ impl Engine {
         // Collect the work first (immutable scan), then mutate.
         let mut jobs: Vec<(String, String, Vec<u8>)> = Vec::new(); // (id, camera_label, jpeg)
         for person in &active.state.persons {
-            // Only profile a subject of concern (intruder-dominant); skip a clearly
-            // resident/guest person — no point spending Opus to ID a known person.
-            if !person.is_subject_of_concern() {
+            // Profile anyone who WARRANTS ATTENTION — a subject of concern
+            // (intruder-dominant) OR a person in structured danger (armed / injured
+            // / in duress). The latter is the first-live-test fix: an ARMED person
+            // who reads as a resident must still be ID'd + carded, not skipped. A
+            // clearly-benign resident/guest is still skipped (no Opus spend).
+            if !person.warrants_attention() {
                 continue;
             }
             // Don't queue a second forensic pass while one is already in flight.
@@ -2075,6 +2054,47 @@ fn delta_is_concern(d: &PersonDelta) -> bool {
         && d.intruder_confidence >= d.guest_confidence
 }
 
+/// Mirror of [`Person::warrants_attention`] for a live delta — concern OR any
+/// structured danger (armed / a visible injury / confident duress). Used for the
+/// zone-movement gate so an ARMED person who reads as a resident is still tracked
+/// room-to-room (the first-live-test fix).
+fn delta_warrants_attention(d: &PersonDelta) -> bool {
+    delta_is_concern(d)
+        || d.armed
+        || d.injury.as_deref().is_some_and(|i| !i.trim().is_empty())
+        || d.in_duress >= DURESS_FLOOR
+}
+
+/// The MAIN-image rank for ONE camera frame this tick, judged on what the model
+/// saw IN THAT FRAME (not the latched, case-level threat). `None` when the frame
+/// shows no person at all (so an empty frame is never a candidate). Ranks
+/// (high→low): 3 a person in structured danger (armed / injured / in duress) /
+/// 2 malicious activity in-frame / 1 a person of concern / 0 any person present.
+/// Pure + unit-tested.
+fn rank_frame(a: &LiveAssessment) -> Option<(u8, &'static str)> {
+    let present = a.person_detected
+        || !a.persons.is_empty()
+        || a.locations.iter().any(|l| l.person_present);
+    if !present {
+        return None;
+    }
+    let danger = a.persons.iter().any(|p| {
+        p.armed
+            || p.injury.as_deref().is_some_and(|i| !i.trim().is_empty())
+            || p.in_duress >= DURESS_FLOOR
+    });
+    if danger {
+        return Some((3, "life_threatening"));
+    }
+    if !a.malicious_activity.is_empty() {
+        return Some((2, "malicious"));
+    }
+    if a.persons.iter().any(delta_is_concern) {
+        return Some((1, "intruder"));
+    }
+    Some((0, "any"))
+}
+
 /// Return a trimmed non-empty clone of an optional string, else `None`.
 fn non_empty(s: &Option<String>) -> Option<String> {
     s.as_deref()
@@ -2266,29 +2286,6 @@ fn self_next_subject_at_least(active: &mut ActiveCase, n: u32) {
 /// unit-tested.
 fn should_replace_main(current_rank: u8, tick_rank: u8) -> bool {
     tick_rank >= current_rank
-}
-
-/// Compute the MAIN-image priority rank for the current case state, with the
-/// category string for the HUD label. Returns `None` when there is NO activity at
-/// all (no person anywhere) — the caller then leaves the existing main image as-is.
-/// Ranks (high→low): 3 life_threatening / 2 malicious / 1 intruder / 0 any-person.
-/// Pure + unit-tested.
-fn compute_main_rank(state: &CaseState) -> Option<(u8, &'static str)> {
-    if state.threat_level == ThreatLevel::LifeThreatening {
-        return Some((3, "life_threatening"));
-    }
-    if !state.malicious_activity.is_empty() {
-        return Some((2, "malicious"));
-    }
-    if state.persons.iter().any(|p| p.is_subject_of_concern()) {
-        return Some((1, "intruder"));
-    }
-    let any_person =
-        !state.persons.is_empty() || state.locations.iter().any(|l| l.person_present);
-    if any_person {
-        return Some((0, "any"));
-    }
-    None
 }
 
 /// Choose the camera label whose still feeds the forensic pass for `person`,
@@ -2631,55 +2628,94 @@ mod tests {
         assert!(should_replace_main(0, 0));
     }
 
-    /// MAIN-image rank table: each tier maps to its (rank, category), and an empty
-    /// case (no person anywhere) yields `None` (leave the existing image as-is).
+    /// Build a `PersonDelta` for the per-frame rank tests. `ic`/`rc` are the
+    /// intruder/resident confidences; `armed` sets the structured-danger flag.
+    fn pdelta(ic: f32, rc: f32, armed: bool) -> PersonDelta {
+        PersonDelta {
+            id: "subject-1".to_string(),
+            descriptors: "test".to_string(),
+            resident_confidence: rc,
+            guest_confidence: 0.05,
+            intruder_confidence: ic,
+            id_score: 0.7,
+            location: Some("Kitchen".to_string()),
+            activity: None,
+            best_camera_label: None,
+            armed,
+            weapon: if armed { Some("knife".to_string()) } else { None },
+            injury: None,
+            in_duress: 0.0,
+        }
+    }
+
+    /// Build a bare `LiveAssessment` from a list of person deltas (+ malicious flag).
+    fn assess(persons: Vec<PersonDelta>, malicious: bool) -> LiveAssessment {
+        LiveAssessment {
+            summary: "t".to_string(),
+            threat_level: ThreatLevel::Benign,
+            person_detected: !persons.is_empty(),
+            locations: Vec::new(),
+            persons,
+            threats: Vec::new(),
+            malicious_activity: if malicious {
+                vec!["breaking into car".to_string()]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    /// MAIN-image PER-FRAME rank: judged on what the model saw IN THE FRAME, NOT
+    /// the latched case threat_level (the bug the first live test exposed — an
+    /// armed person who reads as a resident, plus empty/unarmed frames churning a
+    /// held weapon shot).
     #[test]
-    fn compute_main_rank_covers_each_tier() {
-        // Empty case → no activity → None.
-        let empty = CaseState::new("c".to_string(), Utc::now(), TriggerProfile::Alarm);
-        assert_eq!(compute_main_rank(&empty), None);
+    fn rank_frame_is_per_frame_and_danger_overrides_classification() {
+        // No person in frame → not a candidate (never an empty pane).
+        assert_eq!(rank_frame(&assess(vec![], false)), None);
 
-        // Rank 0 (any): a benign person present (low intruder confidence), threat
-        // not life-threatening, no malicious activity.
-        let mut any = CaseState::new("c".to_string(), Utc::now(), TriggerProfile::Investigate);
-        let mut benign = person("subject-1", false);
-        benign.resident_confidence = 0.9;
-        benign.intruder_confidence = 0.05;
-        benign.guest_confidence = 0.1;
-        assert!(!benign.is_subject_of_concern());
-        any.persons.push(benign);
-        assert_eq!(compute_main_rank(&any), Some((0, "any")));
-
-        // Rank 0 also via a person-present location with NO persons on the roster.
-        let mut loc_only =
-            CaseState::new("c".to_string(), Utc::now(), TriggerProfile::Investigate);
-        loc_only.locations.push(LocationObservation {
-            camera: "camera.x".to_string(),
-            label: "Kitchen".to_string(),
-            activity: "someone moving".to_string(),
+        // A person-present LOCATION with no roster person → rank 0 (any).
+        let mut loc_only = assess(vec![], false);
+        loc_only.locations.push(LocationDelta {
+            camera_label: "Kitchen".to_string(),
+            activity: "movement".to_string(),
             person_present: true,
-            last_seen: Utc::now(),
         });
-        assert_eq!(compute_main_rank(&loc_only), Some((0, "any")));
+        assert_eq!(rank_frame(&loc_only), Some((0, "any")));
 
-        // Rank 1 (intruder): a person of concern present.
-        let mut intruder =
-            CaseState::new("c".to_string(), Utc::now(), TriggerProfile::Investigate);
-        intruder.persons.push(person("subject-1", false));
-        assert_eq!(compute_main_rank(&intruder), Some((1, "intruder")));
+        // A RESIDENT-dominant, benign person → rank 0 (not concern, not armed).
+        assert_eq!(rank_frame(&assess(vec![pdelta(0.2, 0.75, false)], false)), Some((0, "any")));
 
-        // Rank 2 (malicious): malicious_activity non-empty (outranks intruder).
-        let mut malicious =
-            CaseState::new("c".to_string(), Utc::now(), TriggerProfile::Investigate);
-        malicious.persons.push(person("subject-1", false));
-        malicious.malicious_activity.push("breaking into car".to_string());
-        assert_eq!(compute_main_rank(&malicious), Some((2, "malicious")));
+        // An intruder-dominant person → rank 1.
+        assert_eq!(rank_frame(&assess(vec![pdelta(0.9, 0.1, false)], false)), Some((1, "intruder")));
 
-        // Rank 3 (life_threatening): threat_level dominates everything.
-        let mut life = CaseState::new("c".to_string(), Utc::now(), TriggerProfile::Alarm);
-        life.threat_level = ThreatLevel::LifeThreatening;
-        life.malicious_activity.push("smashed window".to_string());
-        life.persons.push(person("subject-1", true));
-        assert_eq!(compute_main_rank(&life), Some((3, "life_threatening")));
+        // Malicious activity in-frame → rank 2 (outranks plain intruder).
+        assert_eq!(rank_frame(&assess(vec![pdelta(0.9, 0.1, false)], true)), Some((2, "malicious")));
+
+        // THE KEY CASE: an ARMED person who reads as a RESIDENT → rank 3. Structured
+        // danger overrides the classification, so the weapon frame wins the pane.
+        assert_eq!(rank_frame(&assess(vec![pdelta(0.2, 0.75, true)], false)), Some((3, "life_threatening")));
+    }
+
+    /// A resident who is ARMED / injured / in duress still WARRANTS ATTENTION (the
+    /// gate for forensic ID, mugshot capture, and zone tracking) — the first-live-
+    /// test fix. A benign resident does not.
+    #[test]
+    fn structured_danger_warrants_attention_even_for_a_resident() {
+        let mut benign = person("subject-1", false);
+        benign.resident_confidence = 0.75;
+        benign.intruder_confidence = 0.2;
+        assert!(!benign.is_subject_of_concern());
+        assert!(!benign.warrants_attention(), "a benign resident is skipped");
+
+        // Same resident, now armed → warrants attention despite the resident read.
+        let mut armed = benign.clone();
+        armed.armed = true;
+        assert!(!armed.is_subject_of_concern());
+        assert!(armed.warrants_attention(), "an armed resident must be ID'd + tracked");
+
+        // The live-delta mirror agrees.
+        assert!(!delta_warrants_attention(&pdelta(0.2, 0.75, false)));
+        assert!(delta_warrants_attention(&pdelta(0.2, 0.75, true)));
     }
 }

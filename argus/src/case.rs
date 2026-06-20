@@ -207,6 +207,12 @@ pub struct LocationObservation {
 /// the person is not treated as a threat by voice/HUD/PagerDuty/forensic-ID.
 pub const CONCERN_INTRUDER_FLOOR: f32 = 0.34;
 
+/// `in_duress` confidence at or above which a person counts as a structured
+/// duress signal — enough, on its own, to make a person [`Person::warrants_attention`]
+/// regardless of how they classify (a resident under coercion is still a casualty
+/// to surface). A high bar: only a confident duress read forces it.
+pub const DURESS_FLOOR: f32 = 0.75;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Person {
     /// Stable within the case (e.g. `subject-1`) so the HUD doesn't thrash and the
@@ -277,6 +283,20 @@ impl Person {
         self.intruder_confidence >= CONCERN_INTRUDER_FLOOR
             && self.intruder_confidence >= self.resident_confidence
             && self.intruder_confidence >= self.guest_confidence
+    }
+
+    /// Whether this person warrants the full attention treatment — forensic ID +
+    /// mugshot card, zone-movement tracking, and the priority MAIN image. This is
+    /// `is_subject_of_concern` **OR any structured danger** (visibly armed, a
+    /// visible injury, or a confident duress read). The key fix after the first
+    /// live test: a person can read as a *resident* (high resident confidence) yet
+    /// be ARMED — structured danger must override the classification so we still
+    /// ID, card, and track them. (Benign residents/guests are still skipped.)
+    pub fn warrants_attention(&self) -> bool {
+        self.is_subject_of_concern()
+            || self.armed
+            || self.injury.as_deref().is_some_and(|i| !i.trim().is_empty())
+            || self.in_duress >= DURESS_FLOOR
     }
 }
 

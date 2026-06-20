@@ -238,6 +238,43 @@
     imgEl.src = url;
   }
 
+  // Like loadStill, but PRELOADS the new frame off-DOM and only swaps the visible
+  // <img> src once it has decoded — so the main pane doesn't flash blank between
+  // ticks (the MAIN image changes on most ticks). On a 404 we KEEP the current
+  // frame (only show the placeholder if nothing has ever loaded). Used for the
+  // primary camera pane; mugshots (which change rarely) still use loadStill.
+  function loadStillPreload(imgEl, showPh, stillId) {
+    if (!stillId) {
+      imgEl.removeAttribute("src");
+      imgEl.dataset.loaded = "false";
+      delete imgEl.dataset.url;
+      delete imgEl.dataset.pending;
+      showPh(true);
+      return;
+    }
+    const url = stillUrl(stillId);
+    if (imgEl.dataset.url === url && imgEl.dataset.loaded === "true") { showPh(false); return; }
+    if (imgEl.dataset.pending === url) return; // a preload for this frame is already in flight
+    imgEl.dataset.pending = url;
+    const pre = new Image();
+    pre.decoding = "async";
+    pre.onload = () => {
+      if (imgEl.dataset.pending !== url) return; // superseded by a newer frame
+      delete imgEl.dataset.pending;
+      imgEl.src = url;
+      imgEl.dataset.url = url;
+      imgEl.dataset.loaded = "true";
+      showPh(false);
+    };
+    pre.onerror = () => {
+      if (imgEl.dataset.pending === url) delete imgEl.dataset.pending;
+      // keep whatever is already shown; only fall back to the placeholder if we've
+      // never successfully loaded a frame into this element.
+      if (imgEl.dataset.loaded !== "true") { imgEl.removeAttribute("src"); showPh(true); }
+    };
+    pre.src = url;
+  }
+
   /* =========================================================================
      5. STATE -> THEME mapping
         status === "cleared"   -> AUTHORISED (green)
@@ -397,18 +434,28 @@
 
   // A person is a "subject of concern" (an "intruder" in the HUD's vocabulary)
   // when their intruder confidence dominates the resident/guest reads and clears
-  // the floor — mirrors `Person::is_subject_of_concern` on the Rust side. The HUD
-  // surfaces only these as threat cards; a clearly resident/guest person is not shown.
+  // the floor — mirrors `Person::is_subject_of_concern` on the Rust side.
   const CONCERN_FLOOR = 0.34;
-  const DURESS_FLOOR = 0.5;
+  const DURESS_FLOOR = 0.5;       // display threshold for the inline DURESS badge
+  const DURESS_ATTENTION = 0.75;  // mirrors the engine's DURESS_FLOOR (warrants_attention)
   function isConcern(p) {
     const ic = clamp01(p.intruder_confidence);
     return ic >= CONCERN_FLOOR
       && ic >= clamp01(p.resident_confidence)
       && ic >= clamp01(p.guest_confidence);
   }
+  // Mirrors `Person::warrants_attention`: concern OR structured danger (armed /
+  // injured / in duress). The HUD cards this person even when they read as a
+  // resident — an ARMED resident must still be carded + ID'd (the first-live-test
+  // fix). A clearly-benign resident/guest is still not shown.
+  function warrantsAttention(p) {
+    return isConcern(p)
+      || !!p.armed
+      || !!(p.injury && String(p.injury).trim())
+      || clamp01(p.in_duress) >= DURESS_ATTENTION;
+  }
   function subjectsOfConcern(cs) {
-    return (cs.persons || []).filter(isConcern);
+    return (cs.persons || []).filter(warrantsAttention);
   }
 
   /* =========================================================================
@@ -564,7 +611,7 @@
     if (els.camPhText) {
       els.camPhText.textContent = (view || haveMainStill) ? "ACQUIRING" : "NO SIGNAL";
     }
-    loadStill(els.camImg, (show) => { els.camPlaceholder.hidden = !show; }, stillId);
+    loadStillPreload(els.camImg, (show) => { els.camPlaceholder.hidden = !show; }, stillId);
 
     els.camRec.style.visibility =
       (caseState.status === "cleared") ? "hidden" : "visible";

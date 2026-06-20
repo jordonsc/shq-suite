@@ -175,38 +175,53 @@ body {
    urgent: a stronger/faster border glow PLUS a full-frame vignette throb and a
    throbbing headline. Removed automatically when data-threat clears (de-escalation).
    ============================================================================= */
+/* A fixed, FAST rate (independent of --pulse-rate) so life-threat reads as
+   distinctly more urgent than threat_present, not just a touch faster. */
 [data-threat="life_threatening"] .pulse-border {
-  /* punch the inset glow harder than the threat-keyed --pulse-alpha alone */
-  box-shadow:
-    inset 0 0 0 2px rgba(var(--hud-rgb), 0.45),
-    inset 0 0 90px rgba(var(--hud-rgb), calc(var(--pulse-alpha) + 0.18));
+  animation: ltBorderPulse 0.85s ease-in-out infinite;
+  will-change: box-shadow;
 }
-/* full-frame vignette throb — its own overlay so it stacks over the border */
+@keyframes ltBorderPulse {
+  0%, 100% {
+    box-shadow:
+      inset 0 0 0 2px rgba(var(--hud-rgb), 0.5),
+      inset 0 0 70px rgba(var(--hud-rgb), 0.30);
+  }
+  50% {
+    box-shadow:
+      inset 0 0 0 5px rgba(var(--hud-rgb), 0.95),
+      inset 0 0 150px rgba(var(--hud-rgb), 0.6);
+  }
+}
+/* full-frame vignette throb — its own overlay so it stacks over the border. A
+   deeper, faster swing than before (reaches further in + nearly opaque edges). */
 [data-threat="life_threatening"] .hud::after {
   content: "";
   position: absolute;
   inset: 0;
   z-index: 1;
   pointer-events: none;
-  background: radial-gradient(120% 100% at 50% 50%,
-    transparent 52%, rgba(var(--hud-rgb), 0.34) 100%);
-  animation: vignettePulse var(--pulse-rate) ease-in-out infinite;
+  background: radial-gradient(125% 105% at 50% 50%,
+    transparent 38%, rgba(var(--hud-rgb), 0.6) 100%);
+  animation: vignettePulse 0.85s ease-in-out infinite;
   will-change: opacity;
 }
 @keyframes vignettePulse {
-  0%, 100% { opacity: 0.2; }
+  0%, 100% { opacity: 0.15; }
   50%      { opacity: 1; }
 }
-/* the headline itself throbs at life-threat */
+/* the headline throbs harder at life-threat — opacity + scale + heavy glow. */
 [data-threat="life_threatening"] .headline {
-  animation: headlinePulse var(--pulse-rate) ease-in-out infinite;
-  will-change: opacity, text-shadow;
+  animation: headlinePulse 0.85s ease-in-out infinite;
+  transform-origin: left center;
+  will-change: opacity, text-shadow, transform;
 }
 @keyframes headlinePulse {
-  0%, 100% { opacity: 0.78; text-shadow: 0 0 26px rgba(var(--hud-rgb), 0.5); }
-  50%      { opacity: 1;    text-shadow: 0 0 44px rgba(var(--hud-rgb), 0.9); }
+  0%, 100% { opacity: 0.7; transform: scale(1);    text-shadow: 0 0 26px rgba(var(--hud-rgb), 0.5); }
+  50%      { opacity: 1;   transform: scale(1.06); text-shadow: 0 0 60px rgba(var(--hud-rgb), 1); }
 }
 @media (prefers-reduced-motion: reduce) {
+  [data-threat="life_threatening"] .pulse-border,
   [data-threat="life_threatening"] .hud::after,
   [data-threat="life_threatening"] .headline { animation: none !important; }
 }
