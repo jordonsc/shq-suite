@@ -154,7 +154,8 @@ const INVESTIGATE_TRIGGER_PROMPT: &str = "Benign activity has been detected on t
     likely a guest arriving, a delivery, or a resident returning. Treat the scene as `benign` UNLESS \
     you have HIGH confidence it is genuinely a threat — an obvious weapon, a masked or prowling \
     intruder, or forced entry — in which case report `threat_present` (or `life_threatening` if a \
-    weapon, duress, or injury is present). When in doubt, it is benign.";
+    weapon, duress, or injury is present). When in doubt, it is benign. Using a knife, utensil or \
+    cutlery to prepare food, cook or eat should be considered benign and NOT flagged as an armed weapon.";
 
 /// Investigate scenario opener for the other (ancillary) cameras during a case.
 const INVESTIGATE_ANCILLARY_PROMPT: &str = "Benign activity has been detected elsewhere on the \
@@ -162,7 +163,8 @@ const INVESTIGATE_ANCILLARY_PROMPT: &str = "Benign activity has been detected el
     is expected — residents or guests on the property. Treat the scene as `benign` UNLESS you have \
     HIGH confidence of a genuine threat — an obvious weapon, a masked or prowling intruder, forced \
     entry, or someone in duress — in which case report `threat_present` (or `life_threatening` for a \
-    weapon, duress, or injury). When in doubt, it is benign.";
+    weapon, duress, or injury). When in doubt, it is benign. Using a knife, utensil or cutlery to \
+    prepare food, cook or eat should be considered benign and NOT flagged as an armed weapon.";
 
 /// Alarm scenario opener (any camera) — a confirmed breach is assumed, so an
 /// unknown person IS a threat (the opposite posture to Investigate).
