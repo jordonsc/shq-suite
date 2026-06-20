@@ -153,9 +153,9 @@ telemetry_entities: []
 #   klaxon_enabled: true                  # false = voice-only (no siren; speech still flows)
 #   klaxon_volume: 0.9                    # 0.0–1.0 SetAlarm volume (the klaxon is LOUD)
 #   voice_volume: 1.0                     # 0.0–1.0 Verbalise volume
-#   duck_volume: 0.15                     # 0.0–1.0: duck a sounding klaxon to this while a
-#                                         # line plays so speech is intelligible (0 = no duck;
-#                                         # restored after the clip; needs Overwatch >=0.4.0)
+#   duck_factor: 0.5                      # scale a sounding klaxon by this factor while a
+#                                         # line plays so speech is intelligible (0.5 = half;
+#                                         # 0 = no duck; restored after the clip; needs Overwatch >=0.4.1)
 
 # PagerDuty Events v2 security-station dispatch (Phase 3). trigger on case open +
 # material change (same dedup_key = case_id), resolve on standdown. The dossier

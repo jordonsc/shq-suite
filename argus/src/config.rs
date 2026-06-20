@@ -184,12 +184,12 @@ pub struct OverwatchConfig {
     /// Spoken-line (`Verbalise`) volume 0.0–1.0. Real-incident value is ~1.0.
     #[serde(default = "default_voice_volume")]
     pub voice_volume: f32,
-    /// Volume to DUCK any sounding klaxon to while a line is spoken, so the speech
-    /// stays intelligible over it (`Verbalise.duck_alarm_volume`). 0 = no ducking.
-    /// Restored to `klaxon_volume` after the clip. Requires Overwatch ≥0.4.0 (an
-    /// older server ignores the unknown field). Default ~0.15.
-    #[serde(default = "default_duck_volume")]
-    pub duck_volume: f32,
+    /// Factor to scale a sounding klaxon by while a line is spoken, so the speech
+    /// stays intelligible over it (`Verbalise.duck_alarm_factor`), e.g. 0.5 = half.
+    /// 0 = no ducking. Restored to `klaxon_volume` after the clip. Requires
+    /// Overwatch ≥0.4.1 (an older server ignores the unknown field). Default 0.5.
+    #[serde(default = "default_duck_factor")]
+    pub duck_factor: f32,
 }
 
 fn default_overwatch_port() -> u16 {
@@ -216,8 +216,8 @@ fn default_voice_volume() -> f32 {
     1.0
 }
 
-fn default_duck_volume() -> f32 {
-    0.15
+fn default_duck_factor() -> f32 {
+    0.5
 }
 
 /// PagerDuty Events v2 security-station dispatch (Phase 3 output sink).

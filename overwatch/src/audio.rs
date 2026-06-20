@@ -34,11 +34,11 @@ pub enum AudioCommand {
         alarm_id: String,
         response: oneshot::Sender<bool>,
     },
-    /// Temporarily set EVERY active alarm sink to `volume` so a spoken line stays
-    /// intelligible over a klaxon. Does NOT touch the stored canonical
-    /// `AlarmState.volume` — `RestoreAlarms` puts each sink back to it.
+    /// Temporarily scale EVERY active alarm sink by `factor` (e.g. 0.5 = half) so a
+    /// spoken line stays intelligible over a klaxon. Does NOT touch the stored
+    /// canonical `AlarmState.volume` — `RestoreAlarms` puts each sink back to it.
     DuckAlarms {
-        volume: f32,
+        factor: f32,
         response: oneshot::Sender<()>,
     },
     /// Restore every active alarm sink to its stored canonical `AlarmState.volume`.
@@ -136,14 +136,15 @@ impl AudioManager {
         response_rx.await.unwrap_or(false)
     }
 
-    /// Duck ALL active alarm sinks to `volume` (transient — the stored canonical
-    /// volume is untouched). No-op if no alarm is active. Resolves once the audio
-    /// thread has applied it, so a caller can sequence Duck → play → Restore.
-    pub async fn duck_alarms(&self, volume: f32) {
+    /// Scale ALL active alarm sinks by `factor` (e.g. 0.5 = half; transient — the
+    /// stored canonical volume is untouched). No-op if no alarm is active. Resolves
+    /// once the audio thread has applied it, so a caller can sequence Duck → play →
+    /// Restore.
+    pub async fn duck_alarms(&self, factor: f32) {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(AudioCommand::DuckAlarms {
-                volume,
+                factor,
                 response: response_tx,
             })
             .ok();
@@ -209,8 +210,8 @@ impl AudioManagerInner {
                             let result = self.stop_alarm_inner(&alarm_id);
                             let _ = response.send(result);
                         }
-                        AudioCommand::DuckAlarms { volume, response } => {
-                            self.duck_alarms_inner(volume);
+                        AudioCommand::DuckAlarms { factor, response } => {
+                            self.duck_alarms_inner(factor);
                             let _ = response.send(());
                         }
                         AudioCommand::RestoreAlarms { response } => {
@@ -305,15 +306,17 @@ impl AudioManagerInner {
         }
     }
 
-    /// Set every active alarm sink to `volume` WITHOUT mutating the stored
-    /// canonical `AlarmState.volume`, so `restore_alarms_inner` can put it back.
-    fn duck_alarms_inner(&self, volume: f32) {
+    /// Scale every active alarm sink by `factor` (e.g. 0.5 = half) WITHOUT mutating
+    /// the stored canonical `AlarmState.volume`, so `restore_alarms_inner` can put
+    /// it back.
+    fn duck_alarms_inner(&self, factor: f32) {
         if self.active_alarms.is_empty() {
             return;
         }
         for (alarm_id, state) in &self.active_alarms {
-            state.sink.set_volume(volume);
-            tracing::debug!("Ducked alarm '{}' to volume {}", alarm_id, volume);
+            let ducked = state.volume * factor;
+            state.sink.set_volume(ducked);
+            tracing::debug!("Ducked alarm '{}' by factor {} to volume {}", alarm_id, factor, ducked);
         }
     }
 

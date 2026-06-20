@@ -40,9 +40,10 @@ pub struct VoiceClient {
     klaxon_volume: f32,
     /// `Verbalise` (spoken-line) volume.
     voice_volume: f32,
-    /// Volume to duck a sounding klaxon to while a line plays (`duck_alarm_volume`
-    /// on `Verbalise`), so speech stays intelligible over the siren. 0 = no duck.
-    duck_volume: f32,
+    /// Factor to scale a sounding klaxon by while a line plays (`duck_alarm_factor`
+    /// on `Verbalise`), e.g. 0.5 = half, so speech stays intelligible over the
+    /// siren. 0 = no duck.
+    duck_factor: f32,
     /// Dry-voice mode (`--dry-voice`): every `SetAlarm`/`Verbalise` is LOGGED at
     /// `info` and Overwatch is never contacted. Lets a live (scratch-alarm) test
     /// show exactly what would be spoken without a real klaxon/voice.
@@ -59,7 +60,7 @@ impl VoiceClient {
         klaxon_enabled: bool,
         klaxon_volume: f32,
         voice_volume: f32,
-        duck_volume: f32,
+        duck_factor: f32,
     ) -> Self {
         Self {
             endpoint: format!("http://{host}:{port}"),
@@ -68,7 +69,7 @@ impl VoiceClient {
             klaxon_enabled,
             klaxon_volume,
             voice_volume,
-            duck_volume,
+            duck_factor,
             dry: false,
         }
     }
@@ -84,7 +85,7 @@ impl VoiceClient {
             klaxon_enabled: true,
             klaxon_volume: 1.0,
             voice_volume: 1.0,
-            duck_volume: 0.15,
+            duck_factor: 0.5,
             dry: true,
         }
     }
@@ -159,10 +160,11 @@ impl VoiceClient {
             // so the serial voice worker paces itself and lines never overlap — no
             // local timing estimate needed.
             await_playback: Some(true),
-            // Duck any sounding klaxon to this volume for the duration of the line
-            // so it stays intelligible over the siren, then Overwatch restores it.
-            // Overwatch <0.4.0 ignores this unknown field (no ducking, no error).
-            duck_alarm_volume: Some(self.duck_volume),
+            // Scale any sounding klaxon by this factor (e.g. 0.5 = half) for the
+            // duration of the line so it stays intelligible over the siren, then
+            // Overwatch restores it. Overwatch <0.4.1 ignores this unknown field
+            // (no ducking, no error).
+            duck_alarm_factor: Some(self.duck_factor),
         };
         match client.verbalise(req).await {
             Ok(resp) => {

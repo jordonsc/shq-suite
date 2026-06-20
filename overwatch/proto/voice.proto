@@ -30,7 +30,7 @@ message VerbaliseRequest {
   optional string voice_id = 3;
   optional float volume = 4;  // Volume level 0.0-1.0
   optional bool await_playback = 5;  // if true, block until playback finishes (default false = fire-and-forget)
-  optional float duck_alarm_volume = 6;  // if >0, duck ALL active alarm sinks to this volume for the duration of the clip, then restore (absent/0 = no ducking)
+  optional float duck_alarm_factor = 6;  // if 0<f<1, scale ALL active alarm sinks by f for the duration of the clip (e.g. 0.5 = half), then restore (absent/0 = no ducking)
 }
 
 message VerbaliseResponse {

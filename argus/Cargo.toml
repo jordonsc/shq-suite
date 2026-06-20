@@ -1,6 +1,6 @@
 [package]
 name = "argus"
-version = "0.30.0"
+version = "0.30.1"
 edition = "2021"
 description = "Argus — AI-powered alarm assessment daemon (native x86_64, runs on atlas)"
 

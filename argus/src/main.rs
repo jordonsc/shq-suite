@@ -150,7 +150,7 @@ async fn main() -> Result<()> {
                 host = %o.host, port = o.port,
                 klaxon_enabled = o.klaxon_enabled,
                 klaxon_volume = o.klaxon_volume, voice_volume = o.voice_volume,
-                duck_volume = o.duck_volume,
+                duck_factor = o.duck_factor,
                 "Voice output enabled (Overwatch gRPC)"
             );
             out::voice::VoiceClient::new(
@@ -161,7 +161,7 @@ async fn main() -> Result<()> {
                 o.klaxon_enabled,
                 o.klaxon_volume,
                 o.voice_volume,
-                o.duck_volume,
+                o.duck_factor,
             )
         })
     };
