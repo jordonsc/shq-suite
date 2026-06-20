@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDate, Utc};
+use chrono_tz::Tz;
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
@@ -77,6 +78,21 @@ const AUTHORISED_DWELL_SECS: u64 = 15;
 /// `General` is a fast, shallow glance for OBVIOUS danger, not a deep ID; it must
 /// stay cheap (it fires on every doorstep visitor) and silent.
 const GENERAL_STANDDOWN_TICKS: u64 = 4;
+
+/// **Escalation persistence gate (the production false-escalation safety win).**
+/// A GATED (`Investigate`/`General`) case must see its escalate condition hold for
+/// at least this many CONSECUTIVE ticks before it is promoted to full `Alarm`
+/// (which trips the real `alarm_control_panel` + pages PagerDuty + cascades the
+/// whole-house automations). A single tick's read — e.g. a phone misread as a blade
+/// for one frame — must NOT trip the house; two consecutive concurring ticks must.
+/// An intermittent signal (met, not-met, met) never reaches the threshold (the
+/// streak resets to 0 on any non-escalating tick).
+///
+/// **This applies ONLY to the gated → Alarm promotion.** A real `Alarm`-profile
+/// case is born escalated/ungated; `decide_promotion` short-circuits to `Continue`
+/// for it, so the streak never increments and zero latency is added to the real
+/// house-alarm path.
+const ESCALATION_PERSISTENCE_TICKS: u32 = 2;
 
 /// `Investigate` (perimeter-security) silent-run budget: a gated `Investigate`
 /// case quietly stands down when this window elapses with no escalation. Used to
@@ -209,6 +225,13 @@ struct ActiveCase {
     /// When it passes with no escalation, the case quietly stands down. `None` for
     /// the other profiles (which don't use a deadline).
     investigate_deadline: Option<Instant>,
+    /// Consecutive-tick count for which a gated case's escalate condition has held
+    /// (Phase 4b precision pass). Promotion only fires once this reaches
+    /// [`ESCALATION_PERSISTENCE_TICKS`] — so a single misread frame can't trip the
+    /// real house alarm. Reset to 0 on any tick the escalate condition is NOT met.
+    /// Irrelevant for an `Alarm` case (born escalated → `decide_promotion` is a
+    /// no-op there, so this stays 0).
+    escalation_streak: u32,
 }
 
 /// Running daily token usage for the optional cap.
@@ -658,6 +681,7 @@ impl Engine {
                 }
                 _ => None,
             },
+            escalation_streak: 0,
         };
         self.persist_and_broadcast(&mut active)?;
         self.active = Some(active);
@@ -1049,10 +1073,13 @@ impl Engine {
     ///   intruder / attempted entry; else quiet standdown when
     ///   `investigate_deadline` passes.
     async fn evaluate_promotion(&mut self, active: &mut ActiveCase, now: DateTime<Utc>) -> Result<bool> {
-        match decide_promotion(active) {
-            PromotionDecision::Continue => Ok(false),
-            PromotionDecision::Standdown => Ok(true),
-            PromotionDecision::Promote(reason) => {
+        // The persistence gate is a PURE state transition (mutates the streak,
+        // returns the action) so it is unit-testable without touching the network;
+        // only the actual `promote()` (which trips the real alarm) is IO.
+        match apply_persistence(active, decide_promotion(active)) {
+            PromotionAction::Hold => Ok(false),
+            PromotionAction::Standdown => Ok(true),
+            PromotionAction::Promote(reason) => {
                 self.promote(active, reason, now).await;
                 Ok(false)
             }
@@ -1104,6 +1131,28 @@ impl Engine {
     /// vets whether perimeter activity is a prowler vs a resident/known visitor;
     /// `General` is a quick glance for OBVIOUS danger at a friendly zone.
     fn live_instruction_camera(&self, state: &CaseState, telemetry: &str, label: &str) -> String {
+        // CONTEXT (priors, not triggers). The current local date/time + the alarm
+        // arm state inform suspicion but never decide it: a resident arriving home
+        // at an odd hour is STILL a resident; an approach while armed-away (with the
+        // residents out) merely weights suspicion higher. The local time also lets
+        // the model reason recency against any telemetry timestamps — e.g. a
+        // `event.front_door_access` entry the operator adds to `telemetry_entities`
+        // for "recent authorised front-door access" (no special-casing in code;
+        // the model compares that timestamp to the current local time below).
+        let local_time = format_local_time(Utc::now(), &self.cfg.timezone);
+        let arm_state = self
+            .prev_mode
+            .map(|m| m.describe())
+            .unwrap_or("unknown");
+        let context = format!(
+            "CONTEXT (priors that inform suspicion, NOT triggers — weigh them, don't \
+             decide on them). Current local time: {local_time}. House alarm: {arm_state}. \
+             A resident arriving home, even at an odd hour, is still a resident; but a \
+             perimeter or door approach while the house is armed-away (residents out) should \
+             weight your suspicion higher. Compare any access/event timestamps in the \
+             telemetry against this current local time to judge recency."
+        );
+
         let mut roster = String::new();
         if state.intruders.is_empty() {
             roster.push_str("No intruders detected yet.");
@@ -1146,7 +1195,7 @@ impl Engine {
              SINGLE camera named \"{label}\" — the one still above. Report ONLY what is visible in \
              this one frame: your `locations` should describe just this camera, and your \
              `intruders`/`threats` only the people and threats visible in it. Return an updated \
-             structured situation report for this frame.\n\n{telemetry}\n\n{roster}\n\n\
+             structured situation report for this frame.\n\n{context}\n\n{telemetry}\n\n{roster}\n\n\
              RESIDENT RECOGNITION (critical). The premises briefing names the residents. Only treat \
              a person as a resident — and therefore EXCLUDE them from `intruders` — when their \
              appearance matches a named resident BEYOND REASONABLE DOUBT. A mere resemblance \
@@ -1742,6 +1791,28 @@ fn zone_key(zone: &str) -> String {
     zone.trim().to_lowercase()
 }
 
+/// Format a UTC instant as a human local date/time in the configured `tz_name`
+/// (an IANA name like `Australia/Sydney`), e.g.
+/// `"Friday 20 June 2026, 11:32 (Australia/Sydney)"`. The container runs UTC, so
+/// this converts explicitly via `chrono_tz` rather than `chrono::Local`. An
+/// invalid/unknown `tz_name` falls back to UTC (with a `warn!`), never panics.
+///
+/// Used to inject the current local time into the live-assessment prompt as a
+/// PRIOR (so the model can reason about odd hours, and weigh recency against
+/// telemetry timestamps such as `event.front_door_access`), NOT as a trigger.
+fn format_local_time(now: DateTime<Utc>, tz_name: &str) -> String {
+    let tz: Tz = match tz_name.parse() {
+        Ok(tz) => tz,
+        Err(_) => {
+            warn!("invalid timezone {tz_name:?}; falling back to UTC for prompt context");
+            Tz::UTC
+        }
+    };
+    let local = now.with_timezone(&tz);
+    // %A=weekday %-d=day(no pad) %B=month %Y=year %H:%M=24h time; tz name appended.
+    format!("{} ({})", local.format("%A %-d %B %Y, %H:%M"), tz_name)
+}
+
 /// The Phase-4b per-tick escalation verdict for a gated case (pure of IO so it is
 /// unit-testable; [`Engine::evaluate_promotion`] acts on it).
 #[derive(Debug, PartialEq, Eq)]
@@ -1803,6 +1874,59 @@ fn decide_promotion(active: &ActiveCase) -> PromotionDecision {
                 PromotionDecision::Standdown
             } else {
                 PromotionDecision::Continue
+            }
+        }
+    }
+}
+
+/// The action `evaluate_promotion` takes AFTER the persistence gate is applied —
+/// the per-tick `PromotionDecision` filtered through the consecutive-tick streak.
+#[derive(Debug, PartialEq, Eq)]
+enum PromotionAction {
+    /// Do nothing this tick — either the escalate condition wasn't met, or it was
+    /// but the persistence streak hasn't yet reached the threshold.
+    Hold,
+    /// Promote to full `Alarm` (carries the reason) — the streak has held for
+    /// `ESCALATION_PERSISTENCE_TICKS` consecutive ticks.
+    Promote(&'static str),
+    /// Quiet auto-standdown (the profile's silent budget elapsed).
+    Standdown,
+}
+
+/// Apply the consecutive-tick PERSISTENCE GATE to a per-tick `PromotionDecision`,
+/// mutating `active.escalation_streak`, and return the action to take. PURE of IO
+/// (the network trip lives in [`Engine::promote`]), so it is unit-testable.
+///
+/// - `Continue`/`Standdown` ⇒ reset the streak to 0 (so an intermittent signal —
+///   met, not-met, met — never accumulates) and map straight through.
+/// - `Promote` ⇒ increment the streak; only emit `Promote` once it reaches
+///   [`ESCALATION_PERSISTENCE_TICKS`], else `Hold` (waiting for persistence).
+///
+/// This is reached ONLY for a gated case: `decide_promotion` returns `Continue`
+/// for an already-`Alarm`/escalated case, so the real Alarm path never increments
+/// the streak and is given ZERO added latency.
+fn apply_persistence(active: &mut ActiveCase, decision: PromotionDecision) -> PromotionAction {
+    match decision {
+        PromotionDecision::Continue => {
+            active.escalation_streak = 0;
+            PromotionAction::Hold
+        }
+        PromotionDecision::Standdown => {
+            active.escalation_streak = 0;
+            PromotionAction::Standdown
+        }
+        PromotionDecision::Promote(reason) => {
+            active.escalation_streak += 1;
+            if active.escalation_streak < ESCALATION_PERSISTENCE_TICKS {
+                info!(
+                    streak = active.escalation_streak,
+                    need = ESCALATION_PERSISTENCE_TICKS,
+                    reason,
+                    "escalate condition met; holding for persistence before promoting"
+                );
+                PromotionAction::Hold
+            } else {
+                PromotionAction::Promote(reason)
             }
         }
     }
@@ -1988,6 +2112,7 @@ mod tests {
                 }
                 _ => None,
             },
+            escalation_streak: 0,
         }
     }
 
@@ -2142,5 +2267,92 @@ mod tests {
         let mut c2 = active_case(TriggerProfile::General);
         c2.state.threats.push("visible KNIFE in hand".to_string());
         assert!(obvious_threat(&c2.state));
+    }
+
+    /// PERSISTENCE GATE (a): a gated case whose escalate condition holds on a
+    /// SINGLE tick must NOT promote — it must hold; on the SECOND consecutive tick
+    /// it DOES promote. (Drives the `apply_persistence` pure transition with a
+    /// `Promote` decision, so it exercises the streak independently of the IO trip.)
+    #[test]
+    fn persistence_requires_two_consecutive_ticks() {
+        // `ESCALATION_PERSISTENCE_TICKS` is the contract this test pins (==2).
+        assert_eq!(ESCALATION_PERSISTENCE_TICKS, 2);
+        let mut c = active_case(TriggerProfile::Investigate);
+        // Armed intruder → `decide_promotion` yields Promote each tick.
+        c.state.intruders.push(intruder("subject-1", true));
+        assert_eq!(decide_promotion(&c), PromotionDecision::Promote("armed intruder"));
+
+        // Tick 1: condition met once → HOLD (streak 1), no promotion yet.
+        let d = decide_promotion(&c);
+        assert_eq!(apply_persistence(&mut c, d), PromotionAction::Hold);
+        assert_eq!(c.escalation_streak, 1);
+
+        // Tick 2: condition still met → PROMOTE (streak 2 ≥ threshold).
+        let d = decide_promotion(&c);
+        assert_eq!(
+            apply_persistence(&mut c, d),
+            PromotionAction::Promote("armed intruder")
+        );
+        assert_eq!(c.escalation_streak, 2);
+    }
+
+    /// PERSISTENCE GATE (b): an INTERMITTENT signal (met, not-met, met) never
+    /// reaches the streak threshold — a single-frame misread can't accumulate into
+    /// a real-alarm trip across a gap.
+    #[test]
+    fn intermittent_signal_never_promotes() {
+        let mut c = active_case(TriggerProfile::Investigate);
+        let armed = intruder("subject-1", true);
+
+        // Tick 1: met → streak 1, hold.
+        c.state.intruders = vec![armed.clone()];
+        let d = decide_promotion(&c);
+        assert_eq!(apply_persistence(&mut c, d), PromotionAction::Hold);
+        assert_eq!(c.escalation_streak, 1);
+
+        // Tick 2: NOT met (intruder gone from this frame) → streak resets to 0.
+        c.state.intruders.clear();
+        let d = decide_promotion(&c);
+        assert_eq!(apply_persistence(&mut c, d), PromotionAction::Hold);
+        assert_eq!(c.escalation_streak, 0);
+
+        // Tick 3: met again → streak only back to 1, still NOT promoting.
+        c.state.intruders = vec![armed];
+        let d = decide_promotion(&c);
+        assert_eq!(apply_persistence(&mut c, d), PromotionAction::Hold);
+        assert_eq!(c.escalation_streak, 1);
+    }
+
+    /// A `Standdown` decision also resets the streak (and maps straight through).
+    #[test]
+    fn standdown_resets_streak() {
+        let mut c = active_case(TriggerProfile::General);
+        c.escalation_streak = 1;
+        // No threat, at the budget edge → Standdown.
+        c.tick_count = GENERAL_STANDDOWN_TICKS - 1;
+        let d = decide_promotion(&c);
+        assert_eq!(d, PromotionDecision::Standdown);
+        assert_eq!(apply_persistence(&mut c, d), PromotionAction::Standdown);
+        assert_eq!(c.escalation_streak, 0);
+    }
+
+    /// PERSISTENCE GATE (c): the timezone formatting helper converts a known UTC
+    /// instant to Australia/Sydney correctly. 2026-06-20T01:32:00Z is, in Sydney
+    /// (AEST, UTC+10, no DST in June), Saturday 20 June 2026 at 11:32 local.
+    #[test]
+    fn local_time_converts_to_sydney() {
+        let instant = DateTime::parse_from_rfc3339("2026-06-20T01:32:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let s = format_local_time(instant, "Australia/Sydney");
+        assert_eq!(s, "Saturday 20 June 2026, 11:32 (Australia/Sydney)");
+
+        // The same instant in UTC is two hours earlier in the day, same date.
+        let utc = format_local_time(instant, "UTC");
+        assert_eq!(utc, "Saturday 20 June 2026, 01:32 (UTC)");
+
+        // An invalid tz name falls back to UTC (no panic), tagged with the bad name.
+        let bad = format_local_time(instant, "Not/AZone");
+        assert_eq!(bad, "Saturday 20 June 2026, 01:32 (Not/AZone)");
     }
 }

@@ -39,6 +39,19 @@ impl AlarmMode {
         }
     }
 
+    /// A human description of the arm state for the live-assessment prompt
+    /// context (a prior that informs suspicion, e.g. an approach while
+    /// `armed_away` weights higher — NOT a trigger).
+    pub fn describe(self) -> &'static str {
+        match self {
+            AlarmMode::Disarmed => "disarmed (residents likely home)",
+            AlarmMode::Arming => "arming (exit delay; residents leaving)",
+            AlarmMode::Armed => "armed (residents likely out / asleep)",
+            AlarmMode::Triggered => "triggered (alarm sounding)",
+            AlarmMode::Authorised => "just disarmed (authorised all-clear)",
+        }
+    }
+
     /// The wire string sent to the HUD (`system` frame `mode`).
     pub fn as_str(self) -> &'static str {
         match self {

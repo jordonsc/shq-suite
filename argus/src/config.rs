@@ -19,6 +19,13 @@ use crate::case::TriggerProfile;
 pub struct Config {
     pub ha: HaConfig,
     pub anthropic: AnthropicConfig,
+    /// IANA timezone name (e.g. `Australia/Sydney`) used to localise the current
+    /// date/time injected into the live-assessment prompt context. The container
+    /// runs UTC, so this is parsed with `chrono_tz::Tz` and `Utc::now()` is
+    /// converted into it — do NOT use `chrono::Local`. An invalid/unknown name
+    /// falls back to UTC with a warning (never fatal). Default `"UTC"`.
+    #[serde(default = "default_timezone")]
+    pub timezone: String,
     /// Path to the private premises seed (env/`~` expanded).
     pub seed_path: String,
     /// Cameras Argus captures each assessment tick.
@@ -425,6 +432,10 @@ pub struct AnthropicConfig {
 
 fn default_id_model() -> String {
     "claude-opus-4-8".to_string()
+}
+
+fn default_timezone() -> String {
+    "UTC".to_string()
 }
 
 /// A camera Argus can capture, with a human label for the prompt.

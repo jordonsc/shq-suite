@@ -13,6 +13,13 @@ anthropic:
   live_model: "claude-sonnet-4-6"       # Phase 1 uses this one (live what/where loop)
   id_model: "claude-opus-4-8"           # reserved for Phase 2 (forensic who + dossier)
 
+# IANA timezone used to localise the current date/time injected into the live-
+# assessment prompt as CONTEXT (a prior: the model can reason about odd hours and
+# weigh recency against telemetry timestamps — it is NOT a trigger). The container
+# runs UTC; Argus converts via chrono-tz (never chrono::Local). An invalid name
+# falls back to UTC with a warning. Default "UTC".
+timezone: "Australia/Sydney"
+
 # Path to the private premises seed (see seed.example.md). Phase 1 may point this
 # at a copy of seed.example.md; the real seed lives in shq-suite-config / wiki.
 seed_path: "~/.config/argus/seed.md"
@@ -109,7 +116,15 @@ loop_config:
 
 # Security-relevant HA entities pulled as per-tick telemetry (door/window/motion/
 # reed/DOSA). Rendered as a text block after the cached seed. Optional.
+#
+# RECOMMENDED: include `event.front_door_access` (the UniFi Access unlock event) so
+# the model sees the timestamp of the last AUTHORISED front-door entry. Combined
+# with the injected current local time (see `timezone` above), it lets the model
+# reason "this approach follows a known authorised unlock 30 s ago" as a PRIOR that
+# lowers suspicion — no special-casing in code; it is just another telemetry line
+# whose timestamp is compared against the current local time in the prompt.
 telemetry_entities: []
+  # - event.front_door_access            # last authorised front-door unlock (recency prior)
   # - binary_sensor.garage_door
   # - binary_sensor.front_door
 

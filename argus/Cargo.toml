@@ -1,6 +1,6 @@
 [package]
 name = "argus"
-version = "0.30.1"
+version = "0.31.0"
 edition = "2021"
 description = "Argus — AI-powered alarm assessment daemon (native x86_64, runs on atlas)"
 
@@ -28,6 +28,11 @@ clap = { version = "4", features = ["derive"] }
 
 # Timestamps (case ids, started_at/updated_at, journal)
 chrono = { version = "0.4", features = ["serde"] }
+
+# Timezone conversion for the live-assessment prompt context (the container runs
+# UTC; the configured `timezone` localises the injected current date/time so the
+# model can reason recency/odd-hours against telemetry — NOT chrono::Local).
+chrono-tz = "0.9"
 
 # Errors
 anyhow = "1.0"

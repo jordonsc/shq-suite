@@ -1,7 +1,7 @@
 # Phase 7 — Trigger Profiles (tiered response)
 
 > Sub-spec of the [Argus master plan](./00-master.md). **Status: 🟢 4a + 4b LANDED
-> (escalation engine live in code).** Phase 4a (argus 0.28.0) laid the rails —
+> + precision pass (0.31.0).** Phase 4a (argus 0.28.0) laid the rails —
 > `TriggerProfile` + per-source config + the dormant output/kiosk gate, all
 > defaulting to `Alarm` so an existing case is byte-for-byte unchanged. **Phase 4b
 > (argus 0.29.0)** makes the softer profiles work: the escalation/promotion engine,
@@ -175,6 +175,35 @@ The HA side owns *classifying* the trigger (it already sets
   seed guidance placeholders added to `seed.example.md`. A `--profile
   <alarm|investigate|general>` override on `--once` exercises the gated/escalation
   paths without real softer-trigger HA entities.
+
+## Precision pass (argus 0.31.0 — production false-escalation hardening)
+
+The house is now in PRODUCTION (real PagerDuty; a self-escalation trips the whole
+house). Two changes reduce false-escalation risk on the gated profiles without
+touching the real `Alarm` path:
+
+- **≥2-tick escalation persistence.** A gated→`Alarm` promotion now requires the
+  escalate condition to hold for **≥`ESCALATION_PERSISTENCE_TICKS` (2) CONSECUTIVE
+  ticks**. A single tick's read (e.g. a phone misread as a blade for one frame)
+  must not page + cascade the whole house. `ActiveCase.escalation_streak`
+  increments on a `Promote` verdict and resets to 0 on `Continue`/`Standdown`, so
+  an intermittent signal (met, not-met, met) never reaches the threshold. The split
+  is `decide_promotion` (per-tick verdict, pure) → `apply_persistence` (the streak
+  gate, pure, unit-tested) → `evaluate_promotion`. **Gated-ONLY:** `decide_promotion`
+  returns `Continue` for an already-`Alarm`/escalated case, so the streak never
+  increments on the real Alarm path — the threat ratchet, armed/weapon threat-floor,
+  and immediate outputs are unchanged (zero added latency; the pre-existing
+  Alarm-path tests pass byte-identical). The `General` fast auto-close still applies.
+- **Time + arm-state context (priors, NOT triggers).** `live_instruction_camera`
+  injects the current **local date/time + day-of-week** (in `cfg.timezone`, via
+  `chrono-tz` — the container runs UTC, never `chrono::Local`; invalid tz → UTC +
+  warn) and the current **alarm arm-state** into every per-tick prompt (all
+  profiles; harmless for `Alarm`). The model is told these inform suspicion but do
+  not decide it: a resident arriving home at an odd hour is still a resident; a
+  door/perimeter approach while armed-away weights suspicion higher. "Recent
+  authorised front-door access" is not special-cased — the operator adds
+  `event.front_door_access` to `telemetry_entities` and the model judges its
+  timestamp against the injected current local time.
 
 ## Resolved open questions (Phase 4b)
 
