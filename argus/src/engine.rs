@@ -140,10 +140,14 @@ pub const SYSTEM_PROMPT: &str = "You are a smart-security AI that reviews camera
     resident in the briefing below — a mere resemblance (similar build, hair, skin tone, or \
     clothing) is not a match. When you are uncertain, weight your confidence toward intruder: fail \
     toward caution.\n\n\
-    Weapons: look closely at every person's hands and anything they hold or carry. Set `armed` if \
-    they hold a weapon, or any object plausibly consistent with one (a blade, firearm, bat, stick, \
-    tool, or an elongated, pointed, or metallic object), and name it in `weapon`, hedging when \
-    unsure. Only an object clearly recognised as benign (a phone, remote, or cup) is not a weapon.\n\n\
+    Weapons: look closely at every person's hands. Set `armed` ONLY when a person is actually \
+    holding a weapon — a knife or blade, a firearm, a bat, club, or axe, or another object they are \
+    clearly wielding or brandishing as a weapon — and name it in `weapon`. An object a person is \
+    merely carrying or using in an ordinary way is NOT a weapon and must not set `armed`: a box, \
+    parcel, bag, phone, cup, tool, or umbrella is benign even during an alarm. Only if an object is \
+    genuinely ambiguous and its shape and handling strongly suggest a concealed or improvised weapon \
+    (e.g. a partially hidden blade) may you set `armed` with a hedged `weapon` note — do not flag an \
+    ordinary carried item on suspicion alone.\n\n\
     Injuries and duress: record any visible injury in a person's `injury` field (e.g. \"bleeding\", \
     \"stab wound\", \"gunshot wound\", \"unconscious\", \"possibly deceased\"). Set `in_duress` \
     (0.0-1.0) for any person who appears coerced, restrained, threatened, or in distress.";
@@ -183,9 +187,12 @@ const IDENTIFY_INSTRUCTION: &str = "The image is the clearest still of a detecte
     security speaker (sex, approx age, build, key clothing, one standout feature; no preamble). \
     Determine whether the person is armed — examine the hands and any held object CLOSELY (this is \
     the clearest frame, your best chance to confirm or rule out a weapon the live pass was unsure \
-    about). Set `armed` true if they hold a weapon or any object plausibly consistent with one \
-    (blade, firearm, bat, stick, tool, or an elongated/pointed/metallic object) and name it in \
-    `weapon`, hedging if unsure. Note any visible `injury`. Anchor every claim on the image.";
+    about). Set `armed` true ONLY if they are actually holding a weapon (a knife or blade, firearm, \
+    bat, club, or axe) or are clearly wielding an object as a weapon, and name it in `weapon`. An \
+    object merely carried or used in an ordinary way — a box, parcel, bag, phone, cup, tool, or \
+    umbrella — is NOT a weapon and must leave `armed` false, even during an alarm; only a genuinely \
+    weapon-like ambiguous object (e.g. a partially hidden blade) warrants a hedged flag. Note any \
+    visible `injury`. Anchor every claim on the image.";
 
 /// The result of a forensic (Opus) identification, delivered back to the engine's
 /// event loop over an mpsc so the Opus call runs CONCURRENTLY with the live loop
