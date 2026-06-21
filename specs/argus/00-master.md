@@ -119,8 +119,9 @@ alarm_control_panel.shq_alarm ──triggered──► Home Assistant (atlas)
 | 3 | [`03-outputs.md`](./03-outputs.md) | Overwatch **positive-only** voice + PagerDuty trigger/resolve with the dossier | ✅ Implemented & shape-verified (2026-06-18), build warning-free, 9 unit tests pass — tonic 0.11 voice client (proto symlinked), pure positive-only gate, PagerDuty Events v2 (`build_event`/`send` split), `out::run` timeline-diff wiring (independent voice + PD channels). **Live-fire deferred** (no real klaxon/page — residence asleep); owed: Overwatch reachable + real `PAGERDUTY_ROUTING_KEY` |
 | 4 | [`04-kiosk-hud.md`](./04-kiosk-hud.md) | Vector HUD web app + kiosk takeover via nyx + live `CaseState`/stills push | ✅ Implemented + **LIVE-FIRED on kiosk11** (2026-06-19) — axum `/alarm`+`/stills/:id`+`/kiosk` WS server + the vector HUD (`argus/web/`, redesigned this session) + `shq_display.navigate` takeover, now driven by the WHOLE alarm machine (arming/armed/triggered/authorised standby panes + 15s green dwell). nyx wake/Chronos caveat applies only to `idle_mode: clock` kiosks (kiosk11 is `off`) |
 | 5 | [`05-ha-component-docs.md`](./05-ha-component-docs.md) | `argus` HA component (status + arm/ack), deploy tool, docs, private seed | ✅ Implemented (2026-06-18), Rust build warning-free + Python compiles — HA `argus` component (status sensors + ack/standdown buttons over a `/control` WS on the web port), control→engine channel (`ControlCommand`, `TimelineKind::Acknowledged`), native `deploy` `argus` target, cross-project docs. **Real premises seed still OWED** (private, needs the user) |
-| 6 | [`06-refinements.md`](./06-refinements.md) | Post-M1 live-hardening + deployment log (NOT a feature phase — the running record of fixes since M1, plus the **containerisation** of Argus on atlas) | 🔧 Active log — argus **0.22.2**, containerised on atlas (ledger `shq-suite-0004`). Read first for current state + the TEST posture |
-| 7 | [`07-trigger-profiles.md`](./07-trigger-profiles.md) | **Trigger profiles** — tiered response (`Alarm` / `Investigate` / `General`) keyed on the trigger; output-gating + escalation for the softer signals | 📋 Design complete, **M1 scope** (promoted 2026-06-19) — NOT yet implemented |
+| 6 | [`06-refinements.md`](./06-refinements.md) | Post-M1 live-hardening + deployment log (NOT a feature phase — the running record of fixes since M1, plus the **containerisation** of Argus on atlas) | 🔧 Active log — superseded by Phase 8 as the current-state record; containerised on atlas (ledger `shq-suite-0004`) |
+| 7 | [`07-trigger-profiles.md`](./07-trigger-profiles.md) | **Trigger profiles** — tiered response keyed on the trigger; output-gating + escalation for the softer signals | ✅ Implemented (argus 0.28.0 scaffolding → 0.29.0 escalation → **0.33.0 two-flow `{Alarm,Investigate}` + persons model**); live-fire validated. See Phase 8 for the latest |
+| 8 | [`08-post-test-hardening.md`](./08-post-test-hardening.md) | **Post-live-test hardening** — priority MAIN image, forensic ID in-alarm, disarm latency, kiosk keep-awake + arming UI, weapon/presence **confidence scores**, prompts → `prompts.yaml` | ✅ **DONE + LIVE-FIRE VALIDATED (argus 0.36.0, 2026-06-21)** — the current-state record. Read first. Ledger `shq-suite-0002` |
 
 Phases 1–5 are **strictly ordered** — each consumes the prior phase's output. The
 **`CaseState` schema defined in Phase 2 is the central contract** that Phases 3 and 4
@@ -139,20 +140,19 @@ log, not a feature phase.
 
 ## Project status
 
-**2026-06-19 — UPDATE.** M1 phases 1–5 are live-validated end-to-end against the
-**real** alarm + Overwatch; argus is now **0.24.0**, **containerised on atlas**
-(rootless Podman + systemd Quadlet, ledger `shq-suite-0004`). A large post-M1
-hardening pass (per-camera fan-out, threat ratchet, blocking voice, intruder-movement
-zone announcements, quality-aware forensic ID, **alarm-mode kiosk takeover LIVE-FIRED
-on kiosk11** with arming/armed/authorised standby panes + 15s green dwell, **disarm
-logic moved off HA into Argus**, HUD redesign) is logged in
-[`06-refinements.md`](./06-refinements.md) — **read it first** for current state + the
-deliberate TEST posture the house is in (incl. Overwatch voice MUTED for the session).
-**M1 scope was extended** with the **trigger profiles**
-([`07-trigger-profiles.md`](./07-trigger-profiles.md), design complete, pending build).
-Remaining M1 / M2 / M3 work is the structured roadmap in
-[§ Milestone task lists](#milestone-task-lists) below (M1: PagerDuty live-fire, trigger-profile
-build, kiosk 02–10 migration, klaxon-volume ducking, resident photos, the Argus–Nyx link).
+**2026-06-21 — MILESTONE: argus 0.36.0, LIVE-FIRE VALIDATED end-to-end.** Phases 1–5
+plus the Phase-8 post-live-test hardening are done and repeatedly validated against the
+**real** alarm with Overwatch voice + klaxon and PagerDuty LIVE (no longer muted) —
+full arm → trigger → assess → disarm walk-throughs, including box-vs-knife weapon
+detection, casualty/injury escalation, and silent Investigate on real deliveries.
+argus is **containerised on atlas** (rootless Podman + systemd Quadlet, ledger
+`shq-suite-0004`), all on branch `argus-design-specs` (not yet merged to `main`).
+**[`08-post-test-hardening.md`](./08-post-test-hardening.md) is the current-state record
+— read it first**; the per-feature detail is in `argus/CLAUDE.md` § Gotchas and ledger
+`shq-suite-0002`. The earlier hardening log ([`06-refinements.md`](./06-refinements.md))
+and the trigger-profile design ([`07-trigger-profiles.md`](./07-trigger-profiles.md),
+now implemented as the two-flow `{Alarm,Investigate}` + persons model) led here.
+Remaining roadmap (M1 / M2 / M3) is in [§ Milestone task lists](#milestone-task-lists) below.
 Branch `argus-design-specs`, committed — not yet pushed.
 
 **2026-06-18 — ALL PHASES (1, 2, 2a, 3, 4, 5) IMPLEMENTED & COMMITTED** on branch
@@ -210,11 +210,11 @@ live; these complete it.
   real `alarm_control_panel`** (user-locked decisions). Alarm path byte-identical. Owed: the real
   perimeter/front-door HA trigger entities (user-owned) + per-profile seed guidance + escalation
   live-fire (trips the whole house — with user present).
-* ✅ **Resident reference photos** — **BUILT** (argus 0.27.0): labelled resident photos prepended to
-  the Opus identify call; `IDENTIFY_INSTRUCTION` matches-then-excludes a confident resident (keeps
-  the fail-toward-intruder bias); graceful absence (Opus-only, off the cached Sonnet loop). The
-  richer `authorised: bool`-per-person model is the related `CaseState` schema option. Owed: the
-  real private photos on atlas.
+* ↩️ **Resident reference photos** — built (argus 0.27.0) then **REMOVED in 0.33.0**: the persons
+  model with per-person resident/guest/intruder confidences (text-only resident signal from the
+  seed) replaced photo-anchoring; Opus now IDs every subject as unknown. Superseded — do not
+  reintroduce without revisiting the persons model. (0.35.0 added a `presence` + `weapon_confidence`
+  confidence model on top.)
 * 🔧 **Kiosk monopolisation via Argus (remove the current approach)** — Argus drives the
   takeover on kiosk11 today. **Scaffolding + cutover runbook DONE** (config-example entries
   for kiosk02–10 added; the live HA path enumerated read-only — takeover is `script.kiosks_alarm`

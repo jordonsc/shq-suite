@@ -7,6 +7,17 @@ with the private premises seed, and logs a natural-language assessment.
 **Native x86_64** service that runs on **atlas** (the HA + RAG host) — `cargo
 build --release` + systemd, **not** a `cross`/Podman RPi build like nyx/overwatch/dosa.
 
+> **CURRENT: v0.36.0 — LIVE-FIRE VALIDATED end-to-end.** Phases 1–5 plus the Phase-8
+> post-live-test hardening are done and repeatedly validated against the real alarm
+> (full arm → trigger → assess → disarm, Overwatch voice + klaxon + PagerDuty live).
+> The 0.34.0→0.36.0 evolution (warrants_attention, per-frame MAIN image, kiosk
+> keep-awake + arming warning sign, HUD cache-busting, **weapon/presence confidence
+> scores**, and **all prompts externalised to `prompts.yaml`**) is captured in
+> [`specs/argus/08-post-test-hardening.md`](../specs/argus/08-post-test-hardening.md)
+> and ledger `shq-suite-0002`; the per-feature detail is in the **Gotchas** below.
+> All work is on branch `argus-design-specs` (not yet merged to `main`). The history
+> that led here:
+>
 > **Phase status:** Phases 1 (foundation), 2 (assessment loop + `CaseState`), 2a
 > (offsite S3 resilience), 3 (outputs — Overwatch voice + PagerDuty), and 4
 > (kiosk HUD server + takeover — Rust side) are implemented + shape-verified.
@@ -48,9 +59,10 @@ build --release` + systemd, **not** a `cross`/Podman RPi build like nyx/overwatc
 > floor 0.34) is the "intruder" the voice/HUD/PD/timeline speak of. New milestones
 > `InjuryDetected` (re-pages + casualty line) + `MaliciousActivity` (voice-only); new
 > case field `malicious_activity[]`. **Resident reference photos were DROPPED**
-> (Opus IDs every subject as unknown). A **universal `SYSTEM_PROMPT`** (engine) is
-> prepended to the seed as the cached `system` block; per-scenario message prompts
-> are the alarm / investigate-trigger / investigate-ancillary openers. See
+> (Opus IDs every subject as unknown). A **universal system prompt** (since 0.36.0 in
+> `prompts.yaml`, was an engine const) is prepended to the seed as the cached `system`
+> block; per-scenario message prompts are the alarm / investigate-trigger /
+> investigate-ancillary openers. See
 > [`specs/argus/07-trigger-profiles.md`](../specs/argus/07-trigger-profiles.md).
 > **A real escalation that trips the whole-house alarm is a live-fire task with the
 > user present** — unit-tested + `--once --profile investigate`-validated only; the

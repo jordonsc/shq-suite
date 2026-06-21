@@ -1,14 +1,38 @@
 # Phase 8 — post-live-test hardening (forensics-in-alarm, HUD, disarm latency)
 
-> **Status: 🟢 IMPLEMENTED + DEPLOYED (2026-06-21, argus 0.34.0) — awaiting the
-> user's morning live-fire test (checklist at the foot of this file).** Code defects
-> #1–#5 + the HA revert #6 are done; built, unit-tested (42 green), deployed to atlas
-> (journal confirms `Starting Argus v0.34.0` / HA WS authenticated / `+ 2 softer
-> trigger(s)`). NOT live-fired (no agent-driven alarm) — behavioural verification is
-> the user's morning job. Out-of-scope #6.x (the alarm-code script/standdown entities)
-> remain user-owned + unset, by design. This spec was written for a FRESH agent to
-> execute **end-to-end, autonomously, overnight**. It follows the 0.33.x two-flows +
-> persons refactor ([`07-trigger-profiles.md` §Phase 8](./07-trigger-profiles.md)).
+> **Status: ✅ DONE + LIVE-FIRE VALIDATED (2026-06-21, argus 0.36.0).** The original
+> Phase-8 defects #1–#6 were implemented at 0.34.0; the work then **evolved through a
+> series of user live-fire walk-throughs** (full arm → trigger → assess → disarm, with
+> Overwatch voice + klaxon and PagerDuty live) to **0.36.0**, all on `argus-design-specs`.
+> Confirmed working end-to-end against the real alarm: non-blank priority MAIN image,
+> Opus ID + mugshots + zone-movement, casualty/injury escalation, fast disarm→AUTHORISED,
+> the arming warning sign, the box-vs-knife weapon model, and the silent Investigate
+> flow on real deliveries. Out-of-scope #6.x (the alarm-code script / standdown entities)
+> remain user-owned + unset, by design. Follows the 0.33.x two-flows + persons refactor
+> ([`07-trigger-profiles.md` §Phase 8](./07-trigger-profiles.md)).
+>
+> **Post-0.34.0 follow-ups (all live-fire validated, see ledger `shq-suite-0002`):**
+> - **0.34.1** — `Person::warrants_attention` (structured danger overrides resident
+>   classification: an armed person is ID'd/carded/zone-tracked even if read as a
+>   resident); per-frame MAIN-image rank (a held weapon shot isn't displaced by an
+>   unarmed/empty frame); HUD main-image preload (no flicker).
+> - **0.34.2** — Investigate prompts treat kitchen cutlery for food prep as benign.
+> - **0.34.3 → 0.34.5** — kiosk keep-awake state machine (pin during Arming/Triggered/
+>   live case; blank while merely armed; reset the idle timer at standdown); arming
+>   screen shows a pulsing **warning sign** (not the calm ring); life-threat headline
+>   pulse removed (broke layout), vignette/border kept.
+> - **0.34.6** — HUD cache-busting (timestamped asset URLs + `no-store`) so kiosks
+>   never serve stale CSS/HTML after a deploy.
+> - **0.34.7** — `armed` narrowed to real weapons only (a carried box no longer flags);
+>   kiosk text-selection disabled.
+> - **0.35.0** — **confidence scores**: `weapon_confidence` (→ `armed` via tunable
+>   `ARMED_FLOOR` 0.4) replaces the binary, and `presence` (→ `PRESENCE_FLOOR` 0.4)
+>   filters hallucinated subjects; degenerate "no person" Opus IDs are suppressed.
+> - **0.36.0** — **all LLM prompts externalised to `argus/prompts.yaml`** (baked in,
+>   runtime-overridable at `~/.config/argus/prompts.yaml`); Alarm flow now treats a
+>   held weapon as serious regardless of apparent "food prep" (the chef's-knife miss).
+>   Empirically confirmed: box `weapon_confidence` 0.05 (benign) → knife 0.45→0.82
+>   (armed → life_threatening).
 
 ## Environment & ground truth (a fresh agent won't know this)
 
@@ -215,7 +239,12 @@ Leave the description's "Investigate" wording.
 - [x] Docs + ledger updated; committed to `argus-design-specs`.
 - [x] Morning checklist left for the user (below).
 
-## 🌅 MORNING LIVE-TEST CHECKLIST (user-owned — do NOT run autonomously)
+## 🌅 MORNING LIVE-TEST CHECKLIST — ✅ COMPLETED (superseded by live-fire runs)
+
+> This was the pre-live-fire checklist for 0.34.0. It has since been **completed and
+> far exceeded** by a series of full live-fire walk-throughs (Overwatch voice + klaxon
+> and PagerDuty live, NOT muted) that drove the work to 0.36.0 — see the status block
+> at the top of this file and ledger `shq-suite-0002`. Kept below for historical record.
 
 Test posture for the night was unchanged: **Overwatch amp OFF** (no audible
 TTS/klaxon), **PagerDuty in maintenance**. Re-check both before/after as you wish.
