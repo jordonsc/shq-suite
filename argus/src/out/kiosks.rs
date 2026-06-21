@@ -18,12 +18,12 @@
 //! ## nyx wake/keep-awake (Phase 5 — resolved)
 //! Every alarm-mode takeover navigate carries `wake: true` so nyx wakes the
 //! backlight + kills any Chronos clock overlay (`idle_mode: clock`) BEFORE the
-//! CDP navigate — the pane is visible even on a sleeping/clock kiosk. During the
-//! `Arming` delay, a `Triggered` alarm, or a live case it also carries
-//! `keep_awake: true` to PIN the screen on so the takeover HUD can't blank; STEADY
-//! `armed`/authorised standby and the return to the dashboard send
-//! `keep_awake: false` so the kiosk may blank normally while merely armed (no 24/7
-//! burn when armed-away — the user's choice). Requires nyx >= 1.2.0 +
+//! CDP navigate — the pane is visible even on a sleeping/clock kiosk, so the
+//! `Triggered` takeover WAKES a kiosk that blanked while armed. During an actual
+//! incident (`Triggered` or a live case) it also carries `keep_awake: true` to PIN
+//! the screen on so the alarm HUD can't blank mid-incident; arming/armed/authorised
+//! standby and the return to the dashboard send `keep_awake: false` so the kiosk
+//! blanks normally while merely armed (no 24/7 burn when armed-away). Requires nyx >= 1.2.0 +
 //! shq_display component >= 1.2.0; older nyx ignores the unknown fields (the
 //! pre-Phase-5 navigate-only behaviour). See ledger shq-suite-0002.
 
@@ -68,17 +68,16 @@ fn desired_target(case: &Option<CaseState>, mode: AlarmMode) -> Target {
 }
 
 /// Whether the kiosk should be PINNED awake (no idle blank/clock) — drives
-/// `keep_awake`. True during the ARMING delay, a TRIGGERED alarm, or a live
-/// (non-gated) case. **Steady `Armed` deliberately returns false** so an
-/// armed-away house doesn't keep all the kiosks lit 24/7 (the panels blank
-/// normally while merely armed) — the user's choice. The transient arming delay
-/// IS pinned so the exit/entry countdown is visible, and an actual trigger
-/// re-pins (with `wake:true`, so a kiosk that blanked while armed is woken).
-/// `Authorised` (the post-disarm green) is covered by the cleared case still
-/// being present during its dwell, not by the mode here.
+/// `keep_awake`. True ONLY during an actual INCIDENT: a `Triggered` alarm or a
+/// live (non-gated) case. Arming/armed/authorised standby deliberately return
+/// false so the kiosks blank normally while merely armed (no 24/7 burn when
+/// armed-away — the user's choice). The kiosk doesn't need pinning before the
+/// alarm fires: the `Triggered` takeover navigate carries `wake: true`, which
+/// WAKES a kiosk that blanked while armed (see `takeover`), and the pin then holds
+/// it on for the duration of the incident.
 fn alarm_active(case: &Option<CaseState>, mode: AlarmMode) -> bool {
     let active_case = case.as_ref().is_some_and(|c| !c.gated());
-    active_case || matches!(mode, AlarmMode::Triggered | AlarmMode::Arming)
+    active_case || matches!(mode, AlarmMode::Triggered)
 }
 
 /// Spawned in daemon mode only (and only when `web` is configured + `kiosks` is
@@ -212,13 +211,13 @@ mod tests {
     }
 
     #[test]
-    fn alarm_active_pins_during_arming_and_incidents_not_steady_armed() {
-        // keep_awake fires for a live (non-gated) case, Triggered, or the ARMING delay...
+    fn alarm_active_pins_only_during_an_incident() {
+        // keep_awake fires for a live (non-gated) case or a Triggered alarm...
         assert!(alarm_active(&case(TriggerProfile::Alarm), AlarmMode::Disarmed));
         assert!(alarm_active(&None, AlarmMode::Triggered));
-        assert!(alarm_active(&None, AlarmMode::Arming));
-        // ...but NOT for steady armed / authorised standby (the screen may blank to
-        // save the panels while merely armed — the user's choice)...
+        // ...but NOT for arming/armed/authorised standby — the kiosk blanks normally
+        // while merely armed; the Triggered takeover's wake:true wakes it on trigger.
+        assert!(!alarm_active(&None, AlarmMode::Arming));
         assert!(!alarm_active(&None, AlarmMode::Armed));
         assert!(!alarm_active(&None, AlarmMode::Authorised));
         assert!(!alarm_active(&None, AlarmMode::Disarmed));
