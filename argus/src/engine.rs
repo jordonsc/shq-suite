@@ -28,6 +28,7 @@ use crate::case::{
 use crate::config::Config;
 use crate::ha::{HaEvent, RestClient};
 use crate::llm::{AnthropicClient, AssessRequest, ImageInput, Reasoning, Usage};
+use crate::prompts::Prompts;
 use crate::state::AlarmMode;
 
 /// A command from the Phase 5 control surface (the HA component over the
@@ -127,98 +128,10 @@ enum Revert {
     ToDisarmed,
 }
 
-/// The universal **system prompt** — prepended to the private premises seed to
-/// form the cached `system` block on every Sonnet/Opus call (the seed supplies
-/// the `< residence summary >` / `< residents summary >` content referenced at the
-/// end). Holds the role, the threat-level rubric, and the persistent assessment
-/// rules so the per-scenario message prompts can stay short.
-pub const SYSTEM_PROMPT: &str = "You are a smart-security AI that reviews camera footage to \
-    produce a risk assessment of an incident at a residence. You are given a single camera still \
-    and must determine whether anyone is attempting to enter, or has already entered, the premises, \
-    and whether any person appears to be under duress.\n\n\
-    For each frame, report:\n\
-    - a holistic threat level for the scene;\n\
-    - the people present and, for each, the likelihood they are a resident, a guest, or an intruder \
-    (independent 0.0-1.0 confidences that need not sum to 1);\n\
-    - any threats and any injuries you observe;\n\
-    - an activity summary of what is happening in the frame, paying special attention to anything \
-    potentially malicious;\n\
-    - a terse list of malicious actions in the frame, e.g. \"breaking into car\", \"smashed window\".\n\n\
-    Determine the threat level as follows:\n\
-    - benign: no sign of intrusion, threat, or duress — a resident, an expected guest or delivery, \
-    or no one of concern.\n\
-    - threat_present: a genuine threat is present — a non-resident attempting or making entry, \
-    forcing or testing a door or window, prowling or casing the property, or otherwise behaving as \
-    an intruder, armed or not.\n\
-    - life_threatening: immediate danger to life — a person is armed, appears to be under duress, or \
-    appears to be seriously injured.\n\n\
-    How readily to treat an unknown person as a threat depends on the situation, and is stated in \
-    the instruction for this frame.\n\n\
-    Assessing people (important): assign each person a resident, a guest, and an intruder \
-    confidence. Only assign a high resident confidence when the person clearly matches a named \
-    resident in the briefing below — a mere resemblance (similar build, hair, skin tone, or \
-    clothing) is not a match. When you are uncertain, weight your confidence toward intruder: fail \
-    toward caution.\n\n\
-    Person detection: for each person also score `presence` (0.0-1.0) — how confident you are that a \
-    REAL, distinct person is genuinely present. This is separate from who they are and from frame \
-    quality. Score it LOW for a partial limb at the edge of frame, a reflection, a shadow, a \
-    mannequin or poster, a pet, or anything you are not sure is actually a person; do NOT invent a \
-    person from an ambiguous shape. It is better to score presence honestly low than to register a \
-    person who may not be there.\n\n\
-    Weapons: look closely at every person's hands and score `weapon_confidence` (0.0-1.0) — how \
-    confident you are they are holding an ACTUAL weapon. Score HIGH for a clearly-visible weapon — a \
-    knife or blade (INCLUDING a kitchen or chef's knife), a firearm, a bat, club, or axe — or an \
-    object clearly wielded or brandished as a weapon; score MODERATE for a genuinely weapon-like but \
-    unclear object (e.g. a partially hidden blade); score NEAR ZERO for an everyday object carried or \
-    used in an ordinary way (a box, parcel, bag, phone, cup, tool, or umbrella), even during an \
-    alarm, and zero for empty hands. Name any weapon you see in `weapon`.\n\n\
-    Injuries and duress: record any visible injury in a person's `injury` field (e.g. \"bleeding\", \
-    \"stab wound\", \"gunshot wound\", \"unconscious\", \"possibly deceased\"). Set `in_duress` \
-    (0.0-1.0) for any person who appears coerced, restrained, threatened, or in distress.";
-
-/// Investigate scenario opener for the camera that fired the trigger. Posture:
-/// presumed-benign, so the bar for a threat is HIGH (benign unless confident).
-const INVESTIGATE_TRIGGER_PROMPT: &str = "Benign activity has been detected on this camera — most \
-    likely a guest arriving, a delivery, or a resident returning. Treat the scene as `benign` UNLESS \
-    you have HIGH confidence it is genuinely a threat — an obvious weapon, a masked or prowling \
-    intruder, or forced entry — in which case report `threat_present` (or `life_threatening` if a \
-    weapon, duress, or injury is present). When in doubt, it is benign. Using a knife, utensil or \
-    cutlery to prepare food, cook or eat should be considered benign and NOT flagged as an armed weapon.";
-
-/// Investigate scenario opener for the other (ancillary) cameras during a case.
-const INVESTIGATE_ANCILLARY_PROMPT: &str = "Benign activity has been detected elsewhere on the \
-    premises, likely a guest or a delivery. You are reviewing an unrelated camera; normal activity \
-    is expected — residents or guests on the property. Treat the scene as `benign` UNLESS you have \
-    HIGH confidence of a genuine threat — an obvious weapon, a masked or prowling intruder, forced \
-    entry, or someone in duress — in which case report `threat_present` (or `life_threatening` for a \
-    weapon, duress, or injury). When in doubt, it is benign. Using a knife, utensil or cutlery to \
-    prepare food, cook or eat should be considered benign and NOT flagged as an armed weapon.";
-
-/// Alarm scenario opener (any camera) — a confirmed breach is assumed, so an
-/// unknown person IS a threat (the opposite posture to Investigate).
-const ALARM_PROMPT: &str = "An alarm has been triggered — an intrusion is assumed. Treat any person \
-    who is not clearly a resident or an expected guest as a threat: report at least `threat_present`, \
-    and `life_threatening` if anyone is armed, appears to be under duress, or appears injured. \
-    Determine who is present and, for each, their likelihood of being a resident, a guest, or an \
-    intruder; note any weapons, injuries, or signs of duress, and any malicious activity.";
-
-/// The forensic (Opus) instruction — shared by the inline (`--once`) and the
-/// spawned (daemon) identification paths.
-const IDENTIFY_INSTRUCTION: &str = "The image is the clearest still of a detected subject (the \
-    camera frame). Produce a firm forensic identification of this subject: physical descriptors, \
-    distinguishing features, and a short dossier paragraph for the security station. ALSO write \
-    `spoken_summary` — a single short sentence (max ~18 words) suitable to be read aloud over a \
-    security speaker (sex, approx age, build, key clothing, one standout feature; no preamble). \
-    Score `weapon_confidence` (0.0-1.0) — examine the hands and any held object CLOSELY (this is the \
-    clearest frame, your best chance to confirm or rule out a weapon the live pass was unsure about). \
-    Score HIGH for a clearly-visible weapon (a knife or blade INCLUDING a kitchen or chef's knife, a \
-    firearm, bat, club, or axe) or an object clearly wielded as a weapon; MODERATE for a genuinely \
-    weapon-like but unclear object (e.g. a partially hidden blade); NEAR ZERO for an everyday object \
-    carried or used in an ordinary way (a box, parcel, bag, phone, cup, tool, or umbrella), even \
-    during an alarm. Name any weapon in `weapon`. ALSO score `presence` (0.0-1.0): how confident you \
-    are a REAL person is actually in this frame — score it near zero if the frame in fact shows no \
-    one (an empty room or only a partial artifact); do not invent a subject. Note any visible \
-    `injury`. Anchor every claim on the image.";
+// All LLM prompt text lives in `prompts.yaml` (baked in via `include_str!`, and
+// runtime-overridable at `~/.config/argus/prompts.yaml`) — loaded into the `Prompts`
+// bundle (`src/prompts.rs`). The engine holds it on `self.prompts` and fills the
+// `{...}` placeholders in `live_instruction_camera`; the Opus pass uses `prompts.identify`.
 
 /// The result of a forensic (Opus) identification, delivered back to the engine's
 /// event loop over an mpsc so the Opus call runs CONCURRENTLY with the live loop
@@ -232,17 +145,19 @@ struct IdResult {
 }
 
 /// Run one forensic identification call. Free function (no `&self`) so it can run
-/// inline OR inside a spawned task with a cloned client + system prompt.
+/// inline OR inside a spawned task with a cloned client + system prompt + the
+/// `identify` instruction (from `prompts.yaml`).
 async fn run_identify(
     opus: &AnthropicClient,
     system: &str,
+    instruction: &str,
     label: &str,
     jpeg: &[u8],
 ) -> (Result<Identification>, Option<Usage>) {
     let req = AssessRequest {
         system,
         images: vec![ImageInput::camera(label, jpeg)],
-        instruction: IDENTIFY_INSTRUCTION.to_string(),
+        instruction: instruction.to_string(),
         schema: Some(identification_schema()),
         max_tokens: ID_MAX_TOKENS,
         reasoning: Reasoning::Deep,
@@ -333,11 +248,14 @@ pub struct Engine {
     rest: RestClient,
     sonnet: AnthropicClient,
     opus: AnthropicClient,
-    /// The cached `system` block for the LIVE (Sonnet) loop: the universal
-    /// [`SYSTEM_PROMPT`] + the private premises seed, assembled once at startup.
+    /// All LLM prompt text (`prompts.yaml`): the openers, the context/live-message
+    /// templates, and the Opus identify instruction. Loaded once at startup.
+    prompts: Prompts,
+    /// The cached `system` block for the LIVE (Sonnet) loop: the universal system
+    /// prompt (`prompts.system`) + the private premises seed, assembled once at startup.
     system: String,
     /// The cached `system` block for the OPUS forensic call: the premises seed
-    /// ALONE. The live `SYSTEM_PROMPT` frames the per-frame assessment task, which
+    /// ALONE. The live system prompt frames the per-frame assessment task, which
     /// confuses the forensic ID call (it stubbed `dossier`/`spoken_summary` to
     /// "placeholder"); the forensic instruction defines its own task, so it gets
     /// the neutral seed only.
@@ -383,6 +301,7 @@ impl Engine {
         rest: RestClient,
         sonnet: AnthropicClient,
         opus: AnthropicClient,
+        prompts: Prompts,
         system: String,
         seed: String,
         state_tx: watch::Sender<Option<CaseState>>,
@@ -416,6 +335,7 @@ impl Engine {
             rest,
             sonnet,
             opus,
+            prompts,
             system,
             seed,
             label_to_entity,
@@ -1366,7 +1286,7 @@ impl Engine {
 
     /// Build the per-scenario Sonnet message for ONE camera's focused assessment.
     /// The universal role + threat-rubric + assessment rules live in the cached
-    /// system prompt ([`SYSTEM_PROMPT`]); this message carries the scenario opener
+    /// system prompt (`prompts.system`); this message carries the scenario opener
     /// (Alarm / Investigate trigger / Investigate ancillary), the single-camera
     /// scoping, the CONTEXT priors (local time + arm state), telemetry, and the
     /// current person roster (so ids are reused). `is_trigger` selects the
@@ -1386,14 +1306,12 @@ impl Engine {
         // `event.front_door_access` entry the operator adds to `telemetry_entities`.
         let local_time = format_local_time(Utc::now(), &self.cfg.timezone);
         let arm_state = self.prev_mode.map(|m| m.describe()).unwrap_or("unknown");
-        let context = format!(
-            "CONTEXT (priors that inform suspicion, NOT triggers — weigh them, don't \
-             decide on them). Current local time: {local_time}. House alarm: {arm_state}. \
-             A resident arriving home, even at an odd hour, is still a resident; but a door \
-             or perimeter approach while the house is armed-away (residents out) should weight \
-             your suspicion higher. Compare any access/event timestamps in the telemetry \
-             against this current local time to judge recency."
-        );
+        // CONTEXT priors template (prompts.yaml `context`): fill {local_time}/{arm_state}.
+        let context = self
+            .prompts
+            .context
+            .replace("{local_time}", &local_time)
+            .replace("{arm_state}", arm_state);
 
         let mut roster = String::new();
         if state.persons.is_empty() {
@@ -1413,29 +1331,30 @@ impl Engine {
             }
         }
 
-        // The scenario opener: `Alarm` always uses the alarm prompt; an Investigate
-        // case uses the trigger-camera prompt for the camera that fired and the
-        // ancillary prompt for the rest.
+        // The scenario opener (prompts.yaml): `Alarm` always uses the alarm opener; an
+        // Investigate case uses the trigger-camera opener for the camera that fired and
+        // the ancillary opener for the rest.
         let opener = match state.effective_profile {
-            TriggerProfile::Alarm => ALARM_PROMPT,
+            TriggerProfile::Alarm => &self.prompts.alarm,
             TriggerProfile::Investigate => {
                 if is_trigger {
-                    INVESTIGATE_TRIGGER_PROMPT
+                    &self.prompts.investigate_trigger
                 } else {
-                    INVESTIGATE_ANCILLARY_PROMPT
+                    &self.prompts.investigate_ancillary
                 }
             }
         };
 
-        format!(
-            "{opener}\n\nYou are assessing a SINGLE camera named \"{label}\" — the still above. \
-             Report ONLY what is visible in this one frame: `locations` should describe just this \
-             camera, and `persons` / `threats` / `malicious_activity` only the people and things \
-             visible in it.\n\n{context}\n\n{telemetry}\n\n{roster}\n\n\
-             Reuse an existing roster id for a person already seen; coin the next `subject-N` for a \
-             new person. If no person is visible, return empty `persons` and set `person_detected` \
-             to false."
-        )
+        // The live-message wrapper (prompts.yaml `live_message`): fill the slots. The
+        // dynamic-content slots ({telemetry}/{roster}) are substituted LAST so a
+        // placeholder accidentally present in earlier-substituted text can't re-match.
+        self.prompts
+            .live_message
+            .replace("{opener}", opener.trim())
+            .replace("{label}", label)
+            .replace("{context}", context.trim())
+            .replace("{telemetry}", telemetry)
+            .replace("{roster}", roster.trim_end())
     }
 
     /// Normalise a camera reference (which the model returns as either the human
@@ -1787,12 +1706,14 @@ impl Engine {
                 // Daemon: spawn so the live loop never blocks on Opus.
                 Some(tx) => {
                     let opus = self.opus.clone();
-                    // Forensic ID gets the SEED only (not the live SYSTEM_PROMPT).
+                    // Forensic ID gets the SEED only (not the live system prompt),
+                    // plus the `identify` instruction from prompts.yaml.
                     let seed = self.seed.clone();
+                    let instruction = self.prompts.identify.clone();
                     let case_id = active.state.case_id.clone();
                     tokio::spawn(async move {
                         let (ident, usage) =
-                            run_identify(&opus, &seed, &label, &jpeg).await;
+                            run_identify(&opus, &seed, &instruction, &label, &jpeg).await;
                         let _ = tx
                             .send(IdResult {
                                 case_id,
@@ -1808,6 +1729,7 @@ impl Engine {
                     let (ident, usage) = run_identify(
                         &self.opus,
                         &self.seed,
+                        &self.prompts.identify,
                         &label,
                         &jpeg,
                     )

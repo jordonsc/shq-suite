@@ -16,6 +16,7 @@ mod engine;
 mod ha;
 mod llm;
 mod out;
+mod prompts;
 mod state;
 mod version;
 mod web;
@@ -31,6 +32,7 @@ use config::Config;
 use engine::{ControlCommand, Engine};
 use ha::{HaEvent, RestClient};
 use llm::AnthropicClient;
+use prompts::Prompts;
 
 #[derive(Parser, Debug)]
 #[command(name = "argus", version, about = "Argus — AI-powered alarm assessment daemon")]
@@ -79,11 +81,13 @@ async fn main() -> Result<()> {
     let cfg = Config::load(cli.config.clone())?;
     let seed = cfg.load_seed().context("failed to load premises seed")?;
     info!("Loaded premises seed ({} bytes) from {}", seed.len(), cfg.seed_path);
-    // The LIVE (Sonnet) `system` block = the universal security-AI system prompt
-    // followed by the private premises seed (the seed supplies the residence/
-    // residents summaries the prompt refers to). The Opus forensic call gets the
-    // SEED alone (see Engine.seed) — the live prompt's task framing derailed it.
-    let system = format!("{}\n\n{}", engine::SYSTEM_PROMPT, seed);
+    // All LLM prompts live in `prompts.yaml` (baked in, runtime-overridable at
+    // ~/.config/argus/prompts.yaml). The LIVE (Sonnet) `system` block = the universal
+    // system prompt followed by the private premises seed (which supplies the
+    // residence/residents summaries the prompt refers to). The Opus forensic call gets
+    // the SEED alone (see Engine.seed) — the live prompt's task framing derailed it.
+    let prompts = Prompts::load().context("failed to load prompts.yaml")?;
+    let system = prompts.system_block(&seed);
 
     let rest = RestClient::new(&cfg.ha.url, &cfg.ha.token)?;
     let sonnet = AnthropicClient::new(
@@ -118,7 +122,7 @@ async fn main() -> Result<()> {
     let web_mode_rx = mode_tx.subscribe();
     let kiosks_mode_rx = mode_tx.subscribe();
 
-    let mut eng = Engine::new(cfg.clone(), rest, sonnet, opus, system, seed, state_tx);
+    let mut eng = Engine::new(cfg.clone(), rest, sonnet, opus, prompts, system, seed, state_tx);
 
     if cli.once {
         eng.run_once(cli.profile).await?;
