@@ -70,19 +70,22 @@
   --pulse-rate: 1.8s;
   --pulse-alpha: 0.12;
 }
-/* warning pulse on the standby centre (emblem + ring) while arming */
-[data-state="arming"] .emblem,
-[data-state="arming"] .standby-ring {
-  animation: armingPulse 1.4s ease-in-out infinite;
+/* Arming is an urgent CALL TO ACTION, not a passive standby: swap the calm centre
+   ring for a pulsing WARNING SIGN (a triangle + exclamation) that throbs to draw
+   the eye. The ring is hidden while arming; the warning is hidden otherwise. */
+[data-state="arming"] .standby-ring { display: none; }
+[data-state="arming"] .standby-warn {
+  display: block;
+  animation: armingWarn 0.9s ease-in-out infinite;
   transform-origin: center;
 }
-@keyframes armingPulse {
-  0%, 100% { opacity: 0.55; }
-  50%      { opacity: 1; }
+@keyframes armingWarn {
+  0%, 100% { opacity: 0.6; transform: scale(0.95); }
+  50%      { opacity: 1;   transform: scale(1.08);
+             filter: drop-shadow(0 0 16px rgba(var(--hud-rgb), 0.85)); }
 }
 @media (prefers-reduced-motion: reduce) {
-  [data-state="arming"] .emblem,
-  [data-state="arming"] .standby-ring { animation: none !important; }
+  [data-state="arming"] .standby-warn { animation: none !important; opacity: 1; }
 }
 
 /* ---- Reset --------------------------------------------------------------- */
@@ -429,6 +432,12 @@ body {
   transform-origin: 100px 100px; animation: spin 14s linear infinite reverse; }
 .sb-core { fill: var(--hud); stroke: none; }
 @keyframes spin { to { transform: rotate(360deg); } }
+/* Arming warning sign (hidden unless data-state="arming" swaps it in for the ring). */
+.standby-warn { display: none; width: clamp(120px, 22vw, 220px); height: auto; }
+.standby-warn .sw-tri {
+  fill: none; stroke: var(--hud); stroke-width: 5; stroke-linejoin: round;
+}
+.standby-warn .sw-bang, .standby-warn .sw-dot { fill: var(--hud); }
 .standby-text { text-align: center; display: grid; gap: 6px; }
 .sb-1 { font-family: var(--font-display); font-weight: 700; letter-spacing: 0.3em;
   font-size: clamp(20px, 3vw, 34px); color: var(--hud); text-shadow: 0 0 20px rgba(var(--hud-rgb), 0.4); }

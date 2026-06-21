@@ -30,7 +30,7 @@
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use crate::case::CaseState;
+use crate::case::{CaseState, CaseStatus};
 use crate::config::KioskConfig;
 use crate::ha::RestClient;
 use crate::state::AlarmMode;
@@ -68,16 +68,23 @@ fn desired_target(case: &Option<CaseState>, mode: AlarmMode) -> Target {
 }
 
 /// Whether the kiosk should be PINNED awake (no idle blank/clock) — drives
-/// `keep_awake`. True ONLY during an actual INCIDENT: a `Triggered` alarm or a
-/// live (non-gated) case. Arming/armed/authorised standby deliberately return
-/// false so the kiosks blank normally while merely armed (no 24/7 burn when
-/// armed-away — the user's choice). The kiosk doesn't need pinning before the
-/// alarm fires: the `Triggered` takeover navigate carries `wake: true`, which
-/// WAKES a kiosk that blanked while armed (see `takeover`), and the pin then holds
-/// it on for the duration of the incident.
+/// `keep_awake`. The user's state machine:
+/// - **Arming** → pinned (wake + keep on: the exit/entry countdown is an urgent
+///   call-to-action, not a passive standby).
+/// - **Armed** → NOT pinned (blanks normally; no 24/7 burn when armed-away).
+/// - **Triggered** / a live (non-gated) case → pinned (the alarm HUD can't blank).
+/// - **Standdown** (the post-disarm cleared-case dwell / `Authorised` green) → NOT
+///   pinned: blanking is allowed, but with the idle timer reset to *now* (the pin
+///   flipping off here makes the consumer re-navigate with `wake:true`, which resets
+///   nyx's idle timer — so the blank countdown begins at standdown, not earlier).
+///
+/// The cleared case is EXCLUDED from `active_case` precisely so the pin drops at
+/// standdown (a live case keeps it; the cleared dwell releases it).
 fn alarm_active(case: &Option<CaseState>, mode: AlarmMode) -> bool {
-    let active_case = case.as_ref().is_some_and(|c| !c.gated());
-    active_case || matches!(mode, AlarmMode::Triggered)
+    let live_case = case
+        .as_ref()
+        .is_some_and(|c| !c.gated() && c.status != CaseStatus::Cleared);
+    live_case || matches!(mode, AlarmMode::Triggered | AlarmMode::Arming)
 }
 
 /// Spawned in daemon mode only (and only when `web` is configured + `kiosks` is
@@ -101,13 +108,14 @@ pub async fn run(
     // navigate only when the desired target — or the keep-awake pin — changes.
     let mut current = Target::Dashboard;
     let mut current_force_on = false;
+    let mut prev_mode = AlarmMode::Disarmed;
 
     loop {
         // Recompute + navigate on a change to EITHER channel.
-        let (desired, force_on) = {
+        let (desired, force_on, mode) = {
             let case = case_rx.borrow();
             let mode = *mode_rx.borrow();
-            (desired_target(&case, mode), alarm_active(&case, mode))
+            (desired_target(&case, mode), alarm_active(&case, mode), mode)
         };
         // Re-navigate on a target change OR when the keep-awake pin flips while
         // staying on the HUD. arming→triggered keeps the SAME `/alarm` URL (the
@@ -116,7 +124,17 @@ pub async fn run(
         // woken at arm-time but could blank during the actual alarm.
         let target_changed = desired != current;
         let pin_changed = desired == Target::Hud && force_on != current_force_on;
-        if target_changed || pin_changed {
+        // Entering the NO-INCIDENT all-clear (`Authorised` green, no case): target
+        // and pin may both be unchanged (armed→authorised are both unpinned HUD), so
+        // force a re-navigate to WAKE the kiosk + reset the idle timer (the takeover's
+        // `wake:true`) so the green is shown and the blank countdown restarts at
+        // standdown. (The post-incident standdown is handled by `pin_changed` — the
+        // live→cleared pin drop re-navigates with the same wake.)
+        let entered_authorised = desired == Target::Hud
+            && mode == AlarmMode::Authorised
+            && prev_mode != AlarmMode::Authorised;
+        prev_mode = mode;
+        if target_changed || pin_changed || entered_authorised {
             match desired {
                 // Wake the screen on every alarm-mode takeover so the standby/
                 // alarm pane is visible even on a sleeping/clock kiosk; PIN it
@@ -211,17 +229,22 @@ mod tests {
     }
 
     #[test]
-    fn alarm_active_pins_only_during_an_incident() {
-        // keep_awake fires for a live (non-gated) case or a Triggered alarm...
-        assert!(alarm_active(&case(TriggerProfile::Alarm), AlarmMode::Disarmed));
+    fn alarm_active_pins_for_arming_triggered_and_live_case() {
+        // Pinned: the Arming delay, a Triggered alarm, and a live (non-gated) case.
+        assert!(alarm_active(&None, AlarmMode::Arming));
         assert!(alarm_active(&None, AlarmMode::Triggered));
-        // ...but NOT for arming/armed/authorised standby — the kiosk blanks normally
-        // while merely armed; the Triggered takeover's wake:true wakes it on trigger.
-        assert!(!alarm_active(&None, AlarmMode::Arming));
+        assert!(alarm_active(&case(TriggerProfile::Alarm), AlarmMode::Disarmed));
+        // NOT pinned: steady armed / disarmed standby (the kiosk blanks normally).
         assert!(!alarm_active(&None, AlarmMode::Armed));
-        assert!(!alarm_active(&None, AlarmMode::Authorised));
         assert!(!alarm_active(&None, AlarmMode::Disarmed));
-        // ...nor for a gated (soft) case that hasn't escalated.
+        // NOT pinned: the STANDDOWN dwell — a CLEARED case (the pin must drop here so
+        // the consumer re-navigates with wake:true → idle timer resets to now)...
+        let mut cleared = CaseState::new("c".to_string(), Utc::now(), TriggerProfile::Alarm);
+        cleared.status = CaseStatus::Cleared;
+        assert!(!alarm_active(&Some(cleared), AlarmMode::Disarmed));
+        // ...and the no-incident Authorised green is likewise unpinned (blank allowed).
+        assert!(!alarm_active(&None, AlarmMode::Authorised));
+        // NOT pinned: a gated (soft) case that hasn't escalated.
         assert!(!alarm_active(&case(TriggerProfile::Investigate), AlarmMode::Armed));
     }
 
