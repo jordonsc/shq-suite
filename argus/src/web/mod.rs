@@ -36,7 +36,8 @@ use axum::{
         ws::{Message, WebSocket},
         Path as AxumPath, State, WebSocketUpgrade,
     },
-    http::{header, StatusCode},
+    http::{header, HeaderValue, StatusCode},
+    middleware::map_response,
     response::{IntoResponse, Response},
     routing::get,
     Router,
@@ -64,6 +65,9 @@ struct AppState {
     mode_rx: watch::Receiver<AlarmMode>,
     case_base: Arc<PathBuf>,
     control_tx: mpsc::Sender<ControlCommand>,
+    /// The resolved HUD web dir — read by `index_html` to inject the version into
+    /// the asset URLs (cache-busting).
+    web_dir: Arc<PathBuf>,
 }
 
 /// Spawn the HUD server. Runs until the process exits (or the bind fails, which
@@ -93,22 +97,24 @@ pub async fn serve(
         mode_rx,
         case_base: Arc::new(case_base),
         control_tx,
+        web_dir: Arc::new(dir.clone()),
     };
 
-    // Static assets: ServeDir serves `/` → index.html and every asset under the
-    // web dir (css/js/images). `/alarm` is routed to the same index.html so the
-    // SPA is the deliberate landing page; the kiosk navigates to `<base>/alarm`.
-    // `index.html` missing at runtime just yields a 404 (warned above) — the
-    // frontend agent owns that file.
+    // `/` and `/alarm` are served by `index_html`, which injects the running
+    // version into the asset URLs (`hud.css?v=<ver>`) so a kiosk never serves a
+    // stale cached stylesheet/script after a deploy. Every other path (hud.css,
+    // hud.js, demo.js, fonts) falls through to ServeDir. A `no-store`
+    // Cache-Control is layered onto ALL responses so the kiosk always re-fetches.
     let assets = ServeDir::new(&dir).append_index_html_on_directories(true);
-    let alarm = ServeDir::new(&dir).append_index_html_on_directories(true);
 
     let app = Router::new()
+        .route("/", get(index_html))
+        .route("/alarm", get(index_html))
         .route("/kiosk", get(kiosk_ws))
         .route("/control", get(control_ws))
         .route("/stills/:id", get(still))
-        .nest_service("/alarm", alarm)
         .fallback_service(assets)
+        .layer(map_response(no_store))
         .with_state(state);
 
     let bind = cfg.bind.clone();
@@ -140,6 +146,59 @@ fn resolve_web_dir(dir: &str) -> PathBuf {
         }
     }
     p
+}
+
+/// `GET /` and `GET /alarm` → the HUD SPA. Reads `index.html` and rewrites the
+/// `__ARGUS_VER__` placeholder in the asset URLs (`hud.css?v=…`, `hud.js?v=…`) to
+/// the running version, so a kiosk's Chromium always fetches the current assets
+/// after a deploy instead of a heuristically-cached copy. 404 if `index.html` is
+/// absent (the frontend owns it). `no-store` is added by the router layer.
+async fn index_html(State(state): State<AppState>) -> Response {
+    let dir = state.web_dir.as_ref();
+    let path = dir.join("index.html");
+    match tokio::fs::read_to_string(&path).await {
+        Ok(html) => {
+            let ver = asset_version(dir).await;
+            let html = html.replace("__ARGUS_VER__", &ver);
+            ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response()
+        }
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "index.html unreadable");
+            StatusCode::NOT_FOUND.into_response()
+        }
+    }
+}
+
+/// Cache-bust token for the HUD assets — the NEWEST modification time (unix secs)
+/// among the served files, so `hud.css?v=<ts>` / `hud.js?v=<ts>` changes whenever
+/// any asset is updated: a full deploy OR a frontend-only `web/` rsync (which
+/// bumps the file mtimes even without a version bump or service restart). Falls
+/// back to the build version if no mtime is readable.
+async fn asset_version(dir: &Path) -> String {
+    let mut newest = 0u64;
+    for f in ["hud.css", "hud.js", "index.html"] {
+        if let Ok(meta) = tokio::fs::metadata(dir.join(f)).await {
+            if let Ok(m) = meta.modified() {
+                if let Ok(d) = m.duration_since(std::time::UNIX_EPOCH) {
+                    newest = newest.max(d.as_secs());
+                }
+            }
+        }
+    }
+    if newest > 0 {
+        newest.to_string()
+    } else {
+        version::ARGUS_VERSION.to_string()
+    }
+}
+
+/// Response middleware: mark every HUD response `no-store` so kiosks never serve a
+/// stale cached HUD. The version-stamped asset URLs are the primary cache-bust;
+/// `no-store` is the belt-and-braces so even an unversioned fetch re-validates.
+async fn no_store(mut res: Response) -> Response {
+    res.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    res
 }
 
 /// `GET /kiosk` → WebSocket. Push the HUD frame on connect, then on every change

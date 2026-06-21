@@ -97,7 +97,15 @@ pub async fn run(
     rest: RestClient,
     public_base: String,
 ) {
-    let alarm_url = format!("{}/alarm", public_base.trim_end_matches('/'));
+    // Version-stamp the navigate URL so a kiosk re-fetches the HUD document after a
+    // deploy instead of serving a heuristically-cached copy (the server also
+    // version-stamps the asset URLs + sends no-store; this busts the document URL
+    // itself, which Chrome would otherwise reuse from cache on a same-URL navigate).
+    let alarm_url = format!(
+        "{}/alarm?v={}",
+        public_base.trim_end_matches('/'),
+        crate::version::ARGUS_VERSION
+    );
     info!(
         kiosks = kiosks.len(),
         alarm_url = %alarm_url,

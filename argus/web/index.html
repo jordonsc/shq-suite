@@ -14,7 +14,9 @@
     href="https://fonts.googleapis.com/css2?family=Saira+Condensed:wght@500;600;700&family=Share+Tech+Mono&display=swap"
     rel="stylesheet" />
 
-  <link rel="stylesheet" href="hud.css" />
+  <!-- ?v=__ARGUS_VER__ is rewritten to the running Argus version at serve time
+       (src/web/mod.rs) so a kiosk never serves a stale cached stylesheet/script. -->
+  <link rel="stylesheet" href="hud.css?v=__ARGUS_VER__" />
 </head>
 <body>
   <!-- =========================================================
@@ -161,12 +163,12 @@
     </div>
   </main>
 
-  <script src="hud.js"></script>
+  <script src="hud.js?v=__ARGUS_VER__"></script>
   <script>
     // Demo harness loads only on ?demo=1 — keeps the prod path clean.
     if (new URLSearchParams(location.search).has('demo')) {
       const s = document.createElement('script');
-      s.src = 'demo.js';
+      s.src = 'demo.js?v=__ARGUS_VER__';
       document.body.appendChild(s);
     }
   </script>
