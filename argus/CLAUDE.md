@@ -15,7 +15,7 @@ build --release` + systemd, **not** a `cross`/Podman RPi build like nyx/overwatc
 > scores**, and **all prompts externalised to `prompts.yaml`**) is captured in
 > [`specs/argus/08-post-test-hardening.md`](../specs/argus/08-post-test-hardening.md)
 > and ledger `shq-suite-0002`; the per-feature detail is in the **Gotchas** below.
-> All work is on branch `argus-design-specs` (not yet merged to `main`). The history
+> Merged to `main` (2026-06-21, v0.36.0); developed on `argus-design-specs`. The history
 > that led here:
 >
 > **Phase status:** Phases 1 (foundation), 2 (assessment loop + `CaseState`), 2a

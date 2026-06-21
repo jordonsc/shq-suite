@@ -3,7 +3,8 @@
 > **Status: ✅ DONE + LIVE-FIRE VALIDATED (2026-06-21, argus 0.36.0).** The original
 > Phase-8 defects #1–#6 were implemented at 0.34.0; the work then **evolved through a
 > series of user live-fire walk-throughs** (full arm → trigger → assess → disarm, with
-> Overwatch voice + klaxon and PagerDuty live) to **0.36.0**, all on `argus-design-specs`.
+> Overwatch voice + klaxon and PagerDuty live) to **0.36.0**, developed on
+> `argus-design-specs` and **merged to `main`** (2026-06-21).
 > Confirmed working end-to-end against the real alarm: non-blank priority MAIN image,
 > Opus ID + mugshots + zone-movement, casualty/injury escalation, fast disarm→AUTHORISED,
 > the arming warning sign, the box-vs-knife weapon model, and the silent Investigate

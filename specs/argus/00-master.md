@@ -146,7 +146,7 @@ plus the Phase-8 post-live-test hardening are done and repeatedly validated agai
 full arm → trigger → assess → disarm walk-throughs, including box-vs-knife weapon
 detection, casualty/injury escalation, and silent Investigate on real deliveries.
 argus is **containerised on atlas** (rootless Podman + systemd Quadlet, ledger
-`shq-suite-0004`), all on branch `argus-design-specs` (not yet merged to `main`).
+`shq-suite-0004`); **merged to `main`** 2026-06-21 (developed on `argus-design-specs`).
 **[`08-post-test-hardening.md`](./08-post-test-hardening.md) is the current-state record
 — read it first**; the per-feature detail is in `argus/CLAUDE.md` § Gotchas and ledger
 `shq-suite-0002`. The earlier hardening log ([`06-refinements.md`](./06-refinements.md))
