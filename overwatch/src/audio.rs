@@ -1,8 +1,9 @@
+use rodio::buffer::SamplesBuffer;
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
@@ -17,10 +18,10 @@ pub enum AudioCommand {
         data: Vec<u8>,
         volume: f32,
         /// If true, block the audio thread until the clip finishes playing
-        /// (`sink.sleep_until_end()`) so the oneshot — and thus the RPC — only
-        /// returns after playback. Tradeoff: a blocking clip defers other audio
-        /// commands (e.g. StopAlarm) on the single audio thread by up to the clip
-        /// length; the looping klaxon sink keeps sounding meanwhile.
+        /// (bounded poll on `sink.empty()`) so the oneshot — and thus the RPC —
+        /// only returns after playback. Tradeoff: a blocking clip defers other
+        /// audio commands (e.g. StopAlarm) on the single audio thread by up to the
+        /// clip length; the looping klaxon sink keeps sounding meanwhile.
         blocking: bool,
         response: oneshot::Sender<anyhow::Result<()>>,
     },
@@ -52,8 +53,13 @@ pub struct AudioManager {
 }
 
 struct AudioManagerInner {
-    _stream: OutputStream,
-    stream_handle: OutputStreamHandle,
+    /// The active rodio output stream and its handle. `None` when no working audio
+    /// device is currently held — e.g. the USB DAC was unplugged/powered off, or
+    /// none was available at startup. `ensure_stream()` (re)opens it on demand, so
+    /// the daemon self-heals when the amp/DAC is powered back on. They are always
+    /// set/cleared together; `stream` must be kept alive for `stream_handle` to play.
+    stream: Option<OutputStream>,
+    stream_handle: Option<OutputStreamHandle>,
     active_alarms: HashMap<String, AlarmState>,
 }
 
@@ -68,16 +74,10 @@ impl AudioManager {
     pub fn new() -> anyhow::Result<Self> {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
 
-        // Spawn dedicated audio thread
+        // Spawn dedicated audio thread. The thread stays alive even if no audio
+        // device is available at startup — it heals on demand via ensure_stream().
         std::thread::spawn(move || {
-            let mut inner = match AudioManagerInner::new() {
-                Ok(inner) => inner,
-                Err(e) => {
-                    tracing::error!("Failed to initialize audio: {}", e);
-                    return;
-                }
-            };
-
+            let mut inner = AudioManagerInner::new();
             inner.run(command_rx);
         });
 
@@ -97,8 +97,8 @@ impl AudioManager {
     }
 
     /// Play raw decoded audio bytes. When `blocking` is true the call resolves only
-    /// after playback finishes (the audio thread holds on `sink.sleep_until_end()`);
-    /// when false it detaches the sink and returns immediately (fire-and-forget).
+    /// after playback finishes (the audio thread holds on a bounded `sink.empty()`
+    /// poll); when false it detaches the sink and returns immediately (fire-and-forget).
     pub async fn play_bytes(&self, data: Vec<u8>, volume: f32, blocking: bool) -> anyhow::Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
@@ -164,14 +164,124 @@ impl AudioManager {
     }
 }
 
+/// Build a looping (infinite) alarm sink on the given output handle. Shared by the
+/// initial StartAlarm and by alarm resumption after the stream is reopened.
+fn make_alarm_sink(handle: &OutputStreamHandle, path: &Path, volume: f32) -> anyhow::Result<Sink> {
+    let file = File::open(path)?;
+    let source = Decoder::new(BufReader::new(file))?.repeat_infinite();
+    let sink = Sink::try_new(handle)?;
+    sink.set_volume(volume);
+    sink.append(source);
+    Ok(sink)
+}
+
 impl AudioManagerInner {
-    fn new() -> anyhow::Result<Self> {
-        let (stream, stream_handle) = OutputStream::try_default()?;
-        Ok(Self {
-            _stream: stream,
-            stream_handle,
+    fn new() -> Self {
+        let mut inner = Self {
+            stream: None,
+            stream_handle: None,
             active_alarms: HashMap::new(),
-        })
+        };
+        // Try to open the output now, but don't fail the thread if the device is
+        // absent (e.g. amp powered off at boot) — ensure_stream() retries on demand.
+        if let Err(e) = inner.open_stream() {
+            tracing::warn!("Audio output unavailable at startup ({}); will open on demand", e);
+        }
+        inner
+    }
+
+    /// (Re)open the default output stream, dropping any existing one first so the
+    /// device handle is released before reacquiring it. The ALSA `default` is pinned
+    /// to the USB DAC via `/etc/asound.conf`, so this reacquires card 2 once it has
+    /// re-enumerated.
+    fn open_stream(&mut self) -> anyhow::Result<()> {
+        self.stream = None;
+        self.stream_handle = None;
+        let (stream, handle) = OutputStream::try_default()?;
+        self.stream = Some(stream);
+        self.stream_handle = Some(handle);
+        tracing::info!("Audio output stream opened");
+        Ok(())
+    }
+
+    /// End-to-end liveness check: append a brief silent buffer to a throwaway sink
+    /// and confirm it drains. A live device's cpal callback pulls it within tens of
+    /// milliseconds; a removed/stalled device (e.g. amp powered off after the stream
+    /// was opened) never pulls, so the sink stays full and we report dead. This is
+    /// the only reliable signal — rodio/cpal silently swallow device removal, so
+    /// `Sink::try_new` and decode keep succeeding into a dead stream.
+    fn probe_alive(&self) -> bool {
+        let handle = match self.stream_handle.as_ref() {
+            Some(h) => h,
+            None => return false,
+        };
+        let sink = match Sink::try_new(handle) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        // ~20 ms of mono silence at 44.1 kHz — inaudible, no click.
+        sink.append(SamplesBuffer::new(1, 44100, vec![0.0f32; 882]));
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while !sink.empty() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        true
+    }
+
+    /// Guarantee a healthy output stream before playback. Fast path: stream present
+    /// and probe passes → return. Otherwise (re)open the device, re-probe, and on
+    /// success resume any active alarms onto the fresh handle. Returns an error when
+    /// the device is genuinely unavailable, so the playback RPC fails cleanly instead
+    /// of silently dropping audio into the void.
+    fn ensure_stream(&mut self) -> anyhow::Result<()> {
+        if self.stream_handle.is_some() && self.probe_alive() {
+            return Ok(());
+        }
+
+        tracing::info!("Audio output not healthy; reopening stream");
+        self.open_stream()?;
+        if !self.probe_alive() {
+            // Opened but not draining — device not actually ready (e.g. ALSA default
+            // resolved but the USB DAC is still absent). Clear so we retry next time.
+            self.stream = None;
+            self.stream_handle = None;
+            anyhow::bail!("audio output not draining after reopen (device unavailable)");
+        }
+        self.resume_alarms();
+        Ok(())
+    }
+
+    /// Recreate every active alarm sink on the current (freshly opened) handle. The
+    /// old sinks were bound to the dropped stream and are silent; this re-arms them.
+    fn resume_alarms(&mut self) {
+        if self.active_alarms.is_empty() {
+            return;
+        }
+        let handle = match self.stream_handle.clone() {
+            Some(h) => h,
+            None => return,
+        };
+        let ids: Vec<String> = self.active_alarms.keys().cloned().collect();
+        for id in ids {
+            let (path, volume) = match self.active_alarms.get(&id) {
+                Some(s) => (s.path.clone(), s.volume),
+                None => continue,
+            };
+            match make_alarm_sink(&handle, &path, volume) {
+                Ok(sink) => {
+                    if let Some(state) = self.active_alarms.get_mut(&id) {
+                        state.sink.stop();
+                        state.sink = sink;
+                        state.started_at = Instant::now();
+                    }
+                    tracing::info!("Resumed alarm '{}' on reopened audio stream", id);
+                }
+                Err(e) => tracing::error!("Failed to resume alarm '{}': {}", id, e),
+            }
+        }
     }
 
     fn run(&mut self, mut command_rx: mpsc::UnboundedReceiver<AudioCommand>) {
@@ -221,8 +331,17 @@ impl AudioManagerInner {
                     }
                 }
                 Err(mpsc::error::TryRecvError::Empty) => {
-                    // No command available, check if we need to do cleanup
-                    if last_cleanup.elapsed() >= Duration::from_secs(10) {
+                    // No command available; periodically maintain state.
+                    if last_cleanup.elapsed() >= Duration::from_secs(3) {
+                        // If an alarm is sounding, proactively heal the stream so a
+                        // blaring klaxon resumes within seconds of the amp/DAC being
+                        // powered back on, without waiting for the next RPC. When
+                        // idle we skip the probe — the next playback heals on demand.
+                        if !self.active_alarms.is_empty() {
+                            if let Err(e) = self.ensure_stream() {
+                                tracing::debug!("Audio still unavailable while alarm active: {}", e);
+                            }
+                        }
                         self.cleanup_dead_alarms();
                         last_cleanup = Instant::now();
                     }
@@ -237,20 +356,24 @@ impl AudioManagerInner {
         }
     }
 
-    fn play_file_inner(&self, path: &PathBuf, volume: f32) -> anyhow::Result<()> {
+    fn play_file_inner(&mut self, path: &PathBuf, volume: f32) -> anyhow::Result<()> {
+        self.ensure_stream()?;
+        let handle = self.stream_handle.as_ref().unwrap();
         let file = File::open(path)?;
         let source = Decoder::new(BufReader::new(file))?;
-        let sink = Sink::try_new(&self.stream_handle)?;
+        let sink = Sink::try_new(handle)?;
         sink.set_volume(volume);
         sink.append(source);
         sink.detach();
         Ok(())
     }
 
-    fn play_bytes_inner(&self, data: Vec<u8>, volume: f32) -> anyhow::Result<()> {
+    fn play_bytes_inner(&mut self, data: Vec<u8>, volume: f32) -> anyhow::Result<()> {
+        self.ensure_stream()?;
+        let handle = self.stream_handle.as_ref().unwrap();
         let cursor = std::io::Cursor::new(data);
         let source = Decoder::new(cursor)?;
-        let sink = Sink::try_new(&self.stream_handle)?;
+        let sink = Sink::try_new(handle)?;
         sink.set_volume(volume);
         sink.append(source);
         sink.detach();
@@ -258,28 +381,37 @@ impl AudioManagerInner {
     }
 
     /// Identical to `play_bytes_inner` but blocks the audio thread until the clip
-    /// finishes (`sink.sleep_until_end()` instead of `sink.detach()`), so the
-    /// caller's oneshot — and thus the RPC — returns only after playback completes.
-    /// Note: this defers any other audio command (e.g. StopAlarm) on the single
-    /// audio thread by up to the clip length; the looping klaxon sink keeps
-    /// sounding meanwhile.
-    fn play_bytes_blocking_inner(&self, data: Vec<u8>, volume: f32) -> anyhow::Result<()> {
+    /// finishes, so the caller's oneshot — and thus the RPC — returns only after
+    /// playback completes. Uses a bounded poll on `sink.empty()` rather than
+    /// `sink.sleep_until_end()`: if the device stalls or vanishes mid-clip the cpal
+    /// callback stops draining and `sleep_until_end()` would block the audio thread
+    /// forever (wedging all subsequent commands). The 120 s cap sits well above any
+    /// real clip length. Note: this still defers other audio commands (e.g.
+    /// StopAlarm) by up to the clip length; the looping klaxon sink keeps sounding.
+    fn play_bytes_blocking_inner(&mut self, data: Vec<u8>, volume: f32) -> anyhow::Result<()> {
+        self.ensure_stream()?;
+        let handle = self.stream_handle.as_ref().unwrap();
         let cursor = std::io::Cursor::new(data);
         let source = Decoder::new(cursor)?;
-        let sink = Sink::try_new(&self.stream_handle)?;
+        let sink = Sink::try_new(handle)?;
         sink.set_volume(volume);
         sink.append(source);
-        sink.sleep_until_end();
+
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !sink.empty() {
+            if Instant::now() >= deadline {
+                tracing::warn!("Blocking playback exceeded 120s cap; abandoning (audio device stalled?)");
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         Ok(())
     }
 
     fn start_alarm_inner(&mut self, alarm_id: String, path: &PathBuf, volume: f32) -> anyhow::Result<()> {
-        let file = File::open(path)?;
-        let source = Decoder::new(BufReader::new(file))?.repeat_infinite();
-
-        let sink = Sink::try_new(&self.stream_handle)?;
-        sink.set_volume(volume);
-        sink.append(source);
+        self.ensure_stream()?;
+        let handle = self.stream_handle.as_ref().unwrap().clone();
+        let sink = make_alarm_sink(&handle, path, volume)?;
 
         // Stop existing alarm with same ID if present
         if let Some(old_state) = self.active_alarms.remove(&alarm_id) {
