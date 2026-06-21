@@ -210,20 +210,12 @@ body {
   0%, 100% { opacity: 0.15; }
   50%      { opacity: 1; }
 }
-/* the headline throbs harder at life-threat — opacity + scale + heavy glow. */
-[data-threat="life_threatening"] .headline {
-  animation: headlinePulse 0.85s ease-in-out infinite;
-  transform-origin: left center;
-  will-change: opacity, text-shadow, transform;
-}
-@keyframes headlinePulse {
-  0%, 100% { opacity: 0.7; transform: scale(1);    text-shadow: 0 0 26px rgba(var(--hud-rgb), 0.5); }
-  50%      { opacity: 1;   transform: scale(1.06); text-shadow: 0 0 60px rgba(var(--hud-rgb), 1); }
-}
+/* NOTE: the headline ("ALARM MODE") text is deliberately NOT animated at
+   life-threat — a scaling/opacity throb on the text reflowed + broke the layout.
+   The urgency cue is carried by the pulsing border + full-frame vignette instead. */
 @media (prefers-reduced-motion: reduce) {
   [data-threat="life_threatening"] .pulse-border,
-  [data-threat="life_threatening"] .hud::after,
-  [data-threat="life_threatening"] .headline { animation: none !important; }
+  [data-threat="life_threatening"] .hud::after { animation: none !important; }
 }
 
 /* =============================================================================

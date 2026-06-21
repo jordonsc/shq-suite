@@ -93,7 +93,7 @@ dependencies = [
 
 [[package]]
 name = "argus"
-version = "0.34.2"
+version = "0.34.3"
 dependencies = [
  "anyhow",
  "aws-sdk-s3",

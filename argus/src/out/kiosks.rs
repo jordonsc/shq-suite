@@ -18,11 +18,12 @@
 //! ## nyx wake/keep-awake (Phase 5 — resolved)
 //! Every alarm-mode takeover navigate carries `wake: true` so nyx wakes the
 //! backlight + kills any Chronos clock overlay (`idle_mode: clock`) BEFORE the
-//! CDP navigate — the pane is visible even on a sleeping/clock kiosk. While the
-//! alarm is actively sounding/assessing (`Triggered` or a live case) it also
-//! carries `keep_awake: true` to PIN the screen on so the takeover HUD can't
-//! blank; arming/armed/authorised standby and the return to the dashboard send
-//! `keep_awake: false` so the kiosk may blank normally. Requires nyx >= 1.2.0 +
+//! CDP navigate — the pane is visible even on a sleeping/clock kiosk. During the
+//! `Arming` delay, a `Triggered` alarm, or a live case it also carries
+//! `keep_awake: true` to PIN the screen on so the takeover HUD can't blank; STEADY
+//! `armed`/authorised standby and the return to the dashboard send
+//! `keep_awake: false` so the kiosk may blank normally while merely armed (no 24/7
+//! burn when armed-away — the user's choice). Requires nyx >= 1.2.0 +
 //! shq_display component >= 1.2.0; older nyx ignores the unknown fields (the
 //! pre-Phase-5 navigate-only behaviour). See ledger shq-suite-0002.
 
@@ -66,14 +67,18 @@ fn desired_target(case: &Option<CaseState>, mode: AlarmMode) -> Target {
     }
 }
 
-/// Whether an alarm is ACTIVELY sounding/assessing — drives the `keep_awake` pin
-/// so the screen is FORCED on (no idle blank) for the duration. True when the
-/// mode is `Triggered` OR a live (non-gated) case is in progress. Arming/armed/
-/// authorised standby panes deliberately return false: the kiosk may blank
-/// normally while merely armed.
+/// Whether the kiosk should be PINNED awake (no idle blank/clock) — drives
+/// `keep_awake`. True during the ARMING delay, a TRIGGERED alarm, or a live
+/// (non-gated) case. **Steady `Armed` deliberately returns false** so an
+/// armed-away house doesn't keep all the kiosks lit 24/7 (the panels blank
+/// normally while merely armed) — the user's choice. The transient arming delay
+/// IS pinned so the exit/entry countdown is visible, and an actual trigger
+/// re-pins (with `wake:true`, so a kiosk that blanked while armed is woken).
+/// `Authorised` (the post-disarm green) is covered by the cleared case still
+/// being present during its dwell, not by the mode here.
 fn alarm_active(case: &Option<CaseState>, mode: AlarmMode) -> bool {
     let active_case = case.as_ref().is_some_and(|c| !c.gated());
-    active_case || matches!(mode, AlarmMode::Triggered)
+    active_case || matches!(mode, AlarmMode::Triggered | AlarmMode::Arming)
 }
 
 /// Spawned in daemon mode only (and only when `web` is configured + `kiosks` is
@@ -207,12 +212,13 @@ mod tests {
     }
 
     #[test]
-    fn alarm_active_pins_only_while_actually_alarming() {
-        // keep_awake fires for a live (non-gated) case or Triggered...
+    fn alarm_active_pins_during_arming_and_incidents_not_steady_armed() {
+        // keep_awake fires for a live (non-gated) case, Triggered, or the ARMING delay...
         assert!(alarm_active(&case(TriggerProfile::Alarm), AlarmMode::Disarmed));
         assert!(alarm_active(&None, AlarmMode::Triggered));
-        // ...but NOT for arming/armed/authorised standby (the screen may blank)...
-        assert!(!alarm_active(&None, AlarmMode::Arming));
+        assert!(alarm_active(&None, AlarmMode::Arming));
+        // ...but NOT for steady armed / authorised standby (the screen may blank to
+        // save the panels while merely armed — the user's choice)...
         assert!(!alarm_active(&None, AlarmMode::Armed));
         assert!(!alarm_active(&None, AlarmMode::Authorised));
         assert!(!alarm_active(&None, AlarmMode::Disarmed));
