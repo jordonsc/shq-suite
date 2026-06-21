@@ -1,0 +1,361 @@
+//! Phase 3 — PagerDuty Events v2 security-station dispatch.
+//!
+//! Posts a dossier to PagerDuty (`POST https://events.pagerduty.com/v2/enqueue`)
+//! keyed on a STABLE config `dedup_key` (default `"argus-shq-alarm"`, NOT the
+//! per-case `case_id`) — one alarm incident at a time, so HA can resolve the same
+//! incident itself (same key) even if Argus is down:
+//! - **`trigger`** on case open, and re-sent (same dedup_key) on a *material
+//!   change* (new intruder, `intruder_identified`, threat escalation) so the
+//!   open incident always reflects the latest dossier.
+//! - **`acknowledge`** (same dedup_key) when an operator acknowledges via the
+//!   Phase-5 control WS — moves the open incident to ACKNOWLEDGED without closing it.
+//! - **`resolve`** (same dedup_key) on standdown / cleared.
+//!
+//! `payload.severity` derives from [`ThreatLevel::pagerduty_severity`];
+//! `payload.summary` is `CaseState.summary`; `custom_details` carries the
+//! threat level, intruders (descriptors/confidence/dossier), the recent timeline,
+//! and the deterministic S3 case prefix `s3://<bucket>/<prefix>/<case_id>/` when
+//! offsite is configured (per the 02a "Inputs to Phase 3" — atlas holds
+//! write-only creds, so we embed the BARE prefix, never a presigned URL).
+//!
+//! The body builder ([`build_event`]) is split from the sender ([`PagerDuty::send`])
+//! so the request **shape** can be unit/shape-tested without any network call —
+//! which is all this phase does (live-fire is deferred).
+//!
+//! **Resilience contract:** `send` logs and returns on any error — never panics,
+//! never blocks the voice channel. The routing key is NEVER logged.
+
+use serde::Serialize;
+use serde_json::{json, Value};
+use tracing::{info, warn};
+
+use crate::case::CaseState;
+use crate::config::OffsiteConfig;
+
+const ENQUEUE_URL: &str = "https://events.pagerduty.com/v2/enqueue";
+
+/// PagerDuty Events v2 `event_action`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    Trigger,
+    Acknowledge,
+    Resolve,
+}
+
+impl Action {
+    fn as_str(self) -> &'static str {
+        match self {
+            Action::Trigger => "trigger",
+            Action::Acknowledge => "acknowledge",
+            Action::Resolve => "resolve",
+        }
+    }
+}
+
+/// The Events v2 enqueue body. Serialises to the exact JSON PagerDuty expects.
+/// `routing_key` is `#[serde(skip)]`-free (the API requires it) but this struct
+/// is only ever logged via its non-secret fields — see [`PagerDuty::send`].
+#[derive(Debug, Clone, Serialize)]
+pub struct EventBody {
+    pub routing_key: String,
+    pub event_action: &'static str,
+    pub dedup_key: String,
+    /// Only present on `trigger` (PagerDuty ignores `payload` on `acknowledge`/
+    /// `resolve`, but omitting it keeps those bodies minimal and unambiguous).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Payload>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Payload {
+    pub summary: String,
+    pub source: String,
+    pub severity: &'static str,
+    pub custom_details: Value,
+}
+
+/// The PagerDuty sink. Holds the routing key + source + STABLE dedup key; reused
+/// across cases (one alarm incident at a time on a fixed `dedup_key`).
+#[derive(Clone)]
+pub struct PagerDuty {
+    routing_key: String,
+    source: String,
+    /// STABLE Events v2 dedup key (config `pagerduty.dedup_key`, default
+    /// `"argus-shq-alarm"`) — NOT the per-case `case_id`. Every trigger/update/
+    /// acknowledge/resolve for the active alarm shares it, so HA can resolve the
+    /// same incident itself (same key) even if Argus is down (the kill-switch
+    /// rationale).
+    dedup_key: String,
+    http: reqwest::Client,
+}
+
+impl PagerDuty {
+    /// Construct from config. An empty `routing_key` means the caller should not
+    /// have spawned this at all — but [`PagerDuty::send`] also guards against it
+    /// defensively (logs + no-op) so a misconfiguration can never page blindly.
+    pub fn new(routing_key: String, source: String, dedup_key: String) -> Self {
+        Self {
+            routing_key,
+            source,
+            dedup_key,
+            http: reqwest::Client::new(),
+        }
+    }
+
+    /// BUILD the Events v2 body for `state` + `action`. PURE — no network. This is
+    /// the shape-test surface. `offsite`, when `enabled`, contributes the bare S3
+    /// case prefix to `custom_details`.
+    pub fn build_event(
+        &self,
+        state: &CaseState,
+        action: Action,
+        offsite: Option<&OffsiteConfig>,
+    ) -> EventBody {
+        let payload = match action {
+            Action::Trigger => Some(Payload {
+                summary: state.summary.clone(),
+                source: self.source.clone(),
+                severity: state.threat_level.pagerduty_severity(),
+                custom_details: custom_details(state, offsite),
+            }),
+            // acknowledge/resolve: dedup_key alone moves the incident (ack) or
+            // closes it (resolve). PagerDuty ignores `payload` on both.
+            Action::Acknowledge | Action::Resolve => None,
+        };
+        EventBody {
+            routing_key: self.routing_key.clone(),
+            event_action: action.as_str(),
+            // STABLE key (config), NOT `state.case_id` — every trigger/update/ack/
+            // resolve for the active alarm shares it, so HA can resolve the same
+            // incident even if Argus is down.
+            dedup_key: self.dedup_key.clone(),
+            payload,
+        }
+    }
+
+    /// SEND a pre-built body to PagerDuty. Logs + returns on any failure; never
+    /// panics. Never logs the routing key.
+    pub async fn send(&self, body: &EventBody) {
+        if self.routing_key.trim().is_empty() {
+            warn!("pagerduty: routing_key empty; skipping {} send", body.event_action);
+            return;
+        }
+        match self.http.post(ENQUEUE_URL).json(body).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    info!(
+                        action = body.event_action,
+                        dedup_key = %body.dedup_key,
+                        "pagerduty: {} accepted ({})",
+                        body.event_action,
+                        status
+                    );
+                } else {
+                    let text = resp.text().await.unwrap_or_default();
+                    warn!(
+                        action = body.event_action,
+                        dedup_key = %body.dedup_key,
+                        "pagerduty: {} rejected: {} {}",
+                        body.event_action,
+                        status,
+                        text
+                    );
+                }
+            }
+            Err(e) => warn!(
+                action = body.event_action,
+                dedup_key = %body.dedup_key,
+                "pagerduty: {} send failed: {e}",
+                body.event_action
+            ),
+        }
+    }
+
+    /// Convenience: build + send a `trigger` for the current state.
+    pub async fn trigger(&self, state: &CaseState, offsite: Option<&OffsiteConfig>) {
+        let body = self.build_event(state, Action::Trigger, offsite);
+        self.send(&body).await;
+    }
+
+    /// Convenience: build + send an `acknowledge` for the case (operator ack via
+    /// the control WS). Same minimal shape as `resolve` — routing_key + dedup_key,
+    /// no payload — it just moves the open incident to ACKNOWLEDGED.
+    pub async fn acknowledge(&self, state: &CaseState) {
+        let body = self.build_event(state, Action::Acknowledge, None);
+        self.send(&body).await;
+    }
+
+    /// Convenience: build + send a `resolve` for the case.
+    pub async fn resolve(&self, state: &CaseState) {
+        let body = self.build_event(state, Action::Resolve, None);
+        self.send(&body).await;
+    }
+}
+
+/// Build the `custom_details` dossier object for a trigger.
+fn custom_details(state: &CaseState, offsite: Option<&OffsiteConfig>) -> Value {
+    let persons: Vec<Value> = state
+        .persons
+        .iter()
+        .map(|p| {
+            json!({
+                "id": p.id,
+                "descriptors": p.descriptors,
+                "resident_confidence": p.resident_confidence,
+                "guest_confidence": p.guest_confidence,
+                "intruder_confidence": p.intruder_confidence,
+                "subject_of_concern": p.is_subject_of_concern(),
+                "identified": p.identified,
+                "armed": p.armed,
+                "weapon": p.weapon,
+                "injury": p.injury,
+                "in_duress": p.in_duress,
+                "location": p.location,
+                "activity": p.activity,
+                "dossier": p.dossier,
+            })
+        })
+        .collect();
+
+    // Most recent timeline events (closed-vocabulary milestones), newest last.
+    let timeline: Vec<Value> = state
+        .timeline
+        .iter()
+        .rev()
+        .take(10)
+        .rev()
+        .map(|e| {
+            json!({
+                "at": e.at,
+                "kind": e.kind,      // snake_case via serde on TimelineKind
+                "detail": e.detail,
+            })
+        })
+        .collect();
+
+    let mut details = json!({
+        "case_id": state.case_id,
+        "threat_level": state.threat_level,   // snake_case via serde
+        "status": state.status,
+        "started_at": state.started_at,
+        "updated_at": state.updated_at,
+        "persons": persons,
+        "threats": state.threats,
+        "malicious_activity": state.malicious_activity,
+        "timeline": timeline,
+    });
+
+    // Embed the deterministic S3 case prefix IF offsite is configured. Per 02a:
+    // atlas has write-only creds, so this is the BARE prefix, not a presigned URL.
+    if let Some(o) = offsite {
+        if o.enabled && !o.bucket.trim().is_empty() {
+            let prefix = o.prefix.trim_matches('/');
+            let s3 = format!("s3://{}/{}/{}/", o.bucket, prefix, state.case_id);
+            details["evidence_s3_prefix"] = Value::String(s3);
+        }
+    }
+
+    details
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::case::{CaseState, TriggerProfile};
+    use chrono::Utc;
+
+    /// A fixed STABLE dedup key for the tests (distinct from any `case_id`, so a
+    /// test that asserts the body's `dedup_key` proves the per-case id is NOT used).
+    const TEST_DEDUP: &str = "argus-shq-alarm";
+
+    fn case() -> CaseState {
+        let mut s = CaseState::new(
+            "case-20260618T120000Z".to_string(),
+            Utc::now(),
+            TriggerProfile::Alarm,
+        );
+        s.summary = "Person at the garage side door, forcing entry.".to_string();
+        s
+    }
+
+    fn pd() -> PagerDuty {
+        PagerDuty::new(
+            "ROUTING_KEY_PLACEHOLDER".to_string(),
+            "argus@atlas".to_string(),
+            TEST_DEDUP.to_string(),
+        )
+    }
+
+    #[test]
+    fn trigger_body_shape() {
+        let pd = pd();
+        let body = pd.build_event(&case(), Action::Trigger, None);
+        assert_eq!(body.event_action, "trigger");
+        // STABLE dedup key (config), NOT the case_id — even though the case_id is
+        // "case-20260618T120000Z", the body keys on the fixed alarm key.
+        assert_eq!(body.dedup_key, TEST_DEDUP);
+        assert_ne!(body.dedup_key, case().case_id, "must NOT use the case_id");
+        let p = body.payload.as_ref().expect("trigger has payload");
+        assert_eq!(p.source, "argus@atlas");
+        // Default ThreatLevel for a new case is Elevated → "warning".
+        assert_eq!(p.severity, "warning");
+        // Serialises cleanly to the Events v2 shape.
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["event_action"], "trigger");
+        assert_eq!(v["dedup_key"], TEST_DEDUP);
+        assert!(v["payload"]["custom_details"]["timeline"].is_array());
+    }
+
+    /// The whole alarm lifecycle (trigger → acknowledge → resolve) shares ONE
+    /// stable dedup key, so PagerDuty (and HA, if Argus is down) move/close the
+    /// SAME incident.
+    #[test]
+    fn lifecycle_shares_stable_dedup_key() {
+        let pd = pd();
+        let c = case();
+        for action in [Action::Trigger, Action::Acknowledge, Action::Resolve] {
+            let body = pd.build_event(&c, action, None);
+            assert_eq!(body.dedup_key, TEST_DEDUP, "{action:?} must use the stable key");
+            assert_ne!(body.dedup_key, c.case_id, "{action:?} must NOT use the case_id");
+        }
+    }
+
+    #[test]
+    fn trigger_embeds_s3_prefix_when_offsite_enabled() {
+        let pd = pd();
+        let mut off = OffsiteConfig::default();
+        off.enabled = true;
+        off.bucket = "shq-argus-cases".to_string();
+        off.prefix = "cases".to_string();
+        let body = pd.build_event(&case(), Action::Trigger, Some(&off));
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            v["payload"]["custom_details"]["evidence_s3_prefix"],
+            "s3://shq-argus-cases/cases/case-20260618T120000Z/"
+        );
+    }
+
+    #[test]
+    fn acknowledge_body_has_no_payload() {
+        let pd = pd();
+        let body = pd.build_event(&case(), Action::Acknowledge, None);
+        assert_eq!(body.event_action, "acknowledge");
+        // Same stable dedup_key as trigger/resolve → moves the SAME incident.
+        assert_eq!(body.dedup_key, TEST_DEDUP);
+        assert!(body.payload.is_none());
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["event_action"], "acknowledge");
+        assert!(v.get("payload").is_none(), "acknowledge omits payload");
+    }
+
+    #[test]
+    fn resolve_body_has_no_payload() {
+        let pd = pd();
+        let body = pd.build_event(&case(), Action::Resolve, None);
+        assert_eq!(body.event_action, "resolve");
+        assert!(body.payload.is_none());
+        let v = serde_json::to_value(&body).unwrap();
+        assert!(v.get("payload").is_none(), "resolve omits payload");
+    }
+}

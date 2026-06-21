@@ -1,0 +1,25 @@
+# Argus systemd *user* service (runs as the shq user on atlas, like nyx/overwatch).
+# Install: copy to ~/.config/systemd/user/argus.service, then:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now argus
+#
+# Secrets are sourced from the EnvironmentFile below (gitignored), NOT config.yaml:
+#   ~/.config/argus/argus.env
+#     HA_TOKEN=...
+#     ANTHROPIC_API_KEY=...
+
+[Unit]
+Description=Argus AI alarm assessment daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/argus/argus.env
+Environment=RUST_LOG=argus=info
+ExecStart=%h/.local/bin/argus
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

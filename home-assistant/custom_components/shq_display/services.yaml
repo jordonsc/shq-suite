@@ -14,3 +14,21 @@ navigate:
       required: true
       selector:
         text:
+    wake:
+      name: Wake
+      description: >-
+        Wake the display (restore brightness + dismiss the clock overlay) before
+        navigating, so the page is visible on a sleeping or clock-mode kiosk.
+        Requires nyx >= 1.2.0; older kiosks ignore it.
+      required: false
+      selector:
+        boolean:
+    keep_awake:
+      name: Keep awake
+      description: >-
+        Pin the display awake (true) so the idle loop won't dim or blank it, or
+        release the pin (false) to let normal idle behaviour resume. Requires
+        nyx >= 1.2.0; older kiosks ignore it.
+      required: false
+      selector:
+        boolean:

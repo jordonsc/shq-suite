@@ -44,11 +44,17 @@ async def async_setup(hass: HomeAssistant, config: dict):
     async def handle_navigate(call):
         device_id = call.data["device_id"]
         url = call.data["url"]
+        # Optional nyx >= 1.2.0 screen-wake controls — only forwarded when present
+        # so old callers / old nyx are unaffected.
+        wake = call.data.get("wake")
+        keep_awake = call.data.get("keep_awake")
         coordinator = hass.data[DOMAIN].get(device_id)
         if coordinator is None:
             _LOGGER.error(f"Unknown device_id: {device_id}")
             return
-        await coordinator.async_send_command(coordinator.client.navigate, url)
+        await coordinator.async_send_command(
+            coordinator.client.navigate, url, wake=wake, keep_awake=keep_awake
+        )
 
     hass.services.async_register(
         DOMAIN,
@@ -57,6 +63,8 @@ async def async_setup(hass: HomeAssistant, config: dict):
         schema=vol.Schema({
             vol.Required("device_id"): cv.string,
             vol.Required("url"): cv.url,
+            vol.Optional("wake"): cv.boolean,
+            vol.Optional("keep_awake"): cv.boolean,
         }),
     )
 

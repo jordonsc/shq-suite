@@ -1,0 +1,67 @@
+[package]
+name = "argus"
+version = "0.36.0"
+edition = "2021"
+description = "Argus — AI-powered alarm assessment daemon (native x86_64, runs on atlas)"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# WebSocket client (HA event stream)
+tokio-tungstenite = "0.21"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+
+# HTTP client (HA camera_proxy REST + Anthropic /v1/messages)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+
+# Vision payload encoding
+base64 = "0.22"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Timestamps (case ids, started_at/updated_at, journal)
+chrono = { version = "0.4", features = ["serde"] }
+
+# Timezone conversion for the live-assessment prompt context (the container runs
+# UTC; the configured `timezone` localises the injected current date/time so the
+# model can reason recency/odd-hours against telemetry — NOT chrono::Local).
+chrono-tz = "0.9"
+
+# Errors
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Config/home-dir resolution (~/.config/argus precedent, mirrors nyx)
+directories = "5.0"
+
+# Offsite case replication (Phase 2a): S3 mirror of the case dir. rustls TLS to
+# match reqwest above (no native OpenSSL). Explicit static write-only creds — no
+# aws-config / ambient credential chain.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls"] }
+
+# Overwatch gRPC voice client (Phase 3). Versions pinned to match Overwatch's own
+# Cargo.toml (tonic 0.11 / prost 0.12) so the generated stubs are wire-compatible.
+# tonic's default transport pulls a TLS-free hyper client, which is what we want —
+# Overwatch's gRPC listens plaintext on the LAN.
+tonic = "0.11"
+prost = "0.12"
+
+# Kiosk HUD HTTP/WS server (Phase 4). axum's `ws` feature for the /kiosk
+# WebSocket; tower-http `fs` (ServeDir) serves the static `web/` app + stills.
+axum = { version = "0.7", features = ["ws"] }
+tower-http = { version = "0.5", features = ["fs"] }
+
+[build-dependencies]
+# Compiles proto/voice.proto (a symlink to overwatch/proto/voice.proto) into
+# client stubs. Matches Overwatch's build.rs / tonic-build version.
+tonic-build = "0.11"

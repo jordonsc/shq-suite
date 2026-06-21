@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::process::Child;
 use tokio::sync::{watch, Mutex};
@@ -22,6 +23,10 @@ pub struct AutoDimManager {
     touch_monitor: TouchMonitor,
     shutdown: watch::Sender<bool>,
     clock: ClockHandle,
+    /// When set, the idle/auto-dim loop must NOT blank the backlight or spawn the
+    /// Chronos clock overlay — the screen is PINNED awake (e.g. a live alarm HUD
+    /// takeover). Clearing it lets normal idle dimming/blanking resume.
+    pinned_awake: Arc<AtomicBool>,
 }
 
 impl AutoDimManager {
@@ -40,6 +45,17 @@ impl AutoDimManager {
             touch_monitor,
             shutdown: shutdown_tx,
             clock: Arc::new(Mutex::new(None)),
+            pinned_awake: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Pin the display awake (or release the pin). While pinned, the idle loop
+    /// will not dim, blank, or spawn the clock overlay. Releasing it lets normal
+    /// auto-dim/idle behaviour resume immediately.
+    pub fn set_pinned_awake(&self, pinned: bool) {
+        let was = self.pinned_awake.swap(pinned, Ordering::SeqCst);
+        if was != pinned {
+            tracing::info!(pinned, "Display keep-awake pin changed");
         }
     }
 
@@ -104,6 +120,7 @@ impl AutoDimManager {
         let display = self.display.clone();
         let touch_monitor = self.touch_monitor.clone();
         let clock = self.clock.clone();
+        let pinned_awake = self.pinned_awake.clone();
         let mut shutdown_rx = self.shutdown.subscribe();
 
         // Spawn wake handler (handles touch events and explicit wake calls)
@@ -155,6 +172,7 @@ impl AutoDimManager {
                             &display,
                             &touch_monitor,
                             &clock,
+                            &pinned_awake,
                         )
                         .await
                         {
@@ -180,9 +198,17 @@ impl AutoDimManager {
         display: &DisplayController,
         touch_monitor: &TouchMonitor,
         clock: &ClockHandle,
+        pinned_awake: &Arc<AtomicBool>,
     ) -> Result<()> {
         let cfg = config.lock().await.clone();
         let idle_time = touch_monitor.get_idle_time().await;
+
+        // Pinned awake (e.g. a live alarm HUD takeover): never dim, blank, or
+        // spawn the clock. The wake side already restored brightness + ungrabbed,
+        // so there is nothing to do here until the pin is released.
+        if pinned_awake.load(Ordering::SeqCst) {
+            return Ok(());
+        }
 
         // Check if auto-dim is enabled
         if cfg.auto_dim_time == 0 && cfg.auto_off_time == 0 {

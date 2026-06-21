@@ -34,6 +34,7 @@ Applications (top-level directories):
 | `nyx` | Rust | Power/brightness control for wall-display kiosks. |
 | `overwatch` | Rust | TTS server + alarm loop — verbalises prompts, raises looping alarms (announcements, security). |
 | `dosa` | Rust | **D**oor **O**pening **S**ensor **A**utomation — automated door control via a grblHAL CNC controller. |
+| `argus` | Rust (native x86_64) | AI alarm assessment daemon on **atlas**. On `alarm_control_panel.shq_alarm` → `triggered` it builds an evolving `CaseState` (Sonnet live loop + Opus forensic ID over camera stills + a private seed); consumers are offsite S3 evidence, Overwatch voice + PagerDuty, a kiosk HUD (`argus/web/`), and the `argus` HA component. The only **native** (non-`cross`) Rust app — see `argus/CLAUDE.md`. |
 | `somfy-sdn` | — | RS485/SDN blind control via bespoke ESP32-C6 WiFi controllers (firmware in-repo). |
 | `actron-sniffer` / actron MITM | — | Reverse-engineered man-in-the-middle controller for Actron ducted AC: sits between the Neo controller and the internal unit (MITM because Actron allows only one zone-capable master). |
 | `shelly` | Python | CLI to discover, audit, and configure Shelly devices (Gen1 + Gen2) over mDNS. |
@@ -51,6 +52,7 @@ Applications (top-level directories):
 | `somfy_sdn` | WebSocket | Somfy RS485 blinds (via the ESP32-C6 controllers) |
 | `actron_mitm_controller` | WebSocket | Actron AC MITM controller |
 | `overwatch` | sync / executor (not WS) | `overwatch` — TTS + alarms |
+| `argus` | WebSocket (control, on the Argus web port, default 8770) | `argus` — alarm-assessment status + ack/standdown |
 | `centurion` | local HTTP + retry | Centurion garage door — cloud integration is unreliable, so it's driven via locally-exposed endpoints, hardened with retry logic |
 | `cfa_fire_ban` | — | Fire-ban-day sensor |
 
@@ -59,8 +61,9 @@ Applications (top-level directories):
 > Generally reliable and meant to be **followed as-is** — agents tend to over-research before executing.
 > When a documented runbook covers the task, follow it rather than improvising.
 
-- **Deploy / update a device app** (`nyx`, `overwatch`, `dosa`, …): `./deploy <app> -h <host>` (alias of
-  `./setup <app>`). Deploy targets and credentials come from your local `deploy/config` (not committed).
+- **Deploy / update a device app** (`nyx`, `overwatch`, `dosa`, `argus`, …): `./deploy <app> -h <host>` (alias of
+  `./setup <app>`). Deploy targets and credentials come from your local `deploy/config` (not committed). Note `argus`
+  builds **natively** (`cargo build --release` → atlas), not via the `cross`/RPi path the other Rust apps use.
 - **Deploy Home Assistant changes** (custom components, etc.): `./deploy ha` — add `--restart` for changes that
   require an HA restart. Note: automations, scripts, and scenes live in the **HA database**, not in YAML, so they
   are changed via the **HA API**, not by editing files.

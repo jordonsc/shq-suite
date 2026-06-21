@@ -161,9 +161,26 @@ class SHQDisplayClient:
         response = await self._send_command(command)
         return response.get('success', False) if response else False
 
-    async def navigate(self, url: str) -> bool:
-        """Navigate Chrome to a URL."""
-        response = await self._send_command({'type': 'navigate', 'url': url})
+    async def navigate(
+        self,
+        url: str,
+        wake: Optional[bool] = None,
+        keep_awake: Optional[bool] = None,
+    ) -> bool:
+        """Navigate Chrome to a URL.
+
+        Optional ``wake``/``keep_awake`` (omitted unless explicitly set) drive
+        nyx's screen wake + keep-awake pin (nyx >= 1.2.0): ``wake=True`` wakes the
+        backlight + kills the clock overlay before navigating; ``keep_awake=True``
+        pins the screen on (no idle blank), ``False`` releases the pin. Old nyx
+        ignores the unknown fields.
+        """
+        command = {'type': 'navigate', 'url': url}
+        if wake is not None:
+            command['wake'] = wake
+        if keep_awake is not None:
+            command['keep_awake'] = keep_awake
+        response = await self._send_command(command)
         return response.get('success', False) if response else False
 
     async def get_auto_dim_config(self) -> Optional[Dict[str, Any]]:

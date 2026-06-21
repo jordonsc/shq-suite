@@ -1,0 +1,259 @@
+# Argus configuration — copy to ~/.config/argus/config.yaml and fill in.
+#
+# Secrets are NOT stored here: ${VAR} is expanded from the environment at load
+# time (systemd EnvironmentFile, or your shell). The real config is gitignored
+# and mirrored to shq-suite-config.
+
+ha:
+  url: "http://localhost:8123"          # atlas-local Home Assistant
+  token: "${HA_TOKEN}"                  # long-lived token (HA UI → profile → long-lived tokens)
+
+anthropic:
+  api_key: "${ANTHROPIC_API_KEY}"
+  live_model: "claude-sonnet-4-6"       # Phase 1 uses this one (live what/where loop)
+  id_model: "claude-opus-4-8"           # reserved for Phase 2 (forensic who + dossier)
+
+# IANA timezone used to localise the current date/time injected into the live-
+# assessment prompt as CONTEXT (a prior: the model can reason about odd hours and
+# weigh recency against telemetry timestamps — it is NOT a trigger). The container
+# runs UTC; Argus converts via chrono-tz (never chrono::Local). An invalid name
+# falls back to UTC with a warning. Default "UTC".
+timezone: "Australia/Sydney"
+
+# Path to the private premises seed (see seed.example.md). Phase 1 may point this
+# at a copy of seed.example.md; the real seed lives in shq-suite-config / wiki.
+seed_path: "~/.config/argus/seed.md"
+
+# Cameras captured every assessment tick. The real config lists the full set
+# (perimeter, front yard, outdoor living, garage, laundry, kitchen, hallway,
+# stair landing, …). Each camera's still is sent to the live (Sonnet) loop.
+cameras:
+  - entity: "camera.garage_camera_high_resolution_channel"
+    label: "Garage"                     # human label included in the prompt
+    # zone: "Garage"                    # room/area for "Intruder in <zone>." movement
+                                        # announcements; omit = defaults to `label`.
+                                        # Cameras sharing a zone (e.g. the Outdoor
+                                        # Living pair → "Backyard", below) announce
+                                        # once. Match zone names to the HA area names
+                                        # the trigger-location entity reports, so the
+                                        # initial trigger zone is excluded.
+    # Binary sensors that gate whether this camera is re-assessed on a
+    # non-baseline tick (OR'd). Empty/absent = the camera can't be gated and is
+    # assessed every tick.
+    #
+    # GOTCHA (UniFi Protect): a FIXED dome (e.g. garage, laundry) emits real
+    # motion, so plain _motion works. But PTZ cameras (G6 etc.) are
+    # smart-detect-only — their base _motion NEVER fires — so gate those on the
+    # smart-detect sensors (_person_detected / _vehicle_detected /
+    # _animal_detected). See ledger shq-suite-0003. Safe default: list all four.
+    motion_entities:
+      - "binary_sensor.garage_camera_person_detected"
+      - "binary_sensor.garage_camera_vehicle_detected"
+      - "binary_sensor.garage_camera_animal_detected"
+      - "binary_sensor.garage_camera_motion"
+  # - entity: "camera.front_yard_camera_high_resolution_channel"
+  #   label: "Front Yard"               # a PTZ cam — smart-detect sensors only
+  #   motion_entities:
+  #     - "binary_sensor.front_yard_camera_person_detected"
+  #     - "binary_sensor.front_yard_camera_vehicle_detected"
+  #     - "binary_sensor.front_yard_camera_animal_detected"
+  # The two outdoor-living cameras overlap on one area: give them a SHARED `zone`
+  # so a person crossing between them is announced once ("Intruder in Backyard.").
+  # - entity: "camera.outdoor_living_left_high_resolution_channel"
+  #   label: "Outdoor Living Left"
+  #   zone: "Backyard"
+  # - entity: "camera.outdoor_living_right_high_resolution_channel"
+  #   label: "Outdoor Living Right"
+  #   zone: "Backyard"
+
+alarm_entity: "alarm_control_panel.shq_alarm"
+
+# Trigger profiles (tiered response — TWO flows). Each source maps an HA entity to
+# the posture a case opened by it takes:
+#   alarm       → confirmed intrusion: full immediate outputs (klaxon/voice/PD/kiosk)
+#   investigate → a presumed-benign approach (e.g. a person at the front door): GATED
+#                 (silent), fast/shallow (Sonnet-only, no Opus unless escalated). It
+#                 double-checks the activity really is benign; on STRUCTURED danger
+#                 (a weapon, an injury, duress, or a model `critical` read) Argus
+#                 PROMOTES to alarm — full outputs AND it trips the real
+#                 alarm_control_panel — else quiet standdown after a few ticks.
+# An escalation always goes to FULL alarm posture (klaxon included) and trips the
+# real house alarm — see `escalation_alarm_script` below for HOW it trips the panel.
+# OMIT `triggers` (or leave it empty) and the `alarm_entity` above is synthesised
+# into a single `alarm`-profile source — i.e. exactly today's behaviour. The softer
+# source below is a USER-OWNED placeholder (the real front-door entity is private);
+# the alarm entity drives the full arm/disarm machine, the softer one fires a
+# one-shot gated case on its active (on/detected) edge.
+# triggers:
+#   - entity: "alarm_control_panel.shq_alarm"
+#     profile: alarm
+#   - entity: "binary_sensor.front_door_approach"  # e.g. front-door person detected
+#     profile: investigate
+#
+# Testing the gated/escalation path without a real softer-trigger entity:
+#   argus --once --profile investigate  # open a GATED Investigate case, one tick, print it
+# (a gated --once case spends no Opus and fires no klaxon/voice/PD).
+
+# Optional: the HA entity whose state is the human location that tripped the alarm
+# (e.g. set by an "Alarm Sensors" automation to area_name(trigger.entity_id)). Read
+# once at case open to name the location in the spoken breach line. Omit = generic.
+trigger_location_entity: "input_text.alarm_trigger_room"
+
+# Optional: a PANEL-INDEPENDENT standdown kill switch. ANY state change to this
+# entity stands down the active case (klaxon off, PagerDuty resolve, kiosks
+# restore) — the off-switch for an escalation that ran without ever tripping the
+# manual alarm panel (so there was no `triggered` state to disarm). Typically an
+# `input_button`: a press changes its state to a fresh timestamp, so Argus treats
+# EVERY change as a press. Omit = no kill switch (the panel disarm + the HA control
+# WS remain the only standdowns). Wire an HA dashboard button / the `argus` card to
+# press it.
+# standdown_entity: "input_button.argus_stand_down"
+
+# Optional: an HA SCRIPT that trips the real alarm panel on escalation, WITH the
+# secret code — so the trip code lives HA-side, not in Argus's config/seed. Give the
+# script NAME only (no `script.` prefix), e.g. `argus_alarm` → `script.argus_alarm`.
+# When set, an escalation calls this script; when UNSET, Argus falls back to a direct
+# `alarm_control_panel.alarm_trigger` on the primary alarm entity. Either way the
+# resulting panel `triggered` is RECONCILED (a case is already active → no second
+# case, no loop).
+# escalation_alarm_script: "argus_alarm"
+
+# Assessment-loop cadence + cost guardrails (Phase 2).
+loop_config:
+  cadence_secs: 6                       # seconds between ticks while triggered
+  daily_token_cap: null                 # optional billable-input-token/day cap; null = none
+  slow_cadence_secs: 30                 # cadence used once the daily cap is hit
+  # Motion-gated ticks: the first tick (and every full_sweep_every-th) sweeps ALL
+  # cameras; other ticks assess only cameras with recent motion (per the camera
+  # motion_entities) plus any tracking an intruder — and skip the LLM entirely
+  # when nothing is moving.
+  full_sweep_every: 5                   # every Nth tick re-sweeps ALL cameras (0 = baseline only)
+  motion_window_secs: 20                # a sensor off within this window still counts as recent
+
+# Security-relevant HA entities pulled as per-tick telemetry (door/window/motion/
+# reed/DOSA). Rendered as a text block after the cached seed. Optional.
+#
+# RECOMMENDED: include `event.front_door_access` (the UniFi Access unlock event) so
+# the model sees the timestamp of the last AUTHORISED front-door entry. Combined
+# with the injected current local time (see `timezone` above), it lets the model
+# reason "this approach follows a known authorised unlock 30 s ago" as a PRIOR that
+# lowers suspicion — no special-casing in code; it is just another telemetry line
+# whose timestamp is compared against the current local time in the prompt.
+telemetry_entities: []
+  # - event.front_door_access            # last authorised front-door unlock (recency prior)
+  # - binary_sensor.garage_door
+  # - binary_sensor.front_door
+
+# Offsite case replication to S3 (Phase 2a). Mirrors the on-disk case dir
+# (events, best stills, state, dossier) to an immutable S3 bucket in real time so
+# the case survives destruction of atlas mid-incident. The case dir is the durable
+# upload queue (per-file `.uploaded` markers + retry/backoff). Disabled by default;
+# an absent block is equivalent to `enabled: false`.
+#
+# Provision: a DEDICATED bucket in ap-southeast-2, Block Public Access on,
+# versioning + Object Lock (compliance mode, ~1y retention), SSE-S3. atlas gets a
+# WRITE-ONLY IAM key (s3:PutObject only, scoped to cases/*) — no Delete/Get/List —
+# so a compromised atlas cannot read or erase prior evidence. Retrieval uses a
+# separate, locked-down principal. Keep bucket name/region in the private config.
+#
+# offsite:
+#   enabled: false
+#   bucket: "shq-argus-cases"             # estate detail — keep in private config
+#   region: "ap-southeast-2"              # away-from-premises region
+#   prefix: "cases"                       # key = <prefix>/<case_id>/<rest>
+#   aws_access_key_id: "${AWS_ACCESS_KEY_ID}"          # write-only IAM key
+#   aws_secret_access_key: "${AWS_SECRET_ACCESS_KEY}"  # never committed
+#   upload:
+#     best_stills: always                 # evidence is never throttled
+#     routine_frames: sampled             # always | sampled | never (forward-compat; see CLAUDE.md)
+#     routine_sample_secs: 30
+#     retry_backoff_secs: [2, 5, 15, 60]  # per-pass backoff on PUT failures
+#     scan_interval_secs: 5               # periodic re-scan fallback (also crash recovery)
+
+# Overwatch gRPC voice output (Phase 3). Present = Argus speaks POSITIVE-ONLY
+# milestones (intruder identified / clear image captured / security station
+# notified) and drives the security klaxon (SetAlarm loop) to intimidate an
+# intruder. The gate structurally never speaks a failure/uncertainty. Absent
+# block = voice disabled. Connection/RPC failures are logged, never fatal.
+#
+# overwatch:
+#   host: "<overwatch-host>"              # the voice RPi (gRPC plaintext on the LAN)
+#   port: 50051
+#   alarm_id: "security"                  # key in Overwatch's `alarms` config map
+#   voice_id: "Amy"                       # AWS Polly voice for Verbalise
+#   klaxon_enabled: true                  # false = voice-only (no siren; speech still flows)
+#   klaxon_volume: 0.9                    # 0.0–1.0 SetAlarm volume (the klaxon is LOUD)
+#   voice_volume: 1.0                     # 0.0–1.0 Verbalise volume
+#   duck_factor: 0.5                      # scale a sounding klaxon by this factor while a
+#                                         # line plays so speech is intelligible (0.5 = half;
+#                                         # 0 = no duck; restored after the clip; needs Overwatch >=0.4.1)
+
+# PagerDuty Events v2 security-station dispatch (Phase 3). trigger on case open +
+# material change (same dedup_key = case_id), resolve on standdown. The dossier
+# (threat level, intruders, recent timeline, and the bare S3 case prefix if
+# offsite is configured) rides in custom_details. An ABSENT block OR an empty
+# routing_key disables PagerDuty — that is NOT a startup blocker (a build/CI box
+# has no key). The routing_key is never logged.
+#
+# pagerduty:
+#   routing_key: "${PAGERDUTY_ROUTING_KEY}"   # Events v2 integration key; empty = disabled
+#   source: "argus@atlas"                     # payload.source label
+#   dedup_key: "argus-shq-alarm"              # STABLE dedup key shared by every trigger/
+#                                             # update/ack/resolve (NOT the per-case id) —
+#                                             # one alarm incident at a time, so HA can
+#                                             # resolve the SAME page itself (same key) even
+#                                             # if Argus is down. Default "argus-shq-alarm".
+
+# Kiosk HUD HTTP/WS server + takeover (Phase 4) + the HA control WS (Phase 5).
+# When `web:` is present Argus serves the sci-fi HUD web app at /alarm, the case
+# stills at /stills/<id>.jpg, a /kiosk WebSocket that pushes the full CaseState
+# (the same serde shape journalled to disk) on every change, AND a /control
+# WebSocket (Phase 5) the HA `argus` component connects to for status +
+# acknowledge/standdown commands. The control WS shares this same `bind` port —
+# NO separate config/port. ABSENT block = neither the HUD server nor the control
+# WS is spawned. `bind` is the LAN listen address (so kiosks can reach it);
+# `public_base` is the LAN-reachable base URL kiosks are navigated to
+# (`<public_base>/alarm`) — set it to atlas's real address, NOT 0.0.0.0. `dir`
+# is the static HUD app dir; a relative path resolves next to the argus binary
+# (a deployed `web/` beside the binary just works).
+#
+# web:
+#   bind: "0.0.0.0:8770"
+#   public_base: "http://atlas:8770"
+#   dir: "web"
+
+# Wall kiosks to take over on trigger (Phase 4). On the first CaseState of a case
+# Argus calls `shq_display.navigate` for each kiosk → `<web.public_base>/alarm`;
+# on `cleared` it navigates each back to its `dashboard_url`. `ha_target` is the
+# shq_display device id (the `device_id` of the navigate service). EMPTY (or
+# absent) = no takeover — the HUD is still served, just not pushed to any kiosk.
+# Takeover only runs when `web:` is also configured.
+#
+# NOTE (nyx dependency): a bare `shq_display.navigate` does NOT wake a sleeping
+# kiosk or kill a Chronos clock overlay (idle_mode: clock), so on those kiosks
+# the takeover is invisible until nyx gains a navigate-implies-wake behaviour (or
+# a `shq_display.wake` is called first). See argus/CLAUDE.md + 04-kiosk-hud.md.
+# RESOLVED in nyx 1.2.0 (the kiosks consumer sends `wake:true` on takeover) — but
+# the kiosk MUST be running nyx >= 1.2.0 for the wake to take effect, else the
+# takeover is invisible through a clock/blank screensaver (kiosks 02–10 reflash).
+#
+# IMPORTANT: the REAL kiosk list lives in `~/.config/argus/config.yaml` on atlas
+# (gitignored; mirrored to shq-suite-config) — the block below is the EXAMPLE only.
+# kiosk11 is the test unit and is already on Argus. kiosks 02–10 are still driven
+# by the HA alarm automations (script.kiosks_alarm / script.kiosks_dashboard) and
+# are added to the LIVE config at cutover (see specs/argus/06-refinements.md →
+# "Kiosk 02–10 cutover runbook"). The `dashboard_url` is the kiosk's own dashboard
+# Argus navigates it back to on `cleared`; the real pattern (seen live on kiosk11)
+# is http://atlas.shq.sh:8123/dashboard-kiosks/<kiosk_name>?kiosk.
+#
+# kiosks:
+#   - { ha_target: "kiosk02", dashboard_url: "http://atlas.shq.sh:8123/dashboard-kiosks/kiosk02?kiosk" }  # Garage
+#   - { ha_target: "kiosk03", dashboard_url: "http://atlas.shq.sh:8123/dashboard-kiosks/kiosk03?kiosk" }  # Kitchen
+#   - { ha_target: "kiosk04", dashboard_url: "http://atlas.shq.sh:8123/dashboard-kiosks/kiosk04?kiosk" }  # Jordon Study
+#   - { ha_target: "kiosk05", dashboard_url: "http://atlas.shq.sh:8123/dashboard-kiosks/kiosk05?kiosk" }  # Laundry / DOSA
+#   - { ha_target: "kiosk06", dashboard_url: "http://atlas.shq.sh:8123/dashboard-kiosks/kiosk06?kiosk" }  # Entrance
+#   - { ha_target: "kiosk07", dashboard_url: "http://atlas.shq.sh:8123/dashboard-kiosks/kiosk07?kiosk" }  # Bed 1
+#   - { ha_target: "kiosk08", dashboard_url: "http://atlas.shq.sh:8123/dashboard-kiosks/kiosk08?kiosk" }  # Gym
+#   - { ha_target: "kiosk09", dashboard_url: "http://atlas.shq.sh:8123/dashboard-kiosks/kiosk09?kiosk" }  # Sal Study
+#   - { ha_target: "kiosk10", dashboard_url: "http://atlas.shq.sh:8123/dashboard-kiosks/kiosk10?kiosk" }  # Dining Room
+#   - { ha_target: "kiosk11", dashboard_url: "http://atlas.shq.sh:8123/dashboard-kiosks/kiosk11?kiosk" }  # test unit (already live)
