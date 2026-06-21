@@ -235,15 +235,30 @@ pub struct Person {
     /// forensic pass and when to re-profile on a clearer shot.
     #[serde(default)]
     pub id_score: f32,
+    /// 0.0–1.0 confidence a REAL, distinct person is genuinely present (vs a
+    /// reflection, shadow, mannequin, a partial limb at the frame edge, or a model
+    /// hallucination). Distinct from the resident/guest/intruder classification and
+    /// from `id_score` (frame quality). Tracked as the MAX seen; a subject is only
+    /// created when this clears [`crate::case::CONCERN_INTRUDER_FLOOR`]-style floor
+    /// (`PRESENCE_FLOOR` in the engine), so a hallucinated detection is filtered.
+    #[serde(default)]
+    pub presence: f32,
     /// Current camera label.
     pub location: Option<String>,
     /// Current activity.
     pub activity: Option<String>,
-    /// True once this person has been seen visibly armed / carrying a weapon.
-    /// Latched on (only the forensic pass or a clearer view firms it up; a single
-    /// occluded frame should not clear a weapon already established).
+    /// DERIVED: true once `weapon_confidence` has reached the engine's `ARMED_FLOOR`
+    /// on any frame. Latched on (only a clearer view firms it up; a single occluded
+    /// frame should not clear a weapon already established). Argus derives this from
+    /// `weapon_confidence` — the model returns the confidence, not the bool.
     #[serde(default)]
     pub armed: bool,
+    /// 0.0–1.0 confidence this person is holding an actual WEAPON (knife/blade,
+    /// firearm, bat/club/axe, or an object clearly wielded as one). An everyday
+    /// carried object (box, parcel, bag, phone) scores ~0. Tracked as the MAX seen;
+    /// `armed` is derived from it via the engine's tunable `ARMED_FLOOR`.
+    #[serde(default)]
+    pub weapon_confidence: f32,
     /// The weapon if `armed` (e.g. "kitchen knife", "wooden stick"), else None.
     #[serde(default)]
     pub weapon: Option<String>,
@@ -448,13 +463,20 @@ pub struct PersonDelta {
     /// in focus, close, well-lit). Drives best-still selection + when to (re)run
     /// the forensic pass.
     pub id_score: f32,
+    /// 0.0–1.0 confidence a REAL, distinct person is present in this frame (not a
+    /// reflection/shadow/mannequin/partial-edge-artifact/hallucination). Distinct
+    /// from classification and from `id_score`. Argus drops a NEW subject whose
+    /// presence is below `PRESENCE_FLOOR`.
+    pub presence: f32,
     pub location: Option<String>,
     pub activity: Option<String>,
     /// Which camera label currently has the clearest view of this person.
     pub best_camera_label: Option<String>,
-    /// True if this person is visibly holding/carrying a weapon in the stills.
-    pub armed: bool,
-    /// The weapon if `armed` (e.g. "kitchen knife", "wooden stick"), else null.
+    /// 0.0–1.0 confidence this person is holding an actual weapon in this frame.
+    /// Argus derives `armed` from it via the tunable `ARMED_FLOOR` — the model
+    /// returns the confidence, not a bool.
+    pub weapon_confidence: f32,
+    /// The weapon if one is seen (e.g. "kitchen knife", "wooden stick"), else null.
     pub weapon: Option<String>,
     /// A visible injury on this person (e.g. "bleeding", "stab wound"), else null.
     pub injury: Option<String>,
@@ -474,9 +496,16 @@ pub struct Identification {
     /// (build + clothing + one standout feature). The full `descriptors` stay on
     /// the record / PagerDuty; only this is verbalised.
     pub spoken_summary: String,
-    /// Whether the forensic pass judges this person to be armed.
-    pub armed: bool,
-    /// The weapon if `armed`, else null.
+    /// 0.0–1.0 confidence a REAL person is present in this still — low if the frame
+    /// actually shows no one (an empty room, a partial artifact). Lets Argus suppress
+    /// a degenerate "no person" identification instead of announcing it.
+    #[serde(default)]
+    pub presence: f32,
+    /// 0.0–1.0 confidence the forensic pass sees an actual weapon. Argus derives
+    /// `armed` from it via `ARMED_FLOOR` (this is the clearest frame — the best
+    /// chance to confirm/rule out a weapon the live pass was unsure about).
+    pub weapon_confidence: f32,
+    /// The weapon if one is seen, else null.
     pub weapon: Option<String>,
     /// A visible injury the forensic pass can confirm on the clearest frame, else null.
     pub injury: Option<String>,
@@ -521,15 +550,16 @@ pub fn live_assessment_schema() -> Value {
                         "guest_confidence": { "type": "number", "description": "0.0-1.0 likelihood this person is an invited/expected GUEST or delivery person." },
                         "intruder_confidence": { "type": "number", "description": "0.0-1.0 likelihood this person is an INTRUDER. Independent of the other two (they need not sum to 1). When uncertain, weight toward intruder." },
                         "id_score": { "type": "number", "description": "0.0-1.0: how good THIS frame is for IDENTIFYING the person — 1.0 = face and build clearly visible, in focus, close, well-lit; low = far away, blurred, back turned, heavily occluded, or dark. Judge the FRAME's usefulness for an ID." },
+                        "presence": { "type": "number", "description": "0.0-1.0 confidence a REAL, distinct PERSON is genuinely present here — NOT their classification and NOT frame quality. Score LOW for a partial limb at the edge of frame, a reflection, a shadow, a mannequin/poster, a pet, or anything you are not sure is actually a person. 1.0 = unmistakably a person; near 0.0 = probably no real person." },
                         "location": { "type": ["string", "null"], "description": "Current camera label, or null." },
                         "activity": { "type": ["string", "null"], "description": "What they are doing, or null." },
                         "best_camera_label": { "type": ["string", "null"], "description": "Camera label with the clearest current view of this person, or null." },
-                        "armed": { "type": "boolean", "description": "True ONLY if the person is actually holding a weapon (a knife or blade, firearm, bat, club, or axe) or is clearly wielding an object as a weapon. An ordinary object carried or used normally — a box, parcel, bag, phone, cup, tool, or umbrella — is NOT a weapon and must be false, even during an alarm; only a genuinely weapon-like ambiguous object (e.g. a partially hidden blade) warrants a hedged flag." },
-                        "weapon": { "type": ["string", "null"], "description": "Name of the weapon if armed (e.g. \"kitchen knife\"); hedge if unsure (e.g. \"possible knife\", \"elongated object, possibly a blade\"); else null." },
+                        "weapon_confidence": { "type": "number", "description": "0.0-1.0 confidence this person is holding an actual WEAPON. Look CLOSELY at the hands. Score high for a clearly-visible weapon — a knife or blade (INCLUDING a kitchen or chef's knife), firearm, bat, club, or axe — or an object clearly wielded as a weapon; score moderate for a genuinely weapon-like but unclear object (e.g. a partially hidden blade); score near 0.0 for an ordinary carried/used object such as a box, parcel, bag, phone, cup, or tool, and 0.0 for empty hands. Do NOT inflate for a benign carried item even during an alarm." },
+                        "weapon": { "type": ["string", "null"], "description": "Name of the weapon if one is seen (e.g. \"kitchen knife\"); hedge if unsure (e.g. \"possible knife\"); null if no weapon." },
                         "injury": { "type": ["string", "null"], "description": "A visible injury on this person (e.g. \"bleeding\", \"stab wound\", \"gunshot wound\", \"unconscious\", \"possibly deceased\"), else null." },
                         "in_duress": { "type": "number", "description": "0.0-1.0 confidence this person is under duress — coerced, restrained, threatened, or in visible distress. 0.0 if they appear free and calm." }
                     },
-                    "required": ["id", "descriptors", "resident_confidence", "guest_confidence", "intruder_confidence", "id_score", "location", "activity", "best_camera_label", "armed", "weapon", "injury", "in_duress"]
+                    "required": ["id", "descriptors", "resident_confidence", "guest_confidence", "intruder_confidence", "id_score", "presence", "location", "activity", "best_camera_label", "weapon_confidence", "weapon", "injury", "in_duress"]
                 }
             },
             "threats": {
@@ -558,11 +588,12 @@ pub fn identification_schema() -> Value {
             "confidence": { "type": "number", "description": "0.0-1.0 confidence in this identification." },
             "distinguishing_features": { "type": "string", "description": "Tattoos, scars, logos, gait, carried items — anything that aids identification." },
             "spoken_summary": { "type": "string", "description": "A SHORT single sentence (max ~18 words) for a spoken security announcement: sex, approx age, build, key clothing, and one standout feature. No preamble. E.g. 'Caucasian male, forties, navy t-shirt, grey track pants, full red beard.'" },
-            "armed": { "type": "boolean", "description": "True ONLY if the person is actually holding a weapon (a knife or blade, firearm, bat, club, or axe) or is clearly wielding an object as a weapon — this is the clearest frame, scrutinise the hands. An ordinary object carried or used normally — a box, parcel, bag, phone, cup, tool, or umbrella — is NOT a weapon and must be false, even during an alarm; only a genuinely weapon-like ambiguous object (e.g. a partially hidden blade) warrants a hedged flag." },
-            "weapon": { "type": ["string", "null"], "description": "Name of the weapon if armed; hedge if unsure (e.g. \"possible knife\"); else null." },
+            "presence": { "type": "number", "description": "0.0-1.0 confidence a REAL person is actually present in this still. Score near 0.0 if the frame in fact shows NO person (an empty room, only furniture, a partial artifact) — do not invent a subject. 1.0 = unmistakably a person." },
+            "weapon_confidence": { "type": "number", "description": "0.0-1.0 confidence the person is holding an actual WEAPON — this is the clearest frame, scrutinise the hands. High for a clearly-visible knife or blade (INCLUDING a kitchen or chef's knife), firearm, bat, club, or axe, or an object clearly wielded as a weapon; moderate for a genuinely weapon-like but unclear object (e.g. a partially hidden blade); near 0.0 for an ordinary carried/used object (box, parcel, bag, phone, cup, tool), 0.0 for empty hands. Do NOT inflate for a benign carried item, even during an alarm." },
+            "weapon": { "type": ["string", "null"], "description": "Name of the weapon if one is seen; hedge if unsure (e.g. \"possible knife\"); else null." },
             "injury": { "type": ["string", "null"], "description": "A visible injury you can confirm on this clearest frame (e.g. \"bleeding\", \"stab wound\", \"gunshot wound\", \"unconscious\", \"possibly deceased\"), else null." }
         },
-        "required": ["descriptors", "dossier", "confidence", "distinguishing_features", "spoken_summary", "armed", "weapon", "injury"]
+        "required": ["descriptors", "dossier", "confidence", "distinguishing_features", "spoken_summary", "presence", "weapon_confidence", "weapon", "injury"]
     })
 }
 

@@ -84,6 +84,25 @@ const INVESTIGATE_STANDDOWN_TICKS: u64 = 4;
 // `LifeThreatening`, escalates a gated case, and now makes a person
 // `warrants_attention`) is defined once in `case.rs` and imported above.
 
+/// **Person-presence floor.** A NEW subject is only added to the roster when the
+/// model's `presence` confidence (a real, distinct person is genuinely present —
+/// not a reflection/shadow/partial-edge-artifact/hallucination) reaches this. An
+/// already-established subject is NEVER dropped (presence is tracked as the MAX, so
+/// a clearly-seen person who is later briefly occluded persists) — this leans LOOSE
+/// (don't miss real subjects) while filtering a clearly hallucinated detection (the
+/// LEGO-bench "hand at the edge of frame" scored presence well below this). Tunable.
+const PRESENCE_FLOOR: f32 = 0.4;
+
+/// **Weapon-detection floor.** Argus derives `Person.armed` from the model's
+/// `weapon_confidence` (how sure they hold an ACTUAL weapon) once it reaches this.
+/// Replaces the old binary `armed` so sensitivity is tunable: low enough to catch a
+/// faint/distant blade (a chef's knife the binary pass missed), high enough that an
+/// everyday carried object (a box ≈ 0.0-0.1) never trips it. `armed` LATCHES on
+/// (weapon_confidence is tracked as the MAX, so a later occluded frame can't clear
+/// an established weapon). Tunable — raise to reduce false weapons, lower for more
+/// sensitivity.
+const ARMED_FLOOR: f32 = 0.4;
+
 /// **Escalation persistence gate (the production false-escalation safety win).**
 /// A GATED (`Investigate`/`General`) case must see its escalate condition hold for
 /// at least this many CONSECUTIVE ticks before it is promoted to full `Alarm`
@@ -140,14 +159,19 @@ pub const SYSTEM_PROMPT: &str = "You are a smart-security AI that reviews camera
     resident in the briefing below — a mere resemblance (similar build, hair, skin tone, or \
     clothing) is not a match. When you are uncertain, weight your confidence toward intruder: fail \
     toward caution.\n\n\
-    Weapons: look closely at every person's hands. Set `armed` ONLY when a person is actually \
-    holding a weapon — a knife or blade, a firearm, a bat, club, or axe, or another object they are \
-    clearly wielding or brandishing as a weapon — and name it in `weapon`. An object a person is \
-    merely carrying or using in an ordinary way is NOT a weapon and must not set `armed`: a box, \
-    parcel, bag, phone, cup, tool, or umbrella is benign even during an alarm. Only if an object is \
-    genuinely ambiguous and its shape and handling strongly suggest a concealed or improvised weapon \
-    (e.g. a partially hidden blade) may you set `armed` with a hedged `weapon` note — do not flag an \
-    ordinary carried item on suspicion alone.\n\n\
+    Person detection: for each person also score `presence` (0.0-1.0) — how confident you are that a \
+    REAL, distinct person is genuinely present. This is separate from who they are and from frame \
+    quality. Score it LOW for a partial limb at the edge of frame, a reflection, a shadow, a \
+    mannequin or poster, a pet, or anything you are not sure is actually a person; do NOT invent a \
+    person from an ambiguous shape. It is better to score presence honestly low than to register a \
+    person who may not be there.\n\n\
+    Weapons: look closely at every person's hands and score `weapon_confidence` (0.0-1.0) — how \
+    confident you are they are holding an ACTUAL weapon. Score HIGH for a clearly-visible weapon — a \
+    knife or blade (INCLUDING a kitchen or chef's knife), a firearm, a bat, club, or axe — or an \
+    object clearly wielded or brandished as a weapon; score MODERATE for a genuinely weapon-like but \
+    unclear object (e.g. a partially hidden blade); score NEAR ZERO for an everyday object carried or \
+    used in an ordinary way (a box, parcel, bag, phone, cup, tool, or umbrella), even during an \
+    alarm, and zero for empty hands. Name any weapon you see in `weapon`.\n\n\
     Injuries and duress: record any visible injury in a person's `injury` field (e.g. \"bleeding\", \
     \"stab wound\", \"gunshot wound\", \"unconscious\", \"possibly deceased\"). Set `in_duress` \
     (0.0-1.0) for any person who appears coerced, restrained, threatened, or in distress.";
@@ -185,14 +209,16 @@ const IDENTIFY_INSTRUCTION: &str = "The image is the clearest still of a detecte
     distinguishing features, and a short dossier paragraph for the security station. ALSO write \
     `spoken_summary` — a single short sentence (max ~18 words) suitable to be read aloud over a \
     security speaker (sex, approx age, build, key clothing, one standout feature; no preamble). \
-    Determine whether the person is armed — examine the hands and any held object CLOSELY (this is \
-    the clearest frame, your best chance to confirm or rule out a weapon the live pass was unsure \
-    about). Set `armed` true ONLY if they are actually holding a weapon (a knife or blade, firearm, \
-    bat, club, or axe) or are clearly wielding an object as a weapon, and name it in `weapon`. An \
-    object merely carried or used in an ordinary way — a box, parcel, bag, phone, cup, tool, or \
-    umbrella — is NOT a weapon and must leave `armed` false, even during an alarm; only a genuinely \
-    weapon-like ambiguous object (e.g. a partially hidden blade) warrants a hedged flag. Note any \
-    visible `injury`. Anchor every claim on the image.";
+    Score `weapon_confidence` (0.0-1.0) — examine the hands and any held object CLOSELY (this is the \
+    clearest frame, your best chance to confirm or rule out a weapon the live pass was unsure about). \
+    Score HIGH for a clearly-visible weapon (a knife or blade INCLUDING a kitchen or chef's knife, a \
+    firearm, bat, club, or axe) or an object clearly wielded as a weapon; MODERATE for a genuinely \
+    weapon-like but unclear object (e.g. a partially hidden blade); NEAR ZERO for an everyday object \
+    carried or used in an ordinary way (a box, parcel, bag, phone, cup, tool, or umbrella), even \
+    during an alarm. Name any weapon in `weapon`. ALSO score `presence` (0.0-1.0): how confident you \
+    are a REAL person is actually in this frame — score it near zero if the frame in fact shows no \
+    one (an empty room or only a partial artifact); do not invent a subject. Note any visible \
+    `injury`. Anchor every claim on the image.";
 
 /// The result of a forensic (Opus) identification, delivered back to the engine's
 /// event loop over an mpsc so the Opus call runs CONCURRENTLY with the live loop
@@ -1490,11 +1516,15 @@ impl Engine {
         // forensic pass. Injuries/duress matter for ANY person (an injured resident
         // is critical too).
         for d in live.persons {
+            // `armed` is DERIVED from the model's weapon_confidence via the tunable
+            // ARMED_FLOOR (the model no longer returns a bool).
+            let delta_armed = d.weapon_confidence >= ARMED_FLOOR;
             if let Some(existing) = active.state.person_mut(&d.id) {
                 existing.resident_confidence = d.resident_confidence;
                 existing.guest_confidence = d.guest_confidence;
                 existing.intruder_confidence = d.intruder_confidence;
                 existing.id_score = d.id_score;
+                existing.presence = existing.presence.max(d.presence);
                 existing.location = self.to_label_opt(d.location);
                 existing.activity = d.activity;
                 existing.in_duress = existing.in_duress.max(d.in_duress);
@@ -1503,11 +1533,13 @@ impl Engine {
                     existing.descriptors = d.descriptors;
                 }
                 existing.best_camera = self.to_label_opt(d.best_camera_label);
-                // Weapons latch ON: a person seen armed stays armed even if a later
-                // frame occludes the weapon. Stage the milestone, fire it after the
-                // `existing` borrow ends (the milestone helpers re-borrow `active`).
+                // Weapons latch ON: weapon_confidence is tracked as the MAX, and
+                // `armed` is derived from it, so a person seen armed stays armed even
+                // if a later frame occludes the weapon. Stage the milestone, fire it
+                // after the `existing` borrow ends (the helpers re-borrow `active`).
+                existing.weapon_confidence = existing.weapon_confidence.max(d.weapon_confidence);
                 let mut weapon_event: Option<(String, Option<String>)> = None;
-                if d.armed {
+                if delta_armed {
                     let newly_armed = !existing.armed;
                     existing.armed = true;
                     if existing.weapon.is_none() {
@@ -1534,6 +1566,14 @@ impl Engine {
                     Self::announce_injury(active, &id, &injury, now);
                 }
             } else {
+                // NEW subject: filter out a hallucinated detection — only register a
+                // person the model is confident is genuinely present (a real, distinct
+                // person, not a partial-edge artifact / reflection / empty frame). An
+                // already-established subject is never dropped (handled above), so this
+                // leans loose without missing real subjects.
+                if d.presence < PRESENCE_FLOOR {
+                    continue;
+                }
                 // Honour the model's id if it coined a fresh subject-N; bump our
                 // counter past it so we never collide.
                 if let Some(n) = d.id.strip_prefix("subject-").and_then(|s| s.parse::<u32>().ok()) {
@@ -1563,9 +1603,11 @@ impl Engine {
                     guest_confidence: d.guest_confidence,
                     intruder_confidence: d.intruder_confidence,
                     id_score: d.id_score,
+                    presence: d.presence,
                     location: self.to_label_opt(d.location),
                     activity: d.activity,
-                    armed: d.armed,
+                    armed: delta_armed,
+                    weapon_confidence: d.weapon_confidence,
                     weapon: d.weapon.clone(),
                     injury: injury.clone(),
                     in_duress: d.in_duress,
@@ -1576,7 +1618,7 @@ impl Engine {
                     best_camera: self.to_label_opt(d.best_camera_label),
                 });
                 // A first sighting already armed / injured earns its milestone too.
-                if d.armed {
+                if delta_armed {
                     Self::push_weapon_event(active, &id, d.weapon.as_deref(), now);
                 }
                 if let Some(injury) = injury {
@@ -1833,6 +1875,13 @@ impl Engine {
         // announced profile isn't a guess off a first-glimpse frame. Every pass still
         // updates the record (descriptors/dossier/best-still) silently.
         if let Some(person) = active.state.person_mut(id) {
+            // Degenerate forensic result: the clearest frame actually shows NO real
+            // person (an empty room / partial artifact the live loop over-detected).
+            // Don't overwrite the live record, don't mark identified, and — crucially
+            // — don't announce a "no person detected" profile over the speaker.
+            if ident.presence < PRESENCE_FLOOR {
+                return;
+            }
             // Guard against a degenerate forensic output (a model occasionally
             // stubs a free-text field to "placeholder" / empty): never overwrite a
             // good value with junk, and never speak/page a stub. The Sonnet
@@ -1848,8 +1897,10 @@ impl Engine {
             }
             person.identified = true;
             // The forensic pass can be what first confirms a weapon a grainy live
-            // frame missed. Latch armed ON; never clear it.
-            if ident.armed {
+            // frame missed (it scrutinises the clearest frame). weapon_confidence
+            // tracks the MAX; `armed` derives from it via ARMED_FLOOR and latches on.
+            person.weapon_confidence = person.weapon_confidence.max(ident.weapon_confidence);
+            if ident.weapon_confidence >= ARMED_FLOOR {
                 newly_armed = !person.armed;
                 person.armed = true;
                 if person.weapon.is_none() {
@@ -1867,12 +1918,24 @@ impl Engine {
         } else {
             return; // person gone (shouldn't happen mid-case)
         }
-        // Announce (+ page) the first time we have a confident-enough profile.
-        if ident.confidence >= ID_SPEAK_CONF && active.id_spoken.insert(id.to_string()) {
+        // Announce (+ page) the first time we have a confident-enough profile. Use
+        // the distinguishing features for the line, falling back to the spoken
+        // summary; require it to be non-empty so we never push/announce a blank
+        // "subject-N identified:" line (the `&&` order means a blank pass doesn't
+        // consume the once-per-person `id_spoken` slot — a later real pass can fire).
+        let id_detail = if meaningful(&ident.distinguishing_features) {
+            ident.distinguishing_features.clone()
+        } else {
+            ident.spoken_summary.clone()
+        };
+        if ident.confidence >= ID_SPEAK_CONF
+            && meaningful(&id_detail)
+            && active.id_spoken.insert(id.to_string())
+        {
             active.state.push_event(
                 now,
                 TimelineKind::IntruderIdentified,
-                format!("{id} identified: {}", ident.distinguishing_features),
+                format!("{id} identified: {id_detail}"),
             );
         }
         if let Some(injury) = new_injury {
@@ -1994,14 +2057,19 @@ fn merge_persons(results: &[LiveAssessment]) -> Vec<PersonDelta> {
             .iter()
             .max_by(|a, b| a.id_score.total_cmp(&b.id_score))
             .expect("group is non-empty");
-        let armed = group.iter().any(|d| d.armed);
+        // Presence + weapon_confidence reconcile as the MAX across this tick's
+        // cameras (the most confident sighting wins — a clearer view of a real
+        // person or a weapon should not be diluted by a poorer angle).
+        let presence = group.iter().map(|d| d.presence).fold(f32::MIN, f32::max);
+        let weapon_confidence = group.iter().map(|d| d.weapon_confidence).fold(f32::MIN, f32::max);
         let id_score = group.iter().map(|d| d.id_score).fold(f32::MIN, f32::max);
         let in_duress = group.iter().map(|d| d.in_duress).fold(f32::MIN, f32::max);
-        // Prefer a weapon from an armed sighting; else any non-empty weapon.
+        // Prefer the weapon name from the highest-weapon_confidence sighting; else
+        // any non-empty weapon name.
         let weapon = group
             .iter()
-            .filter(|d| d.armed)
-            .find_map(|d| non_empty(&d.weapon))
+            .max_by(|a, b| a.weapon_confidence.total_cmp(&b.weapon_confidence))
+            .and_then(|d| non_empty(&d.weapon))
             .or_else(|| group.iter().find_map(|d| non_empty(&d.weapon)));
         let injury = group.iter().find_map(|d| non_empty(&d.injury));
         let best_camera_label = clearest
@@ -2017,10 +2085,11 @@ fn merge_persons(results: &[LiveAssessment]) -> Vec<PersonDelta> {
             guest_confidence: clearest.guest_confidence,
             intruder_confidence: clearest.intruder_confidence,
             id_score,
+            presence,
             location: clearest.location.clone(),
             activity: clearest.activity.clone(),
             best_camera_label,
-            armed,
+            weapon_confidence,
             weapon,
             injury,
             in_duress,
@@ -2069,7 +2138,7 @@ fn delta_is_concern(d: &PersonDelta) -> bool {
 /// room-to-room (the first-live-test fix).
 fn delta_warrants_attention(d: &PersonDelta) -> bool {
     delta_is_concern(d)
-        || d.armed
+        || d.weapon_confidence >= ARMED_FLOOR
         || d.injury.as_deref().is_some_and(|i| !i.trim().is_empty())
         || d.in_duress >= DURESS_FLOOR
 }
@@ -2088,7 +2157,7 @@ fn rank_frame(a: &LiveAssessment) -> Option<(u8, &'static str)> {
         return None;
     }
     let danger = a.persons.iter().any(|p| {
-        p.armed
+        p.weapon_confidence >= ARMED_FLOOR
             || p.injury.as_deref().is_some_and(|i| !i.trim().is_empty())
             || p.in_duress >= DURESS_FLOOR
     });
@@ -2383,9 +2452,11 @@ mod tests {
             guest_confidence: 0.1,
             intruder_confidence: 0.9,
             id_score: 0.8,
+            presence: 0.9,
             location: None,
             activity: None,
             armed,
+            weapon_confidence: if armed { 0.9 } else { 0.0 },
             weapon: if armed { Some("knife".to_string()) } else { None },
             injury: None,
             in_duress: 0.0,
@@ -2638,7 +2709,8 @@ mod tests {
     }
 
     /// Build a `PersonDelta` for the per-frame rank tests. `ic`/`rc` are the
-    /// intruder/resident confidences; `armed` sets the structured-danger flag.
+    /// intruder/resident confidences; `armed` drives `weapon_confidence` (≥ ARMED_FLOOR
+    /// when true). `presence` defaults high (a clearly-present person).
     fn pdelta(ic: f32, rc: f32, armed: bool) -> PersonDelta {
         PersonDelta {
             id: "subject-1".to_string(),
@@ -2647,10 +2719,11 @@ mod tests {
             guest_confidence: 0.05,
             intruder_confidence: ic,
             id_score: 0.7,
+            presence: 0.9,
             location: Some("Kitchen".to_string()),
             activity: None,
             best_camera_label: None,
-            armed,
+            weapon_confidence: if armed { 0.9 } else { 0.0 },
             weapon: if armed { Some("knife".to_string()) } else { None },
             injury: None,
             in_duress: 0.0,
@@ -2726,5 +2799,27 @@ mod tests {
         // The live-delta mirror agrees.
         assert!(!delta_warrants_attention(&pdelta(0.2, 0.75, false)));
         assert!(delta_warrants_attention(&pdelta(0.2, 0.75, true)));
+    }
+
+    /// `armed` is derived from `weapon_confidence` via the tunable `ARMED_FLOOR`:
+    /// just under the floor is NOT a weapon (so a box ≈ 0 never flags); at/over it
+    /// is. This drives both the per-frame danger rank and the warrants-attention gate.
+    #[test]
+    fn weapon_confidence_threshold_drives_armed() {
+        // Intruder, weapon_confidence just BELOW the floor → rank 1 (not danger).
+        let mut below = pdelta(0.9, 0.1, false);
+        below.weapon_confidence = ARMED_FLOOR - 0.05;
+        assert_eq!(rank_frame(&assess(vec![below], false)), Some((1, "intruder")));
+        // weapon_confidence AT the floor → rank 3 (life_threatening danger).
+        let mut at = pdelta(0.9, 0.1, false);
+        at.weapon_confidence = ARMED_FLOOR;
+        assert_eq!(rank_frame(&assess(vec![at], false)), Some((3, "life_threatening")));
+        // A resident (not concern) only warrants attention once weapon_confidence
+        // reaches the floor — a faint reading (a box) does not.
+        let mut res = pdelta(0.1, 0.8, false);
+        res.weapon_confidence = ARMED_FLOOR - 0.05;
+        assert!(!delta_warrants_attention(&res));
+        res.weapon_confidence = ARMED_FLOOR;
+        assert!(delta_warrants_attention(&res));
     }
 }
