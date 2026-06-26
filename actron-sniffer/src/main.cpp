@@ -44,24 +44,24 @@
 #include <ESPmDNS.h>
 #include <ArduinoOTA.h>
 #include <HTTPUpdate.h>
+#include <esp_app_desc.h>
+#include <esp_ota_ops.h>
 
 #include "bridge.h"
 #include "state.h"
+#include "wifi_prov.h"
 #include "ws_api.h"
 
-// ---- WiFi — credentials come from secrets.h (gitignored). ----------------
-// Copy secrets.h.example -> secrets.h and fill in. The fallbacks below let the
-// repo build without secrets present; they won't connect to a real network.
-#if __has_include("secrets.h")
-#include "secrets.h"
-#endif
-#ifndef WIFI_SSID
-#define WIFI_SSID "your-ssid"
-#endif
-#ifndef WIFI_PASS
-#define WIFI_PASS "your-wifi-password"
-#endif
-static const char *HOSTNAME = "actron-sniffer";  // -> http://actron-sniffer.local/
+// WiFi credentials are provisioned at runtime (NVS) via the SoftAP captive portal — see
+// wifi_prov.{h,cpp}. There are NO baked creds and no secrets.h: an image built without creds
+// used to boot but never join WiFi, and OTA-flashing that onto the in-wall device knocked it off
+// the network with no remote recovery (ledger shq-suite-0013). With provisioning, an
+// unprovisioned / failed-to-connect device falls back to its own AP (actron-mitm-XXXX) for setup.
+
+// Application identity — embedded in the native esp_app_desc (app_desc.cpp), surfaced in
+// /stats + /stats.json, and enforced by the OTA guard (handleUpdate) so the somfy-sdn firmware
+// (same board, same /update endpoint) can't be flashed onto this in-wall Actron controller.
+static const char *APP_ID = "actron-mitm";
 
 // ---- pins -----------------------------------------------------------------
 // Endpoint A = indoor board side, UART1 (the existing transceiver).
@@ -488,7 +488,7 @@ static void emitFromTemplate(uint8_t bytecount, const uint8_t* tmpl, size_t tmpl
 
 static size_t statusLine(char *out, size_t cap) {
   return snprintf(out, cap,
-    "# seq_max=%u baud=%u parity=8%c1 gap=%uus capture=%s "
+    "# app=actron-mitm seq_max=%u baud=%u parity=8%c1 gap=%uus capture=%s "
     "A.bytes=%llu A.frames=%u A.mod=%u A.rxerr=%u "
     "B.bytes=%llu B.frames=%u B.mod=%u B.rxerr=%u "
     "rssi=%d ip=%s "
@@ -604,6 +604,20 @@ static void handleStats() {
   char st[600];
   statusLine(st, sizeof(st));
   server.send(200, "text/plain", String(st) + "\n");
+}
+
+// Machine-readable identity + status. Parallels somfy-sdn's /stats.json so one uniform endpoint
+// positively identifies any TinyC6 board on the LAN (app/mac), rather than inferring from which
+// text /stats fields happen to be present.
+static void handleStatsJson() {
+  char buf[320];
+  snprintf(buf, sizeof(buf),
+    "{\"app\":\"%s\",\"model\":\"TinyC6\",\"fw\":\"%s\",\"hostname\":\"%s\","
+    "\"ip\":\"%s\",\"mac\":\"%s\",\"rssi\":%d,\"bridge\":\"%s\"}",
+    APP_ID, __DATE__ " " __TIME__, wifi_prov::hostname(),
+    WiFi.localIP().toString().c_str(), WiFi.macAddress().c_str(),
+    WiFi.isConnected() ? WiFi.RSSI() : 0, bridgeModeStr(g_bridge_mode));
+  server.send(200, "application/json", buf);
 }
 
 static void handleLog() {
@@ -1202,11 +1216,28 @@ static void handleUpdate() {
   setBridgeMode(bridge::StreamingBridge::OFF);
 
   WiFiClient client;
-  httpUpdate.rebootOnUpdate(true);
+  // Verify the written image's app identity before booting it (OTA app-guard) — refuse a
+  // foreign image (e.g. the somfy-sdn firmware) instead of bricking this in-wall controller.
+  httpUpdate.rebootOnUpdate(false);
   t_httpUpdate_return r = httpUpdate.update(client, url);
 
-  // Only reached on failure — successful update reboots from inside httpUpdate.
-  Serial.printf("# OTA failed (%d): %s\n", (int)r, httpUpdate.getLastErrorString().c_str());
+  if (r == HTTP_UPDATE_OK) {
+    const esp_partition_t *next = esp_ota_get_boot_partition();
+    esp_app_desc_t d{};
+    if (next != nullptr && esp_ota_get_partition_description(next, &d) == ESP_OK &&
+        strcmp(d.project_name, APP_ID) == 0) {
+      Serial.printf("# OTA ok (app=%s ver=%s) — rebooting\n", d.project_name, d.version);
+      delay(150);
+      ESP.restart();
+    } else {
+      esp_ota_set_boot_partition(esp_ota_get_running_partition());
+      Serial.printf("# OTA REJECTED: image app=\"%s\" != \"%s\" — reverted, not booting\n",
+                    d.project_name, APP_ID);
+    }
+  } else {
+    Serial.printf("# OTA failed (%d): %s\n", (int)r, httpUpdate.getLastErrorString().c_str());
+  }
+  // Either a rejected or failed OTA leaves us running — restore normal operation.
   setBridgeMode(bridge::StreamingBridge::INJECT);
   if (g_bridge_task != nullptr) vTaskResume(g_bridge_task);
   g_capture = true;
@@ -1233,27 +1264,54 @@ static void pumpConsole() {
   }
 }
 
-static void connectWifi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.setHostname(HOSTNAME);
-  WiFi.setSleep(false);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.printf("# WiFi connecting to \"%s\"", WIFI_SSID);
-  uint32_t t0 = millis();
-  while (!WiFi.isConnected() && millis() - t0 < 15000) {
-    delay(250);
-    Serial.print('.');
-  }
-  Serial.println();
-  if (WiFi.isConnected()) {
-    Serial.printf("# WiFi up: http://%s/  (or http://%s.local/)\n",
-                  WiFi.localIP().toString().c_str(), HOSTNAME);
-    if (MDNS.begin(HOSTNAME)) MDNS.addService("http", "tcp", 80);
-    ArduinoOTA.setHostname(HOSTNAME);
-    ArduinoOTA.begin();
-  } else {
-    Serial.println("# WiFi failed — capture still runs, HTTP unavailable. Check creds.");
-  }
+// Wipe stored WiFi creds and reboot into the SoftAP provisioning portal (replaces the GPIO0
+// button the somfy port has — GPIO0 is the NEO UART RX here). Lets the device be moved to a
+// different WiFi without USB.
+static void handleWifiReset() {
+  server.send(200, "text/plain", "# wiping WiFi creds — rebooting into the actron-mitm-XXXX portal\n");
+  delay(300);
+  wifi_prov::factoryWipe();  // reboots; does not return
+}
+
+// Stand up the app-facing surfaces (HTTP API on 80, WS controller API on 8767, ArduinoOTA).
+// Called ONLY when WiFi is up (STA connected) — in portal mode wifi_prov owns port 80, so these
+// must not bind. mDNS is started by wifi_prov on connect; the RS485 bridge task runs regardless.
+static void startAppServer() {
+  // Read-only endpoints: GET. Mutating / bus-driving / OTA endpoints: POST — so they can't be
+  // triggered by browser prefetch / crawlers and their params don't leak into GET logs.
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/stats", HTTP_GET, handleStats);
+  server.on("/stats.json", HTTP_GET, handleStatsJson);
+  server.on("/log", HTTP_GET, handleLog);
+  server.on("/measure", HTTP_GET, handleMeasure);
+  server.on("/set", HTTP_POST, handleSet);
+  server.on("/clear", HTTP_POST, handleClear);
+  server.on("/update", HTTP_POST, handleUpdate);
+  server.on("/wifireset", HTTP_POST, handleWifiReset);
+  server.on("/armwrite", HTTP_POST, handleArm);
+  server.on("/disarm", HTTP_POST, handleDisarm);
+  server.on("/txprobe", HTTP_POST, handleTxProbe);
+  server.on("/bridge", HTTP_POST, handleBridge);
+  server.on("/inject", HTTP_POST, handleInject);
+  server.on("/loopback", HTTP_POST, handleLoopback);
+  server.on("/uartcheck", HTTP_POST, handleUartCheck);
+  server.on("/blink", HTTP_POST, handleBlink);
+  server.on("/scramble", HTTP_POST, handleScramble);
+  server.on("/pulse", HTTP_POST, handlePulse);
+  server.on("/snapshot", HTTP_POST, handleSnapshot);
+  server.on("/replay", HTTP_POST, handleReplay);
+  server.on("/loadtemplate", HTTP_POST, handleLoadTemplate);
+  server.begin();
+
+  // Controller WS API (Home Assistant client) — separate port from the RE HTTP API.
+  ws_api::Hooks hooks{};
+  hooks.injector = &g_b.bridge;          // NEO->board direction owns the INJECT rules
+  hooks.mode_var = &g_bridge_mode;
+  hooks.set_mode = setBridgeMode;
+  ws_api::begin(8767, hooks);
+
+  ArduinoOTA.setHostname(wifi_prov::hostname());
+  ArduinoOTA.begin();
 }
 
 void setup() {
@@ -1277,41 +1335,15 @@ void setup() {
   while (!Serial && millis() - t0 < 1500) delay(10);
   Serial.println("\n# Actron RS485 tool (sniffer + MITM bridge + WS controller API)");
 
-  connectWifi();
-
-  // Read-only endpoints: GET. Mutating / bus-driving / OTA endpoints: POST — so they can't be
-  // triggered by browser prefetch / crawlers / caching and their params don't leak into GET logs.
-  // (POST handlers still read query-string args via server.arg(), so `curl -X POST ".../x?a=b"`
-  // works unchanged.)
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/stats", HTTP_GET, handleStats);
-  server.on("/log", HTTP_GET, handleLog);
-  server.on("/measure", HTTP_GET, handleMeasure);
-  server.on("/set", HTTP_POST, handleSet);
-  server.on("/clear", HTTP_POST, handleClear);
-  server.on("/update", HTTP_POST, handleUpdate);
-  server.on("/armwrite", HTTP_POST, handleArm);
-  server.on("/disarm", HTTP_POST, handleDisarm);
-  server.on("/txprobe", HTTP_POST, handleTxProbe);
-  server.on("/bridge", HTTP_POST, handleBridge);
-  server.on("/inject", HTTP_POST, handleInject);
-  server.on("/loopback", HTTP_POST, handleLoopback);
-  server.on("/uartcheck", HTTP_POST, handleUartCheck);
-  server.on("/blink", HTTP_POST, handleBlink);
-  server.on("/scramble", HTTP_POST, handleScramble);
-  server.on("/pulse", HTTP_POST, handlePulse);
-  server.on("/snapshot", HTTP_POST, handleSnapshot);
-  server.on("/replay", HTTP_POST, handleReplay);
-  server.on("/loadtemplate", HTTP_POST, handleLoadTemplate);
-  server.begin();
-
-  // Controller WS API (Home Assistant client) — separate port from the RE HTTP API so the
-  // two surfaces don't share state machines. Spec: ACTRON-MITM-API.md.
-  ws_api::Hooks hooks{};
-  hooks.injector = &g_b.bridge;          // NEO->board direction owns the INJECT rules
-  hooks.mode_var = &g_bridge_mode;
-  hooks.set_mode = setBridgeMode;
-  ws_api::begin(8767, hooks);
+  // Provision/connect WiFi: NVS creds via STA, or a SoftAP captive portal (actron-mitm-XXXX) if
+  // unprovisioned / connect fails. Only stand up the app HTTP+WS servers once we're on the
+  // network — in portal mode wifi_prov owns port 80. The RS485 bridge task (spawned below) runs
+  // in BOTH modes, so the A/C keeps bridging even while the controller waits to be provisioned.
+  if (wifi_prov::begin() == wifi_prov::Status::CONNECTED) {
+    startAppServer();
+  } else {
+    Serial.println("# Unprovisioned — SoftAP portal up; A/C bridge still running.");
+  }
 
   char st[600];
   statusLine(st, sizeof(st));
@@ -1324,9 +1356,13 @@ void setup() {
 }
 
 void loop() {
-  ArduinoOTA.handle();
-  server.handleClient();
-  ws_api::loop();
+  wifi_prov::loop();  // captive portal (PORTAL) + GPIO0 button + on-demand reconnect
   pumpConsole();
-  // pumpCapture() now runs on its own FreeRTOS task — see bridgeTask().
+  if (wifi_prov::isConnected()) {
+    ArduinoOTA.handle();
+    server.handleClient();
+    ws_api::loop();
+  }
+  // pumpCapture() / the A/C bridge run on their own FreeRTOS task — see bridgeTask() — so the
+  // bridge keeps relaying in both CONNECTED and PORTAL modes.
 }

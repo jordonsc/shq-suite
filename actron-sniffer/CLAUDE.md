@@ -119,6 +119,20 @@ embedding. `touch src/main.cpp` is NOT enough to bump the `fw=` string in `/stat
 you have to change the file's content (even a comment) before a rebuild will refresh
 those macros.
 
+**Device identity & OTA app-guard (2026-06-26).** This board shares the `40:4c:ca:51`
+OUI and the `POST /update` endpoint with the somfy-sdn controllers, so the image carries
+a native app id and `/update` refuses a foreign one:
+- `src/app_desc.cpp` overrides `esp_app_desc.project_name` = `"actron-mitm"` (strong
+  `extern "C"` symbol in `.rodata_desc` shadows the prebuilt `arduino-lib-builder` copy).
+  Twin of `somfy-sdn/src/app_desc.cpp`.
+- `/stats` starts `# app=actron-mitm`; `/stats.json` exposes `app`/`mac`.
+- `handleUpdate` runs `httpUpdate` with `rebootOnUpdate(false)`, then checks the written
+  boot partition's `esp_app_desc.project_name`; if it isn't `"actron-mitm"` it reverts the
+  boot partition and does **not** reboot. The guard's twin was validated live on the somfy
+  Jordon Study canary (an actron image was correctly rejected). **Not yet flashed to the
+  in-wall Actron** — its guard/id only take effect after the next OTA. See
+  `somfy-sdn/CLAUDE.md` → "Device identity & OTA app-guard" and ledger shq-suite-0012.
+
 ## Hardware
 
 | Part | Notes |
@@ -185,10 +199,26 @@ TX, so "don't transmit" is enforced in *firmware* — the sniffer never writes t
 bus writes until the protocol is understood and we deliberately enter the 0x67-reply phase (the
 NEO is bus master; stray transmits collide and can error the A/C).
 
-## WiFi credentials
+## WiFi provisioning (`src/wifi_prov.{h,cpp}`)
 
-Baked into `src/main.cpp` (throwaway experiment, LAN only) — currently set to the **SHQ**
-network. `HOSTNAME = "actron-sniffer"` → advertised as `http://redacted.local/`.
+**No baked credentials** — SSID/password live in NVS (Arduino `Preferences`, namespace `actron`),
+provisioned at runtime via a SoftAP captive portal. Ported from `somfy-sdn/src/wifi_prov.{h,cpp}`
+(trimmed: no motor/bus logic). Boot flow: read NVS → STA-connect with retries (all-channel scan,
+strongest AP) → on absence/failure start the SoftAP **`actron-mitm-XXXX`** (XXXX = last 2 STA-MAC
+octets) serving a WiFi-setup form. Provisioned creds survive OTA. Hostname/AP = `actron-mitm-XXXX`.
+
+- **The RS485 bridge runs in BOTH modes** (it's on its own FreeRTOS task), so the A/C keeps
+  bridging even while the controller sits unprovisioned in the portal. The app HTTP/WS servers
+  only start once STA-connected (`startAppServer()`); in portal mode `wifi_prov` owns port 80.
+- **Re-provision / move networks:** `POST /wifireset` wipes creds and reboots into the portal.
+- **⚠️ NO GPIO0 button here** (the somfy port has one): **GPIO0 is the NEO-side UART0 RX**
+  (`PIN_B_RX`). `pinMode(GPIO0, …)` kills NEO reception (`B.frames=0`, no A/C state to decode, HA
+  shows wrong status). This bit us during the port (2026-06-26, ledger shq-suite-0013) — never
+  touch GPIO0/GPIO1 from non-UART code.
+
+Replaces the old baked-`secrets.h` creds, which knocked the in-wall device off the network when an
+image was built without `secrets.h` and left no remote recovery (ledger shq-suite-0013). With
+provisioning, a failed connect falls back to the device's own AP — self-recoverable, no USB.
 
 ## Build & flash
 
@@ -206,7 +236,8 @@ ESP32-C6 needs the **pioarduino** platform fork (pinned in `platformio.ini`; bum
 | Endpoint | Purpose |
 |----------|---------|
 | `GET /` | help + status |
-| `GET /stats` | one-line status incl. `seq_max` |
+| `GET /stats` | one-line status; starts `# app=actron-mitm …` |
+| `GET /stats.json` | machine-readable identity + status (`app`/`model`/`mac`/`ip`/`fw`/`rssi`/`bridge`) — uniform with somfy-sdn so any TinyC6 on the LAN is positively identifiable |
 | `GET /log?since=<seq>&n=<max>` | frames; `since` returns only newer ones (incremental polling) |
 | `POST /set?baud=&parity=N\|E\|O&gap=<us>` | change capture settings live |
 | `GET /measure` | estimate baud from raw line pulse widths (~5s; needs bus activity) |
