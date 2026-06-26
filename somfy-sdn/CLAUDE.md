@@ -83,7 +83,8 @@ a dedicated FreeRTOS task owning UART1, and HTTP-pull OTA. New vs Actron: a **de
 | `src/devices.{h,cpp}` | **Pure C++.** Device table keyed by node addr — registration, position/limit application, stall + fault detection, comms-loss sweep. Host-tested. (This is the firmware's state model; there is intentionally no separate `state.cpp` — the table *is* the snapshot, serialised in `ws_api`/`http_api`.) |
 | `src/bus.{h,cpp}` | Arduino. The **only** code touching UART1. FreeRTOS task: LISTEN/ACTIVE TX gate, command queue + raw request/response, retry, polling cadence, passive sniffing → device table + sniffer ring + errlog, OTA teardown. |
 | `src/ws_api.{h,cpp}` | WebSockets controller API (port 8767). Push `state` snapshots, command/`ack`/`error`, heartbeat. Broadcasts only from the main loop (dirty-flag set by the bus task). **Protocol-level ping/pong with dead-client eviction is enabled in `begin()` (`enableHeartbeat(15000,5000,2)`)** — the app-level state push is a data broadcast, not a liveness probe, so without this a half-open client left by a WiFi blip (no TCP FIN) lingers until lwIP's retransmit timeout (minutes), stalling the WS service loop and blocking new handshakes. That was the root cause of multi-minute HA `unavailable` stretches on weak-signal motors (port-80 HTTP stays responsive throughout, masking it). Fixed in fw 1.1.5. **Wedge watchdog (fw 1.3.0):** the heartbeat only evicts *non-responsive* clients — it can't help when all `WEBSOCKETS_SERVER_CLIENT_MAX` (5) slots fill with *live* zombies (a client leaking duplicate connections, each kept alive by its own keepalive). At capacity the library refuses every new handshake (accept→drop, no HTTP response) and the device looks dead to HA while HTTP/the bus stay healthy. A controller only ever has one legitimate HA coordinator, so `loop()` reboots if `connectedClients()` stays at the cap continuously for `WEDGE_REBOOT_MS` (5 min); any drop below the cap resets the timer. This is the backstop for an HA-side connection leak fixed at source by the coordinator's close-before-reconnect (`somfy_sdn` 1.4.1) — it first wedged `bed_1_blinds_left`'s controller on 2026-06-14. |
-| `src/http_api.{h,cpp}` | HTTP debug API (port 80). `/stats /devices /log /errors` (GET) and `/mode /send /discover /move /forget /wifi /reconnect /update /clear` (POST). `/send` is the RE workhorse. |
+| `src/http_api.{h,cpp}` | HTTP debug API (port 80). `/stats /stats.json /devices /log /errors` (GET) and `/mode /send /discover /move /forget /wifi /reconnect /update /clear` (POST). `/send` is the RE workhorse. `/update` carries the **OTA app-guard** (see Device identity below). |
+| `src/app_desc.cpp` | **Native `esp_app_desc` override (Option A).** A strong `extern "C"` `esp_app_desc` in section `.rodata_desc` shadows the prebuilt Arduino one (`project_name="arduino-lib-builder"`), so the image's native descriptor reports `project_name="somfy-sdn"` + the real `SOMFY_FW_VERSION`. Read by `esp_ota_get_partition_description()` in the OTA guard and by `esptool image_info`. See "Device identity". |
 | `src/version.h` | `SOMFY_FW_VERSION` semver — bump on every flash (see root CLAUDE.md → Versioning). |
 | `src/wifi_prov.{h,cpp}` | NVS creds (Arduino `Preferences`), STA connect w/ retries, SoftAP captive portal, GPIO0 button (long = wipe, short = wink all), mDNS, configured-motor loading. **STA connect uses `WIFI_ALL_CHANNEL_SCAN` + `WIFI_CONNECT_AP_BY_SIGNAL`** (not the Arduino-default `WIFI_FAST_SCAN`, which joins the *first* matching BSSID — often a cached distant AP — and sticks there with no roaming), so every (re)connect joins the **strongest** AP for the SSID; a reboot/OTA now lands on the nearest AP. The stack has no live roaming once associated, so `requestReconnectBestAp()` (HTTP `POST /reconnect` / WS `reconnect_wifi` / HA button) forces an on-demand re-scan + reassociate — deferred to `loop()` so the ack flushes before the link drops. Hostname/SoftAP SSID = `somfy-sdn-<XXXX>` where `XXXX` is the last 2 octets of the **STA MAC** (`esp_read_mac(ESP_MAC_WIFI_STA)`), so it matches the device's label/MAC. (Do **not** use `ESP.getEfuseMac() & 0xFFFF` — that's the shared vendor OUI; every TinyC6 came out `4C40`. getEfuseMac also returns the *base* MAC, which differs from the STA MAC on the C6.) |
 | `src/main.cpp` | Boot wiring: bus task → WiFi/provisioning → HTTP+WS (when connected). |
@@ -146,6 +147,66 @@ way is to hold it open with a single live background SSH for the duration of the
 `ssh atlas 'cd ~/somfy-ota && exec python3 -m http.server 8088'` (run in background), verify it
 serves, `POST /update`, confirm the new `fw=`, then kill the SSH.
 
+### Fleet OTA run-book (flashing ALL Somfy controllers) — derive targets from HA, NEVER a scan
+
+**Cardinal rule:** the set of "Somfy devices" is answered **only by the `somfy_sdn` HA
+integration**. NEVER enumerate flash targets with a network/ARP scan or a MAC-OUI filter — every
+ESP32-C6 board here (Somfy controllers, the **actron-sniffer** which is the same board and shares
+the *identical* `POST /update` OTA endpoint, remote-mouse, …) shares the `40:4c:ca:51` Espressif
+OUI, so a scan sweeps in non-Somfy devices and can push the wrong firmware onto them. A 2026-06-25
+flash run did exactly this — an OUI scan put the Actron controller on the target list; it was only
+caught at the per-device fingerprint step. Membership = HA; the network is consulted *only* to find
+where an already-confirmed-Somfy device currently lives.
+
+1. **Build + test.** `pio test -e native` (must pass) → `pio run -e um_tinyc6` → bump
+   `SOMFY_FW_VERSION`. Stage `firmware.bin` on atlas; start the OTA server (above).
+2. **Derive the target set from HA (the ONLY membership source).** List config entries with
+   `domain == "somfy_sdn"`; for each, find its **controller device** in the device registry
+   (identifier `("somfy_sdn", "<mac>")`, `via_device_id == None`) and read its `mac` +
+   `configuration_url` (`http://<host>/` → the self-healed IP). This yields `{title, mac, ip}` per
+   controller. Do **not** add any IP that didn't come from this list.
+3. **Fingerprint-gate every IP before flashing** (belt-and-braces against a stale/wrong IP):
+   `GET /stats.json` and require **`app == "somfy-sdn"`** (fw ≥ 1.4.0; older fw: fall back to the
+   `/stats` shape — Somfy has `devices= online=`, Actron has `A.bytes= bridge= baud=`) **and** the
+   reported `mac` to match the registry MAC for that entry. Any non-Somfy `app`/fingerprint or MAC
+   mismatch → **ABORT that target**, don't flash it. (As of fw 1.4.0 the device *also* self-guards
+   — `/update` refuses a foreign image — but that's the last line of defence, not a substitute for
+   gating here.)
+4. **Present the manifest + confirm.** Show `{title, mac, ip, current_fw → target_fw}` and check
+   the count equals HA's `somfy_sdn` entry count. Flash only on explicit go-ahead.
+5. **Canary then batch.** The standing canary is the **"Jordon Study" controller** (MAC suffix
+   `3D24`; on a reserved IP — value in the private config). Always flash it first: it's the easiest
+   to physically pull off the wall for USB recovery if an OTA goes wrong.
+   Confirm it returns on the new `fw=`, the motor is healthy, and the HA coordinator reconnects
+   after the reboot — then flash the rest.
+6. **Verify all + retry stragglers** (one OTA retry is normal). Confirm every target reports the
+   new version. **Tear down the OTA server.** Update docs/ledger.
+
+**Abort conditions:** any IP whose `/stats` isn't Somfy; any device→registry MAC mismatch; the
+resolved-IP count ≠ the HA `somfy_sdn` entry count; or a device already on an unexpected version.
+
+### Device identity & OTA app-guard (fw 1.4.0)
+
+Three layers make a wrong-firmware flash hard, because this board, the actron-sniffer, and every
+other TinyC6 here share the `40:4c:ca:51` OUI **and** the `POST /update` endpoint:
+
+- **Native app id (`app_desc.cpp`, Option A).** The image's `esp_app_desc.project_name` is
+  `"somfy-sdn"` and `version` is the real `SOMFY_FW_VERSION` — readable from the running app, the
+  flash, or `esptool image_info`. (Actron's is `"actron-mitm"`.) The override works because a
+  strong `extern "C" esp_app_desc` in `.rodata_desc` stops the linker pulling the prebuilt
+  `arduino-lib-builder` copy from `libesp_app_format.a`. **Verify after a build:** the magic word
+  `0xABCD5432` in `firmware.bin`, then `project_name` at +48, `version` at +16.
+- **Surfaced id.** `/stats` starts `# app=somfy-sdn …`; `/stats.json` carries `app` + `model`.
+  This is what the run-book's fingerprint step checks.
+- **OTA app-guard (`handleUpdate`).** `/update` runs `httpUpdate` with `rebootOnUpdate(false)`,
+  then reads the just-written boot partition's `esp_app_desc`; if `project_name != "somfy-sdn"` it
+  **reverts the boot partition to the running app and does not reboot** — a foreign image is
+  written but never executed. Validated live on the Jordon Study canary (2026-06-26): a somfy image
+  flashed normally; the actron image was downloaded then **rejected** (device stayed on 1.4.0, no
+  reboot — uptime continuous). Note the early HTTP 200 ("pulling firmware") is sent before the
+  verdict, so a rejection shows only in the serial log + an unchanged `/stats` `fw=` — poll `/stats`
+  to confirm a flash actually took.
+
 ## HTTP API (port 80, LAN, all open)
 
 | Endpoint | Purpose |
@@ -179,7 +240,10 @@ component names the controller device off `mac` (stable across DHCP, unlike the 
 `position` (**native Somfy %**, HA inverts), `pulses` (absolute encoder count — provisioning aid,
 surfaced as a cover attribute), `moving`, `fault`, `online`, `up_limit`/`down_limit`,
 `direction` (`normal`/`reversed`). Direction is static — the bus task queries it once per device
-(alongside limits) so it reports rather than sitting unknown. Commands (envelope
+(alongside limits) so it reports rather than sitting unknown, **and re-reads it after a
+`set_direction` (fw 1.3.1)** — without that re-read the command ACKs on the wire but the cached
+`direction` never moves, so the HA "Reversed" switch snaps back to its old value and the change
+looks rejected even though the motor obeyed it (ledger shq-suite-0011). Commands (envelope
 `{type:"command", command, addr, id}`):
 `open` `close` `stop` `set_position{position=HA%}` `jog{direction,duration}` (timed CTRL_MOVE,
 commissioning) `move_steps{direction,pulses}` (post-cal) `set_top_limit` `set_bottom_limit`
@@ -235,9 +299,25 @@ Three distinct move messages (payloads cross-checked against `ccutrer/somfy_sdn`
 
 **NACK reason codes** (motor→tool `0x6F`, `data[0]`; from the SDN `Nack` table): `0x01`
 data_error, `0x10` unknown_message, `0x20` node_locked, **`0x21` wrong_position**, **`0x22`
-limits_not_set**, `0x23` ip_not_set, `0x24` out_of_range, `0xFF` busy. Observed on this
-uncalibrated motor: `0x21`/`0x22`/`0x11` when attempting MoveOf or set-limit — i.e. "no limits /
-no position reference yet", cleared once commissioned via CTRL_MOVE + limit-set.
+limits_not_set**, `0x23` ip_not_set, `0x24` out_of_range, **`0x2F` (see below)**, `0xFF` busy.
+Observed on this uncalibrated motor: `0x21`/`0x22`/`0x11` when attempting MoveOf or set-limit —
+i.e. "no limits / no position reference yet", cleared once commissioned via CTRL_MOVE + limit-set.
+
+**Reversing direction needs limits CLEARED first (NACK `0x2F`).** `SET_MOTOR_DIRECTION` only
+ACKs on a motor with **no limits set**; on a commissioned motor (limits programmed) the motor
+NACKs it with reason **`0x2F`** (not in the public table; established empirically on motor
+`16:4D:F4`, 2026-06-25 — ledger shq-suite-0011). This mirrors Somfy's own split of "reverse
+before limits" vs "reverse after limits" into two different procedures. So to flip a calibrated
+blind: **Reset positions** (clears limits) → toggle **Reversed** → re-**Set top/bottom limit**.
+The `0x2F` NACK is mapped to the human reason `"rejected: clear limits to change direction"`
+(`bus.cpp`), surfaced in the cover `status` attribute.
+
+**Direction-cache re-read (fw 1.3.1):** `direction` is read once at discovery and was never
+refreshed after a `set_direction`; combined with no optimistic state, a successful flip (limits
+clear) left the cache — and the HA "Reversed" switch — showing the old value, so it snapped back
+and looked rejected even when it worked. `execCommand` now re-reads direction after
+`SET_DIRECTION` (mirrors the post-limit-set re-read). This is independent of the `0x2F` block
+above: 1.3.1 fixes *reporting*; the motor still won't accept the change until limits are cleared.
 
 ## Open items (need a Somfy Set Pro capture — SPEC §13)
 

@@ -239,6 +239,11 @@ bool processInbound(const uint8_t* raw, size_t len) {
         case 0x21: reason = "rejected: position unknown"; break;
         case 0x20: reason = "rejected: locked"; break;
         case 0x24: reason = "rejected: out of range"; break;
+        // 0x2F: not in the public NACK table. Empirically returned for SET_MOTOR_DIRECTION on a
+        // COMMISSIONED motor — Somfy blocks a rotation-direction change once limits are set (their
+        // own docs split "reverse before limits" vs "reverse after limits" into two procedures).
+        // Clear the limits (Reset positions) first, flip direction, then re-set the limits.
+        case 0x2F: reason = "rejected: clear limits to change direction"; break;
         case 0xFF: reason = "rejected: busy"; break;
         default: break;
       }
@@ -486,8 +491,11 @@ void execCommand(const Command& c) {
   sdn::ParsedFrame reply;
   transact(msg, dst, dlen ? data : nullptr, dlen, &reply, nullptr, nullptr);
 
-  // After a limit-changing command, re-read the motor's actual limits (and position after a
-  // reset) so the cache + HA reflect reality immediately instead of showing stale values.
+  // After a state-changing command, re-read the motor's actual state so the cache + HA reflect
+  // reality immediately instead of showing stale values. Direction is otherwise only read once
+  // at discovery (never re-polled), so without this re-read a set_direction ACKs on the wire but
+  // the cached/HA-reported direction never moves — the HA "Reversed" switch snaps back to its old
+  // value and the change looks rejected even though the motor obeyed it.
   if (d != nullptr) {
     if (c.type == CmdType::RESET) {
       d->position_known = false;
@@ -497,6 +505,8 @@ void execCommand(const Command& c) {
                c.type == CmdType::SET_BOTTOM_LIMIT_AT) {
       queryLimits(d);
       queryPosition(d);
+    } else if (c.type == CmdType::SET_DIRECTION) {
+      queryDirection(d);
     }
   }
   if (g_on_changed) g_on_changed();

@@ -5,6 +5,8 @@
 #include <HTTPUpdate.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <esp_app_desc.h>
+#include <esp_ota_ops.h>
 
 #include <cstring>
 
@@ -20,6 +22,12 @@ namespace http_api {
 namespace {
 
 WebServer* g_server = nullptr;
+
+// Application identity — embedded in the native esp_app_desc (app_desc.cpp), surfaced in
+// /stats + /stats.json, and enforced by the OTA guard (handleUpdate) so a foreign image
+// (e.g. the actron-mitm firmware — same board, same /update endpoint) can't be flashed here.
+constexpr const char* APP_ID = "somfy-sdn";
+constexpr const char* APP_MODEL = "TinyC6";
 
 const char* modeStr() { return (bus::mode() == bus::Mode::ACTIVE) ? "active" : "listen"; }
 
@@ -56,13 +64,13 @@ String statusLine() {
     devices::Device* d = t.at(i);
     if (d && d->online) online++;
   }
-  char buf[420];
+  char buf[440];
   snprintf(buf, sizeof(buf),
-           "# mode=%s devices=%u online=%u "
+           "# app=%s mode=%s devices=%u online=%u "
            "tx=%u rx=%u polls=%u "
            "err.cksum=%u err.framing=%u err.timeout=%u err.nack=%u err.total=%u "
            "ws_clients=%u rssi=%d ip=%s fw=\"%s\"",
-           modeStr(), (unsigned)t.count(), (unsigned)online,
+           APP_ID, modeStr(), (unsigned)t.count(), (unsigned)online,
            st.tx_frames, st.rx_frames, st.polls,
            st.err_checksum, st.err_framing, st.err_timeout, st.err_nack,
            (unsigned)bus::errors().total(),
@@ -192,6 +200,8 @@ void handleStatsJson() {
     if (d && d->online) online++;
   }
   JsonDocument doc;
+  doc["app"] = APP_ID;
+  doc["model"] = APP_MODEL;
   doc["fw"] = SOMFY_FW_VERSION;
   doc["build"] = __DATE__ " " __TIME__;
   doc["mode"] = modeStr();
@@ -482,12 +492,32 @@ void handleUpdate() {
   bus::otaSuspend();
 
   WiFiClient client;
-  httpUpdate.rebootOnUpdate(true);
+  // Don't let httpUpdate reboot us automatically — we verify the written image's app identity
+  // first (OTA app-guard). httpUpdate.update() still switches the boot partition on success;
+  // we either boot it (id matches) or revert the boot partition (foreign image, never booted).
+  httpUpdate.rebootOnUpdate(false);
   t_httpUpdate_return r = httpUpdate.update(client, url);
 
-  // Only reached on failure — success reboots from inside httpUpdate.
-  Serial.printf("# OTA failed (%d): %s\n", (int)r, httpUpdate.getLastErrorString().c_str());
-  bus::otaResume();
+  if (r == HTTP_UPDATE_OK) {
+    const esp_partition_t* next = esp_ota_get_boot_partition();
+    esp_app_desc_t d{};
+    if (next != nullptr && esp_ota_get_partition_description(next, &d) == ESP_OK &&
+        strcmp(d.project_name, APP_ID) == 0) {
+      Serial.printf("# OTA ok (app=%s ver=%s) — rebooting\n", d.project_name, d.version);
+      delay(150);
+      ESP.restart();
+    } else {
+      // Wrong-firmware guard: a non-somfy-sdn image (e.g. actron-mitm) reached this device.
+      // Point the boot partition back at the running app so the foreign image is never executed.
+      esp_ota_set_boot_partition(esp_ota_get_running_partition());
+      Serial.printf("# OTA REJECTED: image app=\"%s\" != \"%s\" — reverted, staying on %s\n",
+                    d.project_name, APP_ID, SOMFY_FW_VERSION);
+      bus::otaResume();
+    }
+  } else {
+    Serial.printf("# OTA failed (%d): %s\n", (int)r, httpUpdate.getLastErrorString().c_str());
+    bus::otaResume();
+  }
 }
 
 }  // namespace
