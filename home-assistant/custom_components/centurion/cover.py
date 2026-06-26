@@ -9,7 +9,15 @@ from .const import DOMAIN, CONF_IP_ADDRESS, CONF_API_KEY
 
 _LOGGER = logging.getLogger(__name__)
 
-SCAN_INTERVAL = timedelta(seconds=30)
+# Baseline poll cadence. Kept short-ish so HA's idea of the door doesn't drift
+# too far when the door is operated outside HA (Centurion app / a directly-paired
+# remote). While the door is actually moving, `_track_until_settled` polls much
+# faster — see that method and ledger shq-suite-0007.
+SCAN_INTERVAL = timedelta(seconds=10)
+
+# Fast-poll cadence + safety bound used while the door is opening/closing.
+MOTION_POLL_INTERVAL = 2.0
+MOTION_POLL_TIMEOUT = 60.0
 
 async def async_setup_entry(hass, config_entry, async_add_entities):
     ip = config_entry.data[CONF_IP_ADDRESS]
@@ -23,6 +31,7 @@ class CenturionGarageDoor(CoverEntity):
         self._state = STATE_CLOSED
         self._position = 0
         self._available = True
+        self._tracking = False
         self._attr_unique_id = f"centurion_garage_{ip.replace('.', '_')}"
 
     def _base_url(self):
@@ -77,6 +86,37 @@ class CenturionGarageDoor(CoverEntity):
     def current_cover_position(self):
         return self._position
 
+    def _apply_door_state(self, door_state):
+        """Map a raw controller door-status string onto _state/_position.
+
+        Returns the previous _state so callers can detect a transition. The
+        controller's strings are verbose (e.g. "closed by wifi", "opening by
+        wifi", "opened. intruder alert"), hence the startswith matching; order
+        matters ("opening" before "open").
+        """
+        old_state = self._state
+        if door_state.startswith("opening"):
+            self._state = STATE_OPENING
+            self._position = 50
+        elif door_state.startswith("closing"):
+            self._state = STATE_CLOSING
+            self._position = 50
+        elif door_state.startswith("close") or door_state.startswith("closed"):
+            self._state = STATE_CLOSED
+            self._position = 0
+        elif door_state.startswith("open"):
+            self._state = STATE_OPEN
+            self._position = 100
+        elif "stopped" in door_state or "error" in door_state:
+            self._state = STATE_OPEN
+            self._position = 50
+            _LOGGER.warning("Door in stopped/error state: %s", door_state)
+        else:
+            _LOGGER.warning("Unexpected door state: %s", door_state)
+            self._state = STATE_OPEN
+            self._position = 50
+        return old_state
+
     async def async_update(self):
         try:
             response = await self.hass.async_add_executor_job(
@@ -89,38 +129,62 @@ class CenturionGarageDoor(CoverEntity):
                 _LOGGER.info("Centurion controller back online, door state: %s", door_state)
             self._available = True
 
-            old_state = self._state
-            if door_state.startswith("opening"):
-                self._state = STATE_OPENING
-                self._position = 50
-            elif door_state.startswith("closing"):
-                self._state = STATE_CLOSING
-                self._position = 50
-            elif door_state.startswith("close") or door_state.startswith("closed"):
-                self._state = STATE_CLOSED
-                self._position = 0
-            elif door_state.startswith("open"):
-                self._state = STATE_OPEN
-                self._position = 100
-            elif "stopped" in door_state or "error" in door_state:
-                self._state = STATE_OPEN
-                self._position = 50
-                _LOGGER.warning("Door in stopped/error state: %s", door_state)
-            else:
-                _LOGGER.warning("Unexpected door state: %s", door_state)
-                self._state = STATE_OPEN
-                self._position = 50
+            old_state = self._apply_door_state(door_state)
 
             if old_state != self._state:
                 _LOGGER.info(
                     "Centurion door state changed: %s -> %s (raw: %s)",
                     old_state, self._state, door_state
                 )
+                # Door just started moving and it wasn't us (HA commands kick the
+                # tracker themselves) — likely the Centurion app or a directly-
+                # paired remote. Fast-track it so HA doesn't sit in opening/closing
+                # for up to a poll interval after the door physically stops.
+                if self._state in (STATE_OPENING, STATE_CLOSING):
+                    self.hass.async_create_task(self._track_until_settled())
 
         except Exception as e:
             if self._available:
                 _LOGGER.error("Centurion controller unreachable: %s", e)
             self._available = False
+
+    async def _track_until_settled(self):
+        """Fast-poll the controller while the door is moving so HA registers it
+        reaching open/closed within ~MOTION_POLL_INTERVAL instead of waiting for
+        the next SCAN_INTERVAL poll.
+
+        Fix for the garage-remote "press twice" defect (ledger shq-suite-0007).
+        The remote drives cover.toggle, and HA core resolves a toggle to STOP
+        whenever it believes the cover is opening/closing (the entity advertises
+        CoverEntityFeature.STOP). With the old 30 s poll, HA could sit in
+        opening/closing for up to ~30 s after the door had physically stopped;
+        an at-rest press in that window mis-resolved to STOP and was silently
+        eaten, so a second press was needed. Keeping HA's state tight to reality
+        removes the window.
+        """
+        if self._tracking:
+            return
+        self._tracking = True
+        try:
+            elapsed = 0.0
+            while elapsed < MOTION_POLL_TIMEOUT:
+                await asyncio.sleep(MOTION_POLL_INTERVAL)
+                elapsed += MOTION_POLL_INTERVAL
+                try:
+                    door_state = await self.hass.async_add_executor_job(self._get_door_state)
+                except Exception:
+                    continue  # transient read failure; keep trying until the bound
+                old_state = self._apply_door_state(door_state)
+                if old_state != self._state:
+                    _LOGGER.info(
+                        "Centurion motion-track: %s -> %s (raw: %s)",
+                        old_state, self._state, door_state,
+                    )
+                self.async_write_ha_state()
+                if self._state in (STATE_OPEN, STATE_CLOSED):
+                    return
+        finally:
+            self._tracking = False
 
     def _get_door_state(self):
         """Poll the controller and return the raw door state string."""
@@ -177,12 +241,16 @@ class CenturionGarageDoor(CoverEntity):
         self._state = STATE_OPENING if "opening" in door_state else STATE_OPEN
         self._position = 50 if "opening" in door_state else 100
         self.async_write_ha_state()
+        if self._state == STATE_OPENING:
+            self.hass.async_create_task(self._track_until_settled())
 
     async def async_close_cover(self, **kwargs):
         door_state = await self._send_command_with_retry("close", ["closing", "close"])
         self._state = STATE_CLOSING if "closing" in door_state else STATE_CLOSED
         self._position = 50 if "closing" in door_state else 0
         self.async_write_ha_state()
+        if self._state == STATE_CLOSING:
+            self.hass.async_create_task(self._track_until_settled())
 
     async def async_stop_cover(self, **kwargs):
         try:

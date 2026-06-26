@@ -106,7 +106,11 @@ argus:
 
 **Config**: UI config flow — prompts for IP address and API key
 
-**Communication**: Simple HTTP GET with query params (`?key={api_key}&door=open`). All entities have availability tracking — go unavailable when the controller is unreachable, recover automatically on next successful poll.
+**Communication**: Simple HTTP GET with query params (`?key={api_key}&door=open`). All entities have availability tracking — go unavailable when the controller is unreachable, recover automatically on next successful poll. The controller's `door` status strings are verbose (`closed by wifi`, `opening by wifi`, `opened. intruder alert`) — `cover.py` `startswith`-matches them (order matters: `opening` before `open`).
+
+**Motion fast-tracking (cover 1.1.0)** — baseline poll is 10 s (`SCAN_INTERVAL`), but while the door is opening/closing `_track_until_settled` fast-polls every 2 s (60 s bound) until it reaches open/closed. Without it, HA could sit in `opening`/`closing` for up to a full poll interval after the door had physically stopped; because the entity advertises `STOP`, HA core resolves `cover.toggle` to **stop** while it thinks the cover is moving, so an at-rest press from the garage remote (which drives `cover.toggle` via `automation.open_close_garage`) mis-resolved to a no-op STOP and was silently eaten — the "press twice" defect (ledger **shq-suite-0007**). The tracker is kicked from `async_open_cover`/`async_close_cover` (HA-initiated) and from `async_update` when it first observes externally-initiated motion (Centurion app / a directly-paired remote). Re-entrancy-guarded by `self._tracking`.
+
+**Garage remote path**: Merlin remote → Merlin E8003 receiver (relay) → TinyS3 ESP32 on legacy `matter-apps` firmware (Matter-over-WiFi, `app_sensor` BooleanState input) → `binary_sensor.garage_remote_button_1` → `automation.open_close_garage` (disarm alarm, then `cover.toggle`). The remote is purely an *input*; this component does the actuation. `cover.toggle`'s stop-while-moving behaviour is intended (classic open→stop→close cycle) — the fix above is about HA's state tracking reality, not changing that semantics.
 
 **Key files**: `config_flow.py`, `cover.py`, `switch.py`
 
