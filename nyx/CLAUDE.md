@@ -1,5 +1,12 @@
 # Nyx Display Server
 
+> ⚠️ **Authoritative source is the Argus repo — build/deploy from there, not here.**
+> As part of the Argus work, Nyx was extracted into the **Argus edge suite** (`jordonsc/argus`,
+> `/mnt/t/Repos/argus/nyx`), which is now the home for the edge components (nyx, chronos, overwatch,
+> argus). Build/deploy with **`./setup nyx` from the Argus repo**. This shq-suite copy is currently in
+> sync (byte-identical) but is **secondary** — make changes and deploys in the Argus repo to avoid
+> divergence (the way Overwatch silently diverged: 0.5.1 vs 0.5.0 here — see ledger shq-suite-0015).
+
 Rust application that controls wall display kiosks. Manages backlight brightness, auto-dim/sleep, touch wake detection, and Chrome navigation via CDP. Exposes a WebSocket API on port 8765.
 
 ## Source Layout

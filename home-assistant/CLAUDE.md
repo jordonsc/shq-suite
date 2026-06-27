@@ -4,12 +4,19 @@ Custom integrations for Home Assistant.
 
 ## Components
 
+> ⚠️ **The edge-suite components (`shq_display`, `overwatch`, `argus`) are authoritative in the Argus
+> repo** (`jordonsc/argus/home-assistant/custom_components/`) — that's where they're maintained and
+> deployed from now. `shq_display`/`overwatch` are currently in sync; the `argus` component is **ahead
+> there** (0.3.0 vs 0.1.0 here). Edit/deploy those three from the Argus repo. The rest below
+> (`dosa`, `actron_mitm_controller`, `centurion`, `somfy_sdn`, `cfa_fire_ban`) are **owned by this
+> shq-suite repo**. See ledger shq-suite-0015.
+
 | Component | Protocol | Port | Config Type | Description |
 |-----------|----------|------|-------------|-------------|
-| `shq_display` | WebSocket | 8765 | YAML | Nyx kiosk display control |
-| `overwatch` | gRPC | 50051 | YAML | Voice TTS and alarm control |
+| `shq_display` | WebSocket | 8765 | YAML | Nyx kiosk display control · **→ Argus repo** |
+| `overwatch` | gRPC | 50051 | YAML | Voice TTS and alarm control · **→ Argus repo** |
 | `dosa` | WebSocket | 8766 | YAML | Door controller (CNC-driven) |
-| `argus` | WebSocket | 8770 | YAML | AI alarm-assessment status + ack/standdown (Argus daemon on atlas) |
+| `argus` | WebSocket | 8770 | YAML | AI alarm-assessment status + ack/standdown (Argus daemon on atlas) · **→ Argus repo (ahead: 0.3.0)** |
 | `actron_mitm_controller` | WebSocket | 8767 | Config Flow | Actron A/C via local MITM bridge (actron-sniffer ESP32) |
 | `centurion` | HTTP REST | — | Config Flow | Centurion garage door |
 | `somfy_sdn` | WebSocket | 8767 | Config Flow | Somfy SDN blind motors via the somfy-sdn ESP32 (one `cover` per motor) |

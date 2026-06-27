@@ -1,5 +1,11 @@
 # Chronos Clock Overlay
 
+> ⚠️ **Authoritative source is the Argus repo — build/deploy from there, not here.**
+> Chronos was extracted into the **Argus edge suite** (`jordonsc/argus`, `/mnt/t/Repos/argus/chronos`)
+> as part of the Argus work, alongside nyx/overwatch/argus. This shq-suite copy is currently in sync
+> (byte-identical) but is **secondary** — make changes and deploys in the Argus repo to avoid divergence
+> (see ledger shq-suite-0015 for the Overwatch case where this trap bit).
+
 Tiny Rust binary that draws a fullscreen clock on a kiosk, **above** the Chromium dashboard, as an idle screensaver. Spawned and killed by `nyx` (it is not a service and has no API). Replaces the plain screen-off behaviour on kiosks configured with `idle_mode: clock`.
 
 ## How it fits together

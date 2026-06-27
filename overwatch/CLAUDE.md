@@ -1,5 +1,14 @@
 # Overwatch Voice Server
 
+> ⚠️ **STALE COPY — DO NOT BUILD OR DEPLOY FROM THIS REPO.**
+> Overwatch's live source of truth and deployment moved to the **Argus project** (`jordonsc/argus`,
+> `/mnt/t/Repos/argus/overwatch`) as part of the Argus work — Argus is now Overwatch's primary consumer
+> (voice + klaxon) and owns its release cadence. The Argus copy is **ahead** (e.g. 0.5.1 audio self-heal
+> vs 0.5.0 here, diverged `audio.rs`). Build/deploy Overwatch with **`./setup overwatch` from the Argus
+> repo**, and edit its config at `argus/deploy/config/app/overwatch.yaml`. Deploying from shq-suite would
+> push a regressed binary and a divergent config to `overwatch.shq.sh`. This tree is kept only for
+> reference/history. (Both deploy to the same host: `overwatch.shq.sh`.)
+
 Rust gRPC server for text-to-speech (AWS Polly) and alarm playback. Runs on a dedicated RPi 5 with USB audio output.
 
 ## Source Layout

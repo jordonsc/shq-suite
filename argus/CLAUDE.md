@@ -1,5 +1,14 @@
 # Argus
 
+> ⚠️ **This is the pre-split monolith (v0.36.0) — active development has moved out of this repo.**
+> The "Phase-02 thin-agent" refactor split Argus into two homes: the **edge agent** lives in the
+> **Argus repo** (`jordonsc/argus`, `/mnt/t/Repos/argus/argus`, now at v3.x) and the **assess/command
+> backend** lives in **js_web** (`services/argus/...`). The `argus` HA component also advanced there
+> (0.3.0 vs 0.1.0 here). Build/deploy Argus from the **Argus repo** (`./setup argus` / container deploy),
+> **not** from shq-suite. This tree is the last monolithic snapshot before the split, kept for
+> reference/history; deploying it would push the old architecture. See ledger argus-0010/argus-0011
+> (the split) and shq-suite-0015 (the divergence trap).
+
 AI-powered alarm assessment daemon. When `alarm_control_panel.shq_alarm`
 transitions to `triggered`, Argus captures camera stills, sends them to Claude
 with the private premises seed, and logs a natural-language assessment.
