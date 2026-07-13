@@ -50,6 +50,18 @@ state::ControllerState current_state_;  // most recent decoder output for transi
 
 uint32_t last_heartbeat_ms_ = 0;
 
+// Wedge watchdog (ported from somfy-sdn ws_api, fw 1.3.0). WebSocketsServer has a hard
+// WEBSOCKETS_SERVER_CLIENT_MAX (5) client cap. If every slot fills with live-but-idle zombie
+// connections — each kept alive by its own WS keepalive, so enableHeartbeat's reaper never evicts
+// them — the library refuses all new handshakes (accept then drop, no HTTP response) and the
+// device looks dead to HA while the HTTP API and the RS485 bridge stay perfectly healthy. There
+// is only ever ONE legitimate HA coordinator, so sitting at the full cap for minutes is an
+// unambiguous wedge: self-heal by rebooting (WiFi creds live in NVS; the bridge task re-inits to
+// INJECT on boot, so the A/C keeps bridging). Backstop to the HA client's close-before-reconnect
+// fix (actron_mitm_controller 1.1.1). Cannot boot-loop: a fresh boot starts with 0 clients.
+constexpr uint32_t WEDGE_REBOOT_MS = 5 * 60 * 1000;  // continuously at cap this long => reboot
+uint32_t at_capacity_since_ms_ = 0;                  // millis() when we hit the cap; 0 = below cap
+
 // ---- Transition table --------------------------------------------------
 //
 // Pulse-style transitions (mode / fan / master setpoint / zone enable) don't need rule
@@ -568,6 +580,14 @@ void begin(uint16_t port, const Hooks& hooks) {
   (void)port;
   server.begin();
   server.onEvent(onEvent);
+  // Protocol-level ping/pong with dead-client eviction (ported from somfy-sdn ws_api, fw 1.1.5).
+  // The app-level state heartbeat below is a data push, not a liveness probe — it can't detect a
+  // half-open socket. When a brief WiFi disruption drops the HA client's association without a TCP
+  // FIN, the zombie connection lingers until lwIP's retransmit timeout (minutes), during which
+  // writes to it stall the WS service loop and HA sees no state → `unavailable`. Ping every 15 s,
+  // expect a pong within 5 s, disconnect after 2 consecutive misses (~30 s to reap). This is the
+  // primary fix for the recurring 30-40 s `unavailable` flaps (ledger shq-suite-0019).
+  server.enableHeartbeat(15000, 5000, 2);
   last_heartbeat_ms_ = millis();
 }
 
@@ -581,6 +601,23 @@ void loop() {
     last_published_state_ = current_state_;
     last_published_valid_ = true;
     last_heartbeat_ms_ = t;
+  }
+
+  // Wedge watchdog (see the note by at_capacity_since_ms_): if every WS slot has been occupied
+  // continuously for WEDGE_REBOOT_MS, the server can no longer accept the HA coordinator — reboot
+  // to self-heal. Any drop below the cap resets the timer, so only a genuine stuck-full state trips.
+  if (server.connectedClients() >= WEBSOCKETS_SERVER_CLIENT_MAX) {
+    if (at_capacity_since_ms_ == 0) {
+      at_capacity_since_ms_ = t;
+    } else if ((uint32_t)(t - at_capacity_since_ms_) >= WEDGE_REBOOT_MS) {
+      Serial.printf("[ws] WEDGE: %u clients at cap for >%us — rebooting to self-heal\n",
+                    (unsigned)server.connectedClients(), WEDGE_REBOOT_MS / 1000);
+      Serial.flush();
+      delay(50);
+      ESP.restart();
+    }
+  } else {
+    at_capacity_since_ms_ = 0;
   }
 }
 
