@@ -1,0 +1,13 @@
+lock_now:
+  name: Lock now
+  description: >-
+    End any held unlock (e.g. a REX press that was never followed by a door cycle)
+    and re-engage the lock immediately.
+  fields:
+    device_id:
+      name: Hub device ID
+      description: The UA hub device id from the component config (e.g. 1c0b8beec226).
+      required: true
+      example: 1c0b8beec226
+      selector:
+        text:

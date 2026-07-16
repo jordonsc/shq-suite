@@ -21,6 +21,7 @@ Custom integrations for Home Assistant.
 | `centurion` | HTTP REST | — | Config Flow | Centurion garage door |
 | `somfy_sdn` | WebSocket | 8767 | Config Flow | Somfy SDN blind motors via the somfy-sdn ESP32 (one `cover` per motor) |
 | `cfa_fire_ban` | HTTP (RSS) | — | YAML | CFA fire ban & danger ratings |
+| `unifi_access_dps` | WebSocket (wss) | 12445 | YAML | Front-door DPS workaround — raw hub input via the UniFi Access developer websocket |
 
 ## shq_display (Nyx Kiosk Control)
 
@@ -181,6 +182,26 @@ cfa_fire_ban:
 **MAC-keyed identity (config entry v2)**: `entity.controller_id()` returns `coordinator.controller_key` = the controller MAC (bare hex, e.g. `404cca512e64`), so every entity `unique_id` and device identifier survives a DHCP IP change — was `f"{host}:{port}"` (v1), which re-keyed/orphaned everything on an IP change. `controller_key` is fixed at coordinator init from the entry's MAC `unique_id` (falls back to `host:port` for manual entries with no discovered MAC). Identifier shapes: controller = `<mac>`, motor = `<mac>:AA:BB:CC`. `async_migrate_entry` (v1→v2, `__init__.py`) rewrites existing registry unique_ids + device identifiers in place (history/customisations preserved) and renames the IP-bearing controller entity_ids to a MAC slug (`somfy_sdn_40_4c_ca_51_2e_64_*`); motor entity_ids were already addr-based. Verified live: 3 entries migrated, 0 orphans, a renamed motor ("Gym Blinds") survived. **Bump `ConfigFlow.VERSION` + extend the migration if the identifier scheme changes again.**
 
 **Key files**: `client.py`, `coordinator.py` (`controller_key`, `_mac_norm`/`_format_mac`), `config_flow.py` (`VERSION`), `__init__.py` (`async_migrate_entry`), `entity.py` (shared bases + controller `device_info`), `cover.py` (per-motor entity + entity services), `services.yaml`, `const.py`.
+
+## unifi_access_dps (Front Door DPS workaround)
+
+**Why it exists**: the UA-Hub-Door-Mini's wire-presence detection false-negatives on the DPS terminals (`wiring_state_d1-dps-pos/neg = off` since 2026-03-11) even though the DPS input itself works — the hub relocks-on-close from it. The Access controller trusts the wiring state, so it publishes `door_position_status = "none"` / `dps_connected: false` on the developer API, and the core `unifi_access` integration's DPS entity (`binary_sensor.front_door_door_position_sensor`) can never update. **UniFi firmware bug — remove this component once Ubiquiti fix wire detection** (watch: `GET /api/v1/developer/doors` returning `open`/`close` instead of `none`). Full history: ledger shq-suite-0020.
+
+**How it works**: connects to the same developer websocket the core integration uses (`wss://<host>:12445/api/v1/developer/devices/notifications`, via the `py-unifi-access` lib — already pinned by core, so no new deps) and reads the **raw hub input** from `access.data.device.update` messages: `data.configs[]` key `input_d1_dps` (`on` = circuit closed = door closed, `off` = open). Updates are push-only; the hub emits them on state changes (every open involves an unlock on a fail-safe maglock, so real usage is fully covered).
+
+**Entities** (per configured door, both `RestoreEntity` — state survives restarts; `unknown` until the first hub event on a fresh install):
+- `binary_sensor.<name>_position` (device class *door*, `on` = open) — from the raw hub input. Attributes: `raw_input`, `input_updated_at` (UniFi's config timestamp — unreliable, informational only), `wiring_detected` (the buggy wire-presence flag — flips `true` when Ubiquiti fix it), `ws_connected`, `restored`.
+- `binary_sensor.<name>_lock` (device class *lock*, `on` = unlocked) — the maglock relay state, which the controller publishes correctly (`state.lock` in location updates / `door_lock_relay_status` on `GET /doors`) but the core integration exposes no entity for. Fed by websocket location updates **plus a 30s `get_doors` poll** (seeds initial state at startup, covers missed pushes). Only created when the door has a `door_id`. **Relay "locked" ≠ door secured**: it means the magnet is energised — secured = locked AND position closed. When unlocked, the door relaxes slightly ajar (no mechanical latch), so DPS correctly reads open until it's held shut and the magnet re-grabs.
+
+**Service**: `unifi_access_dps.lock_now {device_id}` — sends lock rule `lock_now` (accepted by the API but absent from the core integration's `vol.In` allowlist) to end a held unlock immediately. Kept for manual use; a force-relock automation was built then removed 2026-07-16 — the REX-walk-away case leaves the door ajar, so the *Front Door Open* left-open alert covers it.
+
+**Config** (YAML, in `deploy/config/ha/configuration.yaml`): `host`, `api_token` (`!secret unifi_access_token` — same token as the core integration), optional `verify_ssl` (default false), `doors: [{device_id: <hub MAC-id>, door_id: <Access door/location UUID>, name: <base name>, input_key: input_d1_dps}]`.
+
+**Consumers**: `binary_sensor.front_door_position` drives the *Front Door Open* (left-open alert, id 1769997461752) and *Alarm Sensors* (id 1770875325186) automations plus the dashboard-shq DPS badge — all rewired from the dead core entity 2026-07-16. Swap them back if the core entity revives.
+
+**⚠️ Never remote-unlock a maglock door unattended** (`PUT /doors/{id}/unlock` or otherwise): with no mechanical latch the door can swing open on its own and stand open — the relay re-engaging 10s later holds nothing.
+
+**Key files**: `__init__.py` (YAML schema + setup + service), `coordinator.py` (websocket consumer + lock poll, `UnifiAccessDpsHub`), `binary_sensor.py`, `services.yaml`, `const.py`.
 
 ## HA Server Config
 

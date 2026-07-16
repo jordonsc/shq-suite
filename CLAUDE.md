@@ -74,7 +74,7 @@ Argus is unusual: the daemon runs **on the HA host itself (atlas)**, and HA also
 - All target **Raspberry Pi 5 ARM64** via `cross` with Podman (not Docker)
 - Cross-compile: `cd <app> && ./build-rpi.sh`
 - Build output goes to `<app>/build/` for deployment
-- **The edge suite has moved out:** `nyx`, `chronos`, `overwatch`, and `argus` are now authoritative in the **Argus repo** (`jordonsc/argus`) — build/deploy them with that repo's `./setup`, not here. The shq-suite copies are secondary (some already diverged: overwatch 0.5.1 vs 0.5.0, argus split out entirely). Deploying them from here can regress the host. Still owned by **this** repo: `dosa`, the firmware (`actron-sniffer`, `somfy-sdn`), `shelly`, and the `dosa`/`centurion`/`actron_mitm_controller`/`somfy_sdn`/`cfa_fire_ban` HA components. See ledger shq-suite-0015.
+- **The edge suite has moved out:** `nyx`, `chronos`, `overwatch`, and `argus` are now authoritative in the **Argus repo** (`jordonsc/argus`) — build/deploy them with that repo's `./setup`, not here. The shq-suite copies are secondary (some already diverged: overwatch 0.5.1 vs 0.5.0, argus split out entirely). Deploying them from here can regress the host. Still owned by **this** repo: `dosa`, the firmware (`actron-sniffer`, `somfy-sdn`), `shelly`, and the `dosa`/`centurion`/`actron_mitm_controller`/`somfy_sdn`/`cfa_fire_ban`/`unifi_access_dps` HA components. See ledger shq-suite-0015.
 - All use `tokio` async runtime, `tracing` for logging, `serde` for JSON
 - Run with `RUST_LOG=info` (or `RUST_LOG=<app>=debug`)
 - No test suites — tested manually on hardware
