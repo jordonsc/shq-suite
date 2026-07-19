@@ -441,12 +441,38 @@ static void pumpCapture() {
 // during the genuine idle window between bursts (Modbus master pacing leaves >6 ms here, which
 // is plenty of room for HTTP / OTA work).
 static TaskHandle_t g_bridge_task = nullptr;
+
+// Yield budget (ledger shq-suite-0019). The original code only yielded when BOTH UARTs were
+// momentarily idle. Under sustained bus traffic (e.g. heating season) that idle window rarely
+// materialises, so this priority-5 task busy-loops for tens of seconds and starves the
+// priority-1 Arduino main loop — which runs the HTTP server AND ws_api::loop(). Measured on the
+// in-wall device: ~28-37 s stretches where HTTP + the WS state-push both go dark (ICMP stays up,
+// seq_max keeps climbing → pure loop starvation, not WiFi), tripping HA's 30 s availability
+// timeout and flapping every climate.actron_ac_* entity unavailable ~hourly.
+//
+// Fix: cap the time we may pump without yielding. A single vTaskDelay(1) is ~1 ms — well under
+// t3.5 (~3.65 ms at 9600 8N1), the board's premature-frame-end threshold — and is the SAME
+// sub-threshold hiccup the idle-yield below has inserted in-wall for months without splitting a
+// frame. So the yield is safe even if it lands mid-frame. Preference order preserves relay
+// integrity: (1) real idle gap; (2) budget elapsed AND between frames (nothing in flight);
+// (3) hard cap as a last resort, bounding worst-case main-loop starvation to ~one max Modbus
+// frame. Byte-level forwarding within a frame is never interrupted for more than one tick.
+static constexpr uint32_t BRIDGE_YIELD_BUDGET_MS = 20;   // preferred max time between yields
+static constexpr uint32_t BRIDGE_YIELD_HARD_MS   = 250;  // absolute cap (~one max Modbus frame)
+
 static void bridgeTask(void* /*arg*/) {
+  uint32_t last_yield = millis();
   for (;;) {
     if (g_capture) {
       pumpCapture();
-      if (!g_a.uart.available() && !g_b.uart.available()) {
-        vTaskDelay(1);  // bus idle: let lower-priority main loop run
+      bool idle = !g_a.uart.available() && !g_b.uart.available();
+      uint32_t since = (uint32_t)(millis() - last_yield);
+      bool mid_frame = g_a.bridge.isMidFrame() || g_b.bridge.isMidFrame();
+      if (idle ||                                            // (1) genuine idle window
+          (since >= BRIDGE_YIELD_BUDGET_MS && !mid_frame) || // (2) budget, safely between frames
+          since >= BRIDGE_YIELD_HARD_MS) {                   // (3) hard cap (sub-t3.5, mid-frame OK)
+        vTaskDelay(1);  // let the priority-1 main loop (HTTP + WS) run
+        last_yield = millis();
       }
     } else {
       // Capture disabled (e.g. OTA, loopback test). pumpCapture is the only thing that
@@ -454,6 +480,7 @@ static void bridgeTask(void* /*arg*/) {
       // arrives — the previous "yield only on idle" branch would never fire and starve
       // the priority-1 main loop. Always yield when capture is off.
       vTaskDelay(1);
+      last_yield = millis();
     }
   }
 }

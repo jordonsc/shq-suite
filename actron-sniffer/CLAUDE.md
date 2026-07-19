@@ -70,6 +70,23 @@ task busy-loops while either UART has bytes available (forwarding without preemp
 a full Modbus burst, max ~250 ms) and only yields via `vTaskDelay(1)` during the genuine
 idle window between bursts. Don't move pumpCapture back to `loop()`.
 
+**Yield budget (2026-07-19, ledger shq-suite-0019) — the "idle-only" yield above starved the
+main loop under load.** The original code yielded *only* when BOTH UARTs were momentarily idle.
+Under sustained bus traffic (heating season) that window rarely materialises, so the priority-5
+`bridgeTask` busy-looped for **28–37 s** at a stretch and starved the priority-1 main loop —
+which runs the HTTP server AND `ws_api::loop()`. Both went dark together while ICMP stayed up
+and `seq_max` kept climbing (proved it was pure loop starvation, not WiFi), tripping HA's 30 s
+availability timeout and flapping every `climate.actron_ac_*` entity unavailable ~hourly (the
+user-facing symptom was `set_hvac_mode` failing with "no close frame received or sent" — a
+command sent onto the already-silent socket). **Fix:** `bridgeTask` now caps the time it may
+pump without yielding — `BRIDGE_YIELD_BUDGET_MS` (20 ms, preferred, taken between frames via
+`isMidFrame()`), hard-capped at `BRIDGE_YIELD_HARD_MS` (250 ms ≈ one max Modbus frame). A single
+`vTaskDelay(1)` is ~1 ms, **well under t3.5 (~3.65 ms)** — the same sub-threshold hiccup the
+idle-yield already inserts — so relay integrity is preserved even if a forced yield lands
+mid-frame (verified live: A/B frames keep flowing, `rxerr=0`). This makes the 07-13
+`enableHeartbeat` (below) a belt-and-braces extra, not the actual cure — it addressed the wrong
+layer (a starved WS loop can't service heartbeats anyway).
+
 **Open:** command codes for **away / turbo / continuous-fan** still to map (page-1, quick
 `findpulse.py` loop — likely on bits 3/4/5/7 of reg 14 by the bitfield pattern). Firmware
 is receive-only unless `/armwrite` is called OR `/bridge?mode=` is set to a non-OFF value
@@ -362,7 +379,7 @@ push directly: `pio run -e um_tinyc6_ota -t upload`.
 | `src/main.cpp` | capture loop (dual-UART), ring buffer (interleaved A/B with source tag), 0x67 emulator, MITM bridge pump, WiFi + HTTP server, pulse-width baud estimator. Wires `state::feedNeoFrame` into the B-side frame-complete path and `ws_api::loop()` into the Arduino main loop. |
 | `src/bridge.h` / `src/bridge.cpp` | Pure C++ (no Arduino deps) streaming MITM bridge — frame-aware byte forwarder with inline register substitution and on-the-fly CRC re-stamping. Unit-tested on the host. |
 | `src/state.h` / `src/state.cpp` | Pure C++ NEO frame decoder — parses page-1/page-2 func-03 responses into a `ControllerState` struct (mode/fan/setpoints/zones/temps) per FINDINGS §7. Used by ws_api to publish state and tick transitions. Host-testable. |
-| `src/ws_api.h` / `src/ws_api.cpp` | WebSockets server on port 8767 — JSON command/state schema, transition table with per-field `*_transitioning` values, write orchestration mapping each command to the LOCAL-CONTROL-RECIPES recipes. Bridge stays in INJECT permanently; pulse rules auto-expire, persistent rules (zone setpoints) are cleared on board adoption or `GRACE_PERIOD_MS` timeout. **WS liveness (2026-07-13):** `begin()` calls `enableHeartbeat(15000,5000,2)` to evict half-open zombie clients — the fix for recurring ~30-40 s HA `unavailable` flaps where a WiFi blip leaves a client's TCP half-open (no FIN), stalling the WS loop until lwIP's minutes-long retransmit timeout. Plus a **wedge-watchdog**: `loop()` reboots if all `WEBSOCKETS_SERVER_CLIENT_MAX` (5) slots stay occupied continuously for 5 min (backstop to the client-side leak fixed in `actron_mitm_controller` 1.1.1; any drop below the cap resets the timer, so it can't boot-loop). Both ported from `somfy-sdn/src/ws_api.cpp` (fw 1.1.5 + 1.3.0). See ledger shq-suite-0019. |
+| `src/ws_api.h` / `src/ws_api.cpp` | WebSockets server on port 8767 — JSON command/state schema, transition table with per-field `*_transitioning` values, write orchestration mapping each command to the LOCAL-CONTROL-RECIPES recipes. Bridge stays in INJECT permanently; pulse rules auto-expire, persistent rules (zone setpoints) are cleared on board adoption or `GRACE_PERIOD_MS` timeout. **WS liveness (2026-07-13):** `begin()` calls `enableHeartbeat(15000,5000,2)` to evict half-open zombie clients (a WiFi blip leaving a client's TCP half-open, no FIN). **This was NOT the actual cure for the recurring ~30 s `unavailable` flaps** — root cause (found 2026-07-19) is `bridgeTask` loop-starvation, fixed by the yield budget in `main.cpp` (see the "Yield budget" note up top); the heartbeat can't help when the WS loop that *sends* it is the starved thing. Kept as belt-and-braces for genuine half-open clients. Plus a **wedge-watchdog**: `loop()` reboots if all `WEBSOCKETS_SERVER_CLIENT_MAX` (5) slots stay occupied continuously for 5 min (backstop to the client-side leak fixed in `actron_mitm_controller` 1.1.1; any drop below the cap resets the timer, so it can't boot-loop). Both ported from `somfy-sdn/src/ws_api.cpp` (fw 1.1.5 + 1.3.0). See ledger shq-suite-0019. |
 | `test/test_bridge/test_bridge.cpp` | Unity host-side tests for the bridge logic. 21 cases covering passthrough, injection, CRC re-stamping, multi-rule, boundary registers, mid-frame gap reset, pulse expiry, replay templates. Run with `pio test -e native`. |
 | `test/test_state/test_state.cpp` | Unity host-side tests for the NEO state decoder. 10 cases covering frame validation (CRC / addr / func / bytecount), page-1 + page-2 field decode, zone enable mask change, active-array setpoint helper, mode/fan name roundtrip. Run with `pio test -e native`. |
 | `WIRING.md` | step-by-step T568B pass-through tap wiring guide (tap-mode, single transceiver). The cut-bus MITM tap layout is documented in the FINDINGS / root project CLAUDE.md until it earns its own diagram. |
