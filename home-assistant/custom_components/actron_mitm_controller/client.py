@@ -65,6 +65,7 @@ class ActronMitmClient:
         """Drain incoming messages until the socket closes."""
         if self._ws is None:
             return
+        started = asyncio.get_running_loop().time()
         try:
             async for raw in self._ws:
                 try:
@@ -73,8 +74,28 @@ class ActronMitmClient:
                     _LOGGER.warning("Invalid JSON from server: %r", raw)
                     continue
                 await self._handle_message(msg)
-        except websockets.ConnectionClosed:
-            _LOGGER.info("WebSocket closed by peer")
+            # Iterator ended without raising = peer closed cleanly (code 1000/1001).
+            _LOGGER.warning(
+                "WebSocket closed cleanly after %.1fs (code=%s reason=%r)",
+                asyncio.get_running_loop().time() - started,
+                getattr(self._ws, "close_code", None),
+                getattr(self._ws, "close_reason", None),
+            )
+        except websockets.ConnectionClosed as exc:
+            # Diagnostic close-code logging (ledger shq-suite-0019). The recurring ~30 s
+            # flaps were root-caused to firmware loop-starvation (the RS485 bridge task
+            # starving the ESP's HTTP+WS loop until it went silent, tripping the 30 s
+            # availability timeout) — fixed by a yield budget in actron-sniffer main.cpp.
+            # Those flaps came through the coordinator's availability path, not here, so this
+            # branch stays quiet post-fix. It fires when a command hits an already-silent
+            # socket ("no close frame received or sent", 1006) or on a genuine close; the
+            # code + socket lifetime remain the cheapest signal if anything regresses.
+            _LOGGER.warning(
+                "WebSocket closed after %.1fs: %s: %s",
+                asyncio.get_running_loop().time() - started,
+                type(exc).__name__,
+                exc,
+            )
         finally:
             if self._on_disconnect is not None:
                 await self._on_disconnect()
