@@ -62,6 +62,11 @@ uint32_t last_heartbeat_ms_ = 0;
 constexpr uint32_t WEDGE_REBOOT_MS = 5 * 60 * 1000;  // continuously at cap this long => reboot
 uint32_t at_capacity_since_ms_ = 0;                  // millis() when we hit the cap; 0 = below cap
 
+// Lifetime WS event counters (ledger shq-suite-0019 instrumentation) — see ws_api.h.
+uint32_t connect_events_ = 0;
+uint32_t disconnect_events_ = 0;
+uint32_t error_events_ = 0;
+
 // ---- Transition table --------------------------------------------------
 //
 // Pulse-style transitions (mode / fan / master setpoint / zone enable) don't need rule
@@ -530,7 +535,14 @@ void tickTransitions() {
 void onEvent(uint8_t client_id, WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
     case WStype_CONNECTED:
+      connect_events_++;
       sendStateToClient(client_id, current_state_);
+      break;
+    case WStype_DISCONNECTED:
+      disconnect_events_++;
+      break;
+    case WStype_ERROR:
+      error_events_++;
       break;
     case WStype_TEXT: {
       JsonDocument doc;
@@ -543,7 +555,7 @@ void onEvent(uint8_t client_id, WStype_t type, uint8_t* payload, size_t length) 
       break;
     }
     default:
-      break;  // BIN / PING / PONG / DISCONNECT: no-op
+      break;  // BIN / PING / PONG: no-op
   }
 }
 
@@ -636,6 +648,10 @@ void publishStateIfChanged(const state::ControllerState& s) {
 }
 
 size_t connectedClients() { return server.connectedClients(); }
+
+uint32_t connectEvents() { return connect_events_; }
+uint32_t disconnectEvents() { return disconnect_events_; }
+uint32_t errorEvents() { return error_events_; }
 
 size_t pendingTransitions() {
   size_t n = (mode_t_.active ? 1 : 0) + (fan_t_.active ? 1 : 0) +

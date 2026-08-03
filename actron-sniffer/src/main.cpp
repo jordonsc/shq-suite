@@ -521,7 +521,12 @@ static size_t statusLine(char *out, size_t cap) {
     "rssi=%d ip=%s "
     "armed=%d addr=0x%02X tmpl1=%d tmpl2=%d poll=%u tx=%u "
     "bridge=%s rules=%u pulse_rules=%u pulse_remaining=%u "
-    "scramble=%u nonce=0x%04X fw=\"%s\"",
+    "scramble=%u nonce=0x%04X "
+    // Resource / WS-churn telemetry (ledger shq-suite-0019, 2026-08-03): watching for the
+    // ~5-day silent-socket degradation — heap decline/fragmentation (maxblk << heap) and
+    // ws_conn diverging from ws_disc (sockets abandoned without a DISCONNECTED event).
+    "heap=%u minheap=%u maxblk=%u uptime=%lus "
+    "ws=%u ws_conn=%u ws_disc=%u ws_err=%u fw=\"%s\"",
     g_seq, g_baud, g_parity, g_gap_us, g_capture ? "on" : "off",
     (unsigned long long)g_a.total_bytes, g_a.total_frames, g_a.modified_frames, g_a.rx_errors,
     (unsigned long long)g_b.total_bytes, g_b.total_frames, g_b.modified_frames, g_b.rx_errors,
@@ -532,6 +537,10 @@ static size_t statusLine(char *out, size_t cap) {
     bridgeModeStr(g_bridge_mode), (unsigned)g_b.bridge.ruleCount(),
     (unsigned)g_b.bridge.pulseRuleCount(), (unsigned)g_b.bridge.pulseRemaining(),
     g_scramble_reg, g_scramble_nonce,
+    (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(), (unsigned)ESP.getMaxAllocHeap(),
+    (unsigned long)(millis() / 1000),
+    (unsigned)ws_api::connectedClients(), ws_api::connectEvents(), ws_api::disconnectEvents(),
+    ws_api::errorEvents(),
     __DATE__ " " __TIME__);
 }
 

@@ -87,6 +87,21 @@ mid-frame (verified live: A/B frames keep flowing, `rxerr=0`). This makes the 07
 `enableHeartbeat` (below) a belt-and-braces extra, not the actual cure — it addressed the wrong
 layer (a starved WS loop can't service heartbeats anyway).
 
+**⚠️ Regression #2 (2026-08-03, OPEN — ledger shq-suite-0019).** The yield-budget fix held only
+07-20 → 07-24; from 2026-07-25 (~5.3 days after the 07-19 reboot) the HA `unavailable` flaps
+returned at ~70–85/day with a **different signature**: ICMP + HTTP + `seq_max` all stay healthy
+through a flap, but the ESP goes **silent on the one WS socket** — no data, no pong, no FIN
+(HA only notices via its 20 s keepalive; atlas shows lingering FIN-WAIT-2 sockets because the
+ESP never completes a close handshake). Somfy control group (same lib/heartbeat/AP/HA) is clean
+→ device-side. Leading hypothesis: per-socket resource exhaustion with a ~5-day post-reboot
+fuse (heap or lwIP PCB leak; each abandoned CLOSE_WAIT feeds the pressure). `/stats` now
+carries telemetry for this: `heap`/`minheap`/`maxblk` (fragmentation shows as maxblk ≪ heap),
+`uptime` (seconds, wraps with `millis()` at ~49.7 days), `ws` (current clients), and lifetime
+counters `ws_conn`/`ws_disc`/`ws_err` — a growing `ws_conn − ws_disc` gap means sockets are
+dying without the WS library ever seeing a DISCONNECTED event (the silent-death signature).
+Fresh-boot baseline (fw "Aug 3 2026 10:54:22"): heap≈172k, maxblk≈152k. Watch the trend as
+uptime approaches ~5 days.
+
 **Open:** command codes for **away / turbo / continuous-fan** still to map (page-1, quick
 `findpulse.py` loop — likely on bits 3/4/5/7 of reg 14 by the bitfield pattern). Firmware
 is receive-only unless `/armwrite` is called OR `/bridge?mode=` is set to a non-OFF value

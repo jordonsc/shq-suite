@@ -59,4 +59,12 @@ void publishStateIfChanged(const state::ControllerState& s);
 size_t connectedClients();
 size_t pendingTransitions();
 
+// Lifetime WS event counters (since boot) — exposed so /stats can show connection churn.
+// Diagnosing the 2026-08 silent-socket flaps (ledger shq-suite-0019): a healthy device has
+// ws_conn ≈ ws_disc ≈ a handful; a large gap between them means sockets are being abandoned
+// without a DISCONNECTED event (lwIP-layer death the WS library never saw).
+uint32_t connectEvents();
+uint32_t disconnectEvents();
+uint32_t errorEvents();
+
 }  // namespace ws_api
