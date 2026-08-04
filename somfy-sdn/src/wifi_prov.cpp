@@ -28,6 +28,35 @@ constexpr const char* NVS_NS = "somfy";
 constexpr const char* NVS_SSID = "ssid";
 constexpr const char* NVS_PASS = "pass";
 constexpr const char* NVS_MOTORS = "motors";
+constexpr const char* NVS_BOOTNOTE = "bootnote";
+
+// WiFi-death watchdog (fw 1.5.0, ledger shq-suite-0022). Three somfy controllers wedged
+// permanently OFF the network (ICMP-dead, needed a breaker power-cycle): after the one-shot boot
+// connect, nothing in this firmware ever re-drives a dead STA link — it relies entirely on the
+// Arduino stack's implicit auto-reconnect, and when that gives up (or the WiFi task itself
+// wedges) the device is stranded with no remote recovery. A reboot re-runs the full provisioning
+// connect (all-channel scan, retries), so: STA link continuously down this long => reboot.
+// Generous enough to ride out an AP restart (~2-3 min) without churning.
+constexpr uint32_t WIFI_DEAD_REBOOT_MS = 5 * 60 * 1000;
+
+// Portal-purgatory retry (fw 1.5.0). If the AP is down when the device boots (e.g. after a power
+// outage where the AP comes up slower than the ESP32), tryConnect fails and the device falls into
+// the SoftAP portal — and previously stayed there FOREVER despite holding valid creds. With creds
+// present, reboot periodically to retake the STA path; the window is long enough to finish a
+// manual re-provision in the portal first. A creds-less portal (fresh device / post-wipe) never
+// retries — nothing to retry with.
+constexpr uint32_t PORTAL_RETRY_MS = 15 * 60 * 1000;
+
+// Active link-retry loop (fw 1.5.0). Between "link dropped" and the reboot backstop, don't just
+// trust the Arduino stack's implicit auto-reconnect — it re-drives the SAME association state
+// machine, which is precisely what gets stuck after an infra outage (AP rebooted/rekeyed/changed
+// channel mid-association: a known ESP32 glitch class where auto-reconnect spins forever and only
+// a fresh WiFi.begin() — or a reboot — recovers). After LINK_RETRY_AFTER_MS of continuous
+// downtime (long enough for auto-reconnect to win the easy cases itself), force a full
+// disconnect + begin() every LINK_RETRY_INTERVAL_MS. begin() re-applies the all-channel
+// strongest-AP scan, so it also copes with the AP coming back on a new channel/BSSID.
+constexpr uint32_t LINK_RETRY_AFTER_MS = 20 * 1000;
+constexpr uint32_t LINK_RETRY_INTERVAL_MS = 30 * 1000;
 
 Status g_status = Status::PORTAL;
 char g_hostname[24] = "somfy-sdn";
@@ -44,6 +73,35 @@ uint32_t g_btn_down_ms = 0;
 // Set by requestReconnectBestAp() (HTTP/WS handler context) and serviced from loop(), so the
 // HTTP/WS ack flushes before we drop the link to re-scan.
 bool g_reconnect_requested = false;
+
+// Watchdog state.
+uint32_t g_wifi_down_since_ms = 0;   // millis() when the STA link was first seen down; 0 = up
+uint32_t g_portal_started_ms = 0;    // millis() when the portal started
+bool g_portal_has_creds = false;     // creds exist => portal retry applies
+char g_boot_note[24] = "none";       // previous boot's noteReboot() reason
+uint32_t g_last_link_retry_ms = 0;   // last forced re-begin attempt; 0 = none this outage
+String g_ssid, g_pass;               // cached creds for the retry loop (avoid NVS reads in loop)
+
+// WiFi event telemetry (fw 1.5.0). Set from the WiFi event task — keep the handler minimal
+// (counters only, no Serial/heap work); loop() does the logging and mDNS servicing.
+volatile uint32_t g_wifi_disc_count = 0;   // lifetime STA disconnect events since boot
+volatile uint8_t g_wifi_last_reason = 0;   // last disconnect reason code (802.11 reason)
+volatile bool g_got_ip_event = false;      // GOT_IP seen — service mDNS re-announce from loop()
+uint32_t g_wifi_disc_logged = 0;           // last count logged from loop()
+
+void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      g_wifi_disc_count = g_wifi_disc_count + 1;
+      g_wifi_last_reason = info.wifi_sta_disconnected.reason;
+      break;
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      g_got_ip_event = true;
+      break;
+    default:
+      break;
+  }
+}
 
 void computeHostname() {
   // Suffix from the last 2 octets of the WiFi STA MAC — the unique NIC-specific bytes, and the
@@ -273,6 +331,11 @@ void portalScanMotors() {
 }
 
 void startPortal() {
+  g_portal_started_ms = millis();
+  {
+    String s, p;
+    g_portal_has_creds = readCreds(s, p);
+  }
   // AP_STA so we can scan for nearby networks (synchronously, per page load) while serving AP.
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(g_hostname);
@@ -320,12 +383,34 @@ Status begin() {
   computeHostname();
   pinMode(PIN_BUTTON, INPUT_PULLUP);
 
+  // Recover the previous boot's reboot note (if any), then clear it so a subsequent power
+  // cycle reads "none" — the note describes THIS boot's cause only.
+  {
+    Preferences p;
+    if (p.begin(NVS_NS, false)) {
+      String note = p.getString(NVS_BOOTNOTE, "");
+      if (note.length() > 0) {
+        strncpy(g_boot_note, note.c_str(), sizeof(g_boot_note) - 1);
+        g_boot_note[sizeof(g_boot_note) - 1] = '\0';
+        p.remove(NVS_BOOTNOTE);
+        Serial.printf("# boot note: %s\n", g_boot_note);
+      }
+      p.end();
+    }
+  }
+
+  // Register the event hook before the first connect so boot-time disconnects are counted too.
+  WiFi.onEvent(onWiFiEvent);
+
   String ssid, pass;
   if (readCreds(ssid, pass) && tryConnect(ssid, pass)) {
+    g_ssid = ssid;  // cached for the link-retry loop
+    g_pass = pass;
     g_status = Status::CONNECTED;
     Serial.printf("# WiFi up: http://%s/  (%s)\n", WiFi.localIP().toString().c_str(),
                   g_hostname);
     startMdns();
+    g_got_ip_event = false;  // boot GOT_IP already handled by the startMdns() above
   } else {
     g_status = Status::PORTAL;
     startPortal();
@@ -352,9 +437,75 @@ void serviceReconnect() {
                 (int)WiFi.RSSI());
 }
 
+// Log WiFi events + re-announce mDNS from the main loop (the event handler itself stays minimal).
+// The mDNS restart on every (re)association matters after an infra outage: the device may come
+// back on a NEW IP, and HA's zeroconf host-healing only works if the advert actually re-fires —
+// ESPmDNS's own behaviour on IP change is not dependable. A fresh end()+begin() re-announces,
+// letting HA rewrite the stored host instead of dialling a stale IP forever.
+void serviceWifiEvents() {
+  if (g_wifi_disc_logged != g_wifi_disc_count) {
+    g_wifi_disc_logged = g_wifi_disc_count;
+    Serial.printf("# WiFi: STA disconnect #%u (reason=%u)\n", (unsigned)g_wifi_disc_logged,
+                  (unsigned)g_wifi_last_reason);
+  }
+  if (g_got_ip_event) {
+    g_got_ip_event = false;
+    if (g_status == Status::CONNECTED) {
+      Serial.printf("# WiFi: got IP %s (rssi=%d) — re-announcing mDNS\n",
+                    WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
+      MDNS.end();
+      startMdns();
+    }
+  }
+}
+
+// WiFi-death watchdog + link-retry loop + portal-purgatory retry (constants up top for rationale).
+void serviceWatchdogs() {
+  uint32_t now = millis();
+  if (g_status == Status::CONNECTED) {
+    if (WiFi.isConnected()) {
+      g_wifi_down_since_ms = 0;
+      g_last_link_retry_ms = 0;
+      return;
+    }
+    if (g_wifi_down_since_ms == 0) {
+      g_wifi_down_since_ms = now;
+      Serial.println("# WiFi: STA link down — watchdog armed");
+      return;
+    }
+    uint32_t down_for = (uint32_t)(now - g_wifi_down_since_ms);
+    if (down_for >= WIFI_DEAD_REBOOT_MS) {
+      Serial.printf("# WiFi: STA link dead for >%us — rebooting to self-heal\n",
+                    WIFI_DEAD_REBOOT_MS / 1000);
+      noteReboot("wifi-dead");
+    }
+    // Active retry: give implicit auto-reconnect LINK_RETRY_AFTER_MS to win the easy cases, then
+    // force a full re-begin (resets a stuck association state machine; re-applies the
+    // all-channel strongest-AP scan). Non-blocking — connection progress is observed on
+    // subsequent loop passes; the reboot above remains the backstop.
+    if (down_for >= LINK_RETRY_AFTER_MS && g_ssid.length() > 0 &&
+        (g_last_link_retry_ms == 0 ||
+         (uint32_t)(now - g_last_link_retry_ms) >= LINK_RETRY_INTERVAL_MS)) {
+      g_last_link_retry_ms = now;
+      Serial.printf("# WiFi: link down %us (disc=%u last_reason=%u) — forcing re-begin\n",
+                    down_for / 1000, (unsigned)g_wifi_disc_count, (unsigned)g_wifi_last_reason);
+      WiFi.disconnect();
+      WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+      WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
+      WiFi.begin(g_ssid.c_str(), g_pass.c_str());
+    }
+  } else if (g_portal_has_creds &&
+             (uint32_t)(now - g_portal_started_ms) >= PORTAL_RETRY_MS) {
+    Serial.println("# portal: creds present, retry window elapsed — rebooting to retry STA");
+    noteReboot("portal-retry");
+  }
+}
+
 void loop() {
   serviceButton();
   serviceReconnect();
+  serviceWifiEvents();
+  serviceWatchdogs();
   if (g_status == Status::PORTAL) {
     if (g_dns) g_dns->processNextRequest();
     if (g_portal) g_portal->handleClient();
@@ -362,6 +513,23 @@ void loop() {
 }
 
 void requestReconnectBestAp() { g_reconnect_requested = true; }
+
+void noteReboot(const char* reason) {
+  Preferences p;
+  if (p.begin(NVS_NS, false)) {
+    p.putString(NVS_BOOTNOTE, reason);
+    p.end();
+  }
+  Serial.flush();
+  delay(100);
+  ESP.restart();
+  while (true) {}  // unreachable — satisfies [[noreturn]]
+}
+
+const char* bootNote() { return g_boot_note; }
+
+uint32_t staDisconnectCount() { return g_wifi_disc_count; }
+uint8_t lastDisconnectReason() { return g_wifi_last_reason; }
 
 Status status() { return g_status; }
 bool isConnected() { return g_status == Status::CONNECTED && WiFi.isConnected(); }

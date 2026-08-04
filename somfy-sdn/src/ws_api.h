@@ -25,4 +25,12 @@ void notifyStateChanged();
 
 uint32_t connectedClients();
 
+// Lifetime WS event counters (since boot) — exposed so /stats can show connection churn.
+// Ported from actron-sniffer (ledger shq-suite-0019/0022 silent-socket diagnosis): a healthy
+// device has ws_conn ≈ ws_disc ≈ a handful; a growing gap between them means sockets are being
+// abandoned without a DISCONNECTED event (lwIP-layer death the WS library never saw).
+uint32_t connectEvents();
+uint32_t disconnectEvents();
+uint32_t errorEvents();
+
 }  // namespace ws_api

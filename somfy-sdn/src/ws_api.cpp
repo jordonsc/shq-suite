@@ -33,6 +33,11 @@ uint32_t g_last_heartbeat_ms = 0;
 constexpr uint32_t WEDGE_REBOOT_MS = 5 * 60 * 1000;  // continuously at capacity this long => reboot
 uint32_t g_at_capacity_since_ms = 0;                 // millis() when we hit the cap; 0 = below cap
 
+// Lifetime WS event counters (fw 1.5.0, ported from actron-sniffer — see ws_api.h).
+uint32_t g_conn_events = 0;
+uint32_t g_disc_events = 0;
+uint32_t g_err_events = 0;
+
 const char* movementName(sdn::MovementState m) {
   switch (m) {
     case sdn::MovementState::MOVING_UP: return "up";
@@ -267,7 +272,14 @@ void handleCommand(uint8_t client, JsonDocument& doc) {
 void onEvent(uint8_t client, WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
     case WStype_CONNECTED:
+      g_conn_events++;
       sendStateTo(client);
+      break;
+    case WStype_DISCONNECTED:
+      g_disc_events++;
+      break;
+    case WStype_ERROR:
+      g_err_events++;
       break;
     case WStype_TEXT: {
       JsonDocument doc;
@@ -324,7 +336,7 @@ void loop() {
                     g_server->connectedClients(), WEDGE_REBOOT_MS / 1000);
       Serial.flush();
       delay(50);
-      ESP.restart();
+      wifi_prov::noteReboot("ws-wedge");
     }
   } else {
     g_at_capacity_since_ms = 0;
@@ -336,5 +348,9 @@ void notifyStateChanged() { g_dirty = true; }
 uint32_t connectedClients() {
   return g_server ? g_server->connectedClients() : 0;
 }
+
+uint32_t connectEvents() { return g_conn_events; }
+uint32_t disconnectEvents() { return g_disc_events; }
+uint32_t errorEvents() { return g_err_events; }
 
 }  // namespace ws_api

@@ -39,6 +39,21 @@ void factoryWipe();
 // Arduino stack has no live roaming, so this on-demand trigger is how a controller re-evaluates.
 void requestReconnectBestAp();
 
+// Record a reboot reason in NVS and restart. The note is read back (and cleared) on the next
+// boot, surfaced as `note=` in /stats — so a fleet health sweep can tell a watchdog self-heal
+// from a power cycle (which reads note=none reset=poweron). Never returns.
+[[noreturn]] void noteReboot(const char* reason);
+
+// The reboot note recorded by the PREVIOUS boot's noteReboot(), or "none". Valid after begin().
+const char* bootNote();
+
+// WiFi link-churn telemetry (fw 1.5.0) — lifetime STA disconnect events since boot and the last
+// 802.11 disconnect reason code. Surfaced in /stats as wifi_disc=/wifi_reason= so a fleet sweep
+// can see link instability (e.g. after network infra work) before it escalates to a watchdog
+// reboot.
+uint32_t staDisconnectCount();
+uint8_t lastDisconnectReason();
+
 // Load the configured motor addresses ("AA:BB:CC,...") from NVS and register them with the
 // bus device table (CONFIGURED source). Called by main after bus::begin().
 void loadConfiguredMotors();

@@ -7,6 +7,7 @@
 #include <WiFi.h>
 #include <esp_app_desc.h>
 #include <esp_ota_ops.h>
+#include <esp_system.h>
 
 #include <cstring>
 
@@ -30,6 +31,24 @@ constexpr const char* APP_ID = "somfy-sdn";
 constexpr const char* APP_MODEL = "TinyC6";
 
 const char* modeStr() { return (bus::mode() == bus::Mode::ACTIVE) ? "active" : "listen"; }
+
+// Hardware reset cause of THIS boot — distinguishes a power cycle (poweron) from our own
+// watchdog self-heals (sw + a `note=`) and from crashes (panic/wdt/brownout), so a fleet health
+// sweep can tell what actually killed a controller. Pairs with wifi_prov::bootNote().
+const char* resetReasonStr() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON: return "poweron";
+    case ESP_RST_SW: return "sw";
+    case ESP_RST_PANIC: return "panic";
+    case ESP_RST_INT_WDT: return "int_wdt";
+    case ESP_RST_TASK_WDT: return "task_wdt";
+    case ESP_RST_WDT: return "wdt";
+    case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_DEEPSLEEP: return "deepsleep";
+    case ESP_RST_EXT: return "ext";
+    default: return "other";
+  }
+}
 
 int hexNibble(char c) {
   if (c >= '0' && c <= '9') return c - '0';
@@ -56,7 +75,7 @@ int parseHexBytes(const String& s, uint8_t* buf, size_t cap) {
 }
 
 String statusLine() {
-  // (build-string bump for OTA verification — set-bottom-limit-by-pulses round)
+  // (fw 1.5.0 — silent-socket telemetry ported from actron-sniffer, ledger shq-suite-0022)
   devices::DeviceTable& t = bus::table();
   const bus::Stats& st = bus::stats();
   size_t online = 0;
@@ -64,17 +83,28 @@ String statusLine() {
     devices::Device* d = t.at(i);
     if (d && d->online) online++;
   }
-  char buf[440];
+  char buf[560];
   snprintf(buf, sizeof(buf),
            "# app=%s mode=%s devices=%u online=%u "
            "tx=%u rx=%u polls=%u "
            "err.cksum=%u err.framing=%u err.timeout=%u err.nack=%u err.total=%u "
-           "ws_clients=%u rssi=%d ip=%s fw=\"%s\"",
+           // Resource/WS-churn telemetry for the ~5-day silent-socket fuse: fragmentation shows
+           // as maxblk << heap; a growing ws_conn-ws_disc gap = sockets dying without the WS
+           // library seeing a DISCONNECTED. reset/note say why THIS boot happened.
+           "heap=%u minheap=%u maxblk=%u uptime=%lus "
+           "ws=%u ws_conn=%u ws_disc=%u ws_err=%u "
+           "wifi_disc=%u wifi_reason=%u reset=%s note=%s "
+           "rssi=%d ip=%s fw=\"%s\"",
            APP_ID, modeStr(), (unsigned)t.count(), (unsigned)online,
            st.tx_frames, st.rx_frames, st.polls,
            st.err_checksum, st.err_framing, st.err_timeout, st.err_nack,
            (unsigned)bus::errors().total(),
-           (unsigned)ws_api::connectedClients(),
+           (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
+           (unsigned)ESP.getMaxAllocHeap(), (unsigned long)(millis() / 1000),
+           (unsigned)ws_api::connectedClients(), (unsigned)ws_api::connectEvents(),
+           (unsigned)ws_api::disconnectEvents(), (unsigned)ws_api::errorEvents(),
+           (unsigned)wifi_prov::staDisconnectCount(), (unsigned)wifi_prov::lastDisconnectReason(),
+           resetReasonStr(), wifi_prov::bootNote(),
            WiFi.isConnected() ? WiFi.RSSI() : 0,
            WiFi.localIP().toString().c_str(), SOMFY_FW_VERSION " (" __DATE__ " " __TIME__ ")");
   return String(buf);
@@ -212,9 +242,18 @@ void handleStatsJson() {
   doc["rssi"] = WiFi.isConnected() ? WiFi.RSSI() : 0;
   doc["uptime_s"] = (uint32_t)(millis() / 1000);
   doc["heap_free"] = (uint32_t)ESP.getFreeHeap();
+  doc["heap_min"] = (uint32_t)ESP.getMinFreeHeap();
+  doc["heap_maxblk"] = (uint32_t)ESP.getMaxAllocHeap();
+  doc["reset_reason"] = resetReasonStr();
+  doc["boot_note"] = wifi_prov::bootNote();
   doc["devices"] = (uint32_t)t.count();
   doc["online"] = (uint32_t)online;
   doc["ws_clients"] = (uint32_t)ws_api::connectedClients();
+  doc["ws_conn"] = ws_api::connectEvents();
+  doc["ws_disc"] = ws_api::disconnectEvents();
+  doc["ws_err"] = ws_api::errorEvents();
+  doc["wifi_disc"] = wifi_prov::staDisconnectCount();
+  doc["wifi_reason"] = wifi_prov::lastDisconnectReason();
   doc["tx"] = st.tx_frames;
   doc["rx"] = st.rx_frames;
   doc["polls"] = st.polls;
