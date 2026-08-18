@@ -48,6 +48,7 @@
 #include <esp_ota_ops.h>
 
 #include "bridge.h"
+#include "mono.h"
 #include "state.h"
 #include "wifi_prov.h"
 #include "ws_api.h"
@@ -526,7 +527,12 @@ static size_t statusLine(char *out, size_t cap) {
     // ~5-day silent-socket degradation — heap decline/fragmentation (maxblk << heap) and
     // ws_conn diverging from ws_disc (sockets abandoned without a DISCONNECTED event).
     "heap=%u minheap=%u maxblk=%u uptime=%lus "
-    "ws=%u ws_conn=%u ws_disc=%u ws_err=%u fw=\"%s\"",
+    "ws=%u ws_conn=%u ws_disc=%u ws_err=%u "
+    // Heartbeat health + clock-glitch counters (ledger shq-suite-0034): hb_age should stay under
+    // HEARTBEAT_INTERVAL_MS; a large value means the state push has stalled and HA is about to
+    // start its unavailable/available flap. clk_torn/clk_jump count the bad millis() reads that
+    // used to cause exactly that.
+    "hb_age=%u hb_tx=%u clk_torn=%u clk_back=%u clk_jump=%u clk_jumpms=%u fw=\"%s\"",
     g_seq, g_baud, g_parity, g_gap_us, g_capture ? "on" : "off",
     (unsigned long long)g_a.total_bytes, g_a.total_frames, g_a.modified_frames, g_a.rx_errors,
     (unsigned long long)g_b.total_bytes, g_b.total_frames, g_b.modified_frames, g_b.rx_errors,
@@ -538,9 +544,12 @@ static size_t statusLine(char *out, size_t cap) {
     (unsigned)g_b.bridge.pulseRuleCount(), (unsigned)g_b.bridge.pulseRemaining(),
     g_scramble_reg, g_scramble_nonce,
     (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(), (unsigned)ESP.getMaxAllocHeap(),
-    (unsigned long)(millis() / 1000),
+    (unsigned long)(mono::now() / 1000),
     (unsigned)ws_api::connectedClients(), ws_api::connectEvents(), ws_api::disconnectEvents(),
     ws_api::errorEvents(),
+    (unsigned)ws_api::heartbeatAgeMs(), (unsigned)ws_api::heartbeatBroadcasts(),
+    (unsigned)mono::tornReads(), (unsigned)mono::backwardReads(),
+    (unsigned)mono::forwardJumps(), (unsigned)mono::lastJumpMs(),
     __DATE__ " " __TIME__);
 }
 
@@ -608,7 +617,7 @@ static String measureBaud() {
 
 // ---- HTTP handlers --------------------------------------------------------
 static void handleRoot() {
-  char st[600];
+  char st[800];
   statusLine(st, sizeof(st));
   String b = "Actron RS485 sniffer + MITM bridge\n";
   b += String(st) + "\n\n";
@@ -637,7 +646,7 @@ static void handleRoot() {
 }
 
 static void handleStats() {
-  char st[600];
+  char st[800];
   statusLine(st, sizeof(st));
   server.send(200, "text/plain", String(st) + "\n");
 }
@@ -664,7 +673,7 @@ static void handleLog() {
 
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/plain", "");
-  char st[600];
+  char st[800];
   statusLine(st, sizeof(st));
   server.sendContent(String(st) + "\n");
 
@@ -699,7 +708,7 @@ static void handleSet() {
     if (v > 0) g_gap_us = v;
   }
   startBuses();
-  char st[600];
+  char st[800];
   statusLine(st, sizeof(st));
   server.send(200, "text/plain", String(st) + "\n");
 }
@@ -1287,7 +1296,7 @@ static void pumpConsole() {
     if (c == '\r') continue;
     if (c == '\n') {
       buf[len] = '\0';
-      char st[600];
+      char st[800];
       switch (buf[0]) {
         case 'm': Serial.print(measureBaud()); break;
         case 's': statusLine(st, sizeof(st)); Serial.println(st); break;
@@ -1381,7 +1390,7 @@ void setup() {
     Serial.println("# Unprovisioned — SoftAP portal up; A/C bridge still running.");
   }
 
-  char st[600];
+  char st[800];
   statusLine(st, sizeof(st));
   Serial.println(st);
 

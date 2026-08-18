@@ -56,7 +56,7 @@ firmware streams NEO-response bytes through `bridge::StreamingBridge`, substitut
 register values inline and re-stamping the Modbus CRC on the fly so the indoor board sees a
 valid frame. This is the path for **per-zone setpoint writes** that 0x67/pulse can't reach.
 The streaming-CRC injector and the state decoder are unit-tested on the host
-(`pio test -e native`, 31 cases — 21 bridge + 10 state). Bridge and 0x67 emulator are
+(`pio test -e native`, 38 cases — 21 bridge + 10 state + 7 mono). Bridge and 0x67 emulator are
 **mutually exclusive** (both would drive UART1 TX) — switching to non-OFF bridge
 auto-disarms `/armwrite`.
 
@@ -99,8 +99,22 @@ carries telemetry for this: `heap`/`minheap`/`maxblk` (fragmentation shows as ma
 `uptime` (seconds, wraps with `millis()` at ~49.7 days), `ws` (current clients), and lifetime
 counters `ws_conn`/`ws_disc`/`ws_err` — a growing `ws_conn − ws_disc` gap means sockets are
 dying without the WS library ever seeing a DISCONNECTED event (the silent-death signature).
-Fresh-boot baseline (fw "Aug 3 2026 10:54:22"): heap≈172k, maxblk≈152k. Watch the trend as
-uptime approaches ~5 days.
+Fresh-boot baseline (fw "Aug 3 2026 10:54:22"): heap≈172k, maxblk≈152k.
+
+**⇒ ROOT CAUSE FOUND (2026-08-19, ledger shq-suite-0034) — the exhaustion hypothesis above is
+superseded.** The identical signature was caught in the act on a somfy-sdn controller and traced
+to the app-level heartbeat, which both firmwares share: `millis()` on these C6 boards occasionally
+returns a value far in the future (proved by error-ring entries stamped *beyond* the device's own
+uptime), and the periodic push was gated on the **signed** form
+`(int32_t)(t - last_heartbeat_ms_) >= (int32_t)HEARTBEAT_INTERVAL_MS`, which reads "not due yet"
+for as long as the stamp sits ahead of the clock. The socket, the WS pings and the connect-time
+snapshot all keep working — which is exactly why ICMP/HTTP/`seq_max` looked healthy through every
+flap. Fixed on both firmwares (actron build "Aug 18 2026 23:07:14"): the gate is now an
+**unsigned** elapsed test that fires on the next loop instead of wedging, and `mono::now()`
+(`src/mono.{h,cpp}`, twin of somfy-sdn's) filters the bad reads out at source. `/stats` gained
+`hb_age`/`hb_tx` (heartbeat still running?) and `clk_torn`/`clk_back`/`clk_jump`/`clk_jumpms`
+(how often the clock misbehaves). If the flaps return with `hb_age` small and `hb_tx` still
+climbing, it is a *different* fault — go back to the exhaustion hypothesis then, not before.
 
 **Open:** command codes for **away / turbo / continuous-fan** still to map (page-1, quick
 `findpulse.py` loop — likely on bits 3/4/5/7 of reg 14 by the bitfield pattern). Firmware
@@ -268,7 +282,7 @@ ESP32-C6 needs the **pioarduino** platform fork (pinned in `platformio.ini`; bum
 | Endpoint | Purpose |
 |----------|---------|
 | `GET /` | help + status |
-| `GET /stats` | one-line status; starts `# app=actron-mitm …` |
+| `GET /stats` | one-line status; starts `# app=actron-mitm …`. Carries `heap/minheap/maxblk/uptime`, `ws/ws_conn/ws_disc/ws_err`, and (2026-08-19) `hb_age`/`hb_tx` + `clk_torn`/`clk_back`/`clk_jump`/`clk_jumpms` |
 | `GET /stats.json` | machine-readable identity + status (`app`/`model`/`mac`/`ip`/`fw`/`rssi`/`bridge`) — uniform with somfy-sdn so any TinyC6 on the LAN is positively identifiable |
 | `GET /log?since=<seq>&n=<max>` | frames; `since` returns only newer ones (incremental polling) |
 | `POST /set?baud=&parity=N\|E\|O&gap=<us>` | change capture settings live |
@@ -390,11 +404,13 @@ push directly: `pio run -e um_tinyc6_ota -t upload`.
 
 | File | Purpose |
 |------|---------|
-| `platformio.ini` | pioarduino platform (C6), board `um_tinyc6`, USB-CDC console; lib_deps for `Links2004/WebSockets` (Controller WS API) and `bblanchon/ArduinoJson` (command/state serialisation). Also defines `[env:native]` — host-only test runner for the bridge + state decoder. |
+| `platformio.ini` | pioarduino platform (C6), board `um_tinyc6`, USB-CDC console; lib_deps for `Links2004/WebSockets` (Controller WS API) and `bblanchon/ArduinoJson` (command/state serialisation). Also defines `[env:native]` — host-only test runner for the bridge, state decoder + clock filter. |
 | `src/main.cpp` | capture loop (dual-UART), ring buffer (interleaved A/B with source tag), 0x67 emulator, MITM bridge pump, WiFi + HTTP server, pulse-width baud estimator. Wires `state::feedNeoFrame` into the B-side frame-complete path and `ws_api::loop()` into the Arduino main loop. |
 | `src/bridge.h` / `src/bridge.cpp` | Pure C++ (no Arduino deps) streaming MITM bridge — frame-aware byte forwarder with inline register substitution and on-the-fly CRC re-stamping. Unit-tested on the host. |
 | `src/state.h` / `src/state.cpp` | Pure C++ NEO frame decoder — parses page-1/page-2 func-03 responses into a `ControllerState` struct (mode/fan/setpoints/zones/temps) per FINDINGS §7. Used by ws_api to publish state and tick transitions. Host-testable. |
-| `src/ws_api.h` / `src/ws_api.cpp` | WebSockets server on port 8767 — JSON command/state schema, transition table with per-field `*_transitioning` values, write orchestration mapping each command to the LOCAL-CONTROL-RECIPES recipes. Bridge stays in INJECT permanently; pulse rules auto-expire, persistent rules (zone setpoints) are cleared on board adoption or `GRACE_PERIOD_MS` timeout. **WS liveness (2026-07-13):** `begin()` calls `enableHeartbeat(15000,5000,2)` to evict half-open zombie clients (a WiFi blip leaving a client's TCP half-open, no FIN). **This was NOT the actual cure for the recurring ~30 s `unavailable` flaps** — root cause (found 2026-07-19) is `bridgeTask` loop-starvation, fixed by the yield budget in `main.cpp` (see the "Yield budget" note up top); the heartbeat can't help when the WS loop that *sends* it is the starved thing. Kept as belt-and-braces for genuine half-open clients. Plus a **wedge-watchdog**: `loop()` reboots if all `WEBSOCKETS_SERVER_CLIENT_MAX` (5) slots stay occupied continuously for 5 min (backstop to the client-side leak fixed in `actron_mitm_controller` 1.1.1; any drop below the cap resets the timer, so it can't boot-loop). Both ported from `somfy-sdn/src/ws_api.cpp` (fw 1.1.5 + 1.3.0). See ledger shq-suite-0019. |
+| `src/ws_api.h` / `src/ws_api.cpp` | WebSockets server on port 8767 — JSON command/state schema, transition table with per-field `*_transitioning` values, write orchestration mapping each command to the LOCAL-CONTROL-RECIPES recipes. Bridge stays in INJECT permanently; pulse rules auto-expire, persistent rules (zone setpoints) are cleared on board adoption or `GRACE_PERIOD_MS` timeout. **WS liveness (2026-07-13):** `begin()` calls `enableHeartbeat(15000,5000,2)` to evict half-open zombie clients (a WiFi blip leaving a client's TCP half-open, no FIN). **This was NOT the actual cure for the recurring ~30 s `unavailable` flaps** — root cause (found 2026-07-19) is `bridgeTask` loop-starvation, fixed by the yield budget in `main.cpp` (see the "Yield budget" note up top); the heartbeat can't help when the WS loop that *sends* it is the starved thing. Kept as belt-and-braces for genuine half-open clients. Plus a **wedge-watchdog**: `loop()` reboots if all `WEBSOCKETS_SERVER_CLIENT_MAX` (5) slots stay occupied continuously for 5 min (backstop to the client-side leak fixed in `actron_mitm_controller` 1.1.1; any drop below the cap resets the timer, so it can't boot-loop). Both ported from `somfy-sdn/src/ws_api.cpp` (fw 1.1.5 + 1.3.0). See ledger shq-suite-0019. **Heartbeat-wedge fix (2026-08-19, ledger shq-suite-0034):** the periodic push is now gated on an *unsigned* elapsed test and `now_ms()` returns `mono::now()` — see the Regression #2 note up top for why the signed form wedged for hours. `hb_age`/`hb_tx` in `/stats` say whether the push is alive. |
+| `src/mono.h` / `src/mono.cpp` | Pure C++ glitch-filtered monotonic clock (twin of `somfy-sdn/src/mono.{h,cpp}` — keep them in step). `mono::now()` backs `ws_api`'s `now_ms()`, so every transition deadline and the heartbeat stamp are immune to a single far-future `millis()` read. Host-tested. |
+| `test/test_mono/test_mono.cpp` | Unity host-side tests for the clock filter. 7 cases: normal progression, a far-future glitch in either sample, backwards reads, a genuine long stall being accepted, torn tolerance, 49.7-day wrap. |
 | `test/test_bridge/test_bridge.cpp` | Unity host-side tests for the bridge logic. 21 cases covering passthrough, injection, CRC re-stamping, multi-rule, boundary registers, mid-frame gap reset, pulse expiry, replay templates. Run with `pio test -e native`. |
 | `test/test_state/test_state.cpp` | Unity host-side tests for the NEO state decoder. 10 cases covering frame validation (CRC / addr / func / bytecount), page-1 + page-2 field decode, zone enable mask change, active-array setpoint helper, mode/fan name roundtrip. Run with `pio test -e native`. |
 | `WIRING.md` | step-by-step T568B pass-through tap wiring guide (tap-mode, single transceiver). The cut-bus MITM tap layout is documented in the FINDINGS / root project CLAUDE.md until it earns its own diagram. |

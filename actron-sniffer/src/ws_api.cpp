@@ -6,6 +6,8 @@
 
 #include <cstring>
 
+#include "mono.h"
+
 namespace ws_api {
 
 namespace {
@@ -63,6 +65,10 @@ constexpr uint32_t WEDGE_REBOOT_MS = 5 * 60 * 1000;  // continuously at cap this
 uint32_t at_capacity_since_ms_ = 0;                  // millis() when we hit the cap; 0 = below cap
 
 // Lifetime WS event counters (ledger shq-suite-0019 instrumentation) — see ws_api.h.
+// Lifetime count of state pushes — paired with hb_age in /stats this answers "is the heartbeat
+// still running?" in one curl (ledger shq-suite-0034).
+uint32_t hb_broadcasts_ = 0;
+
 uint32_t connect_events_ = 0;
 uint32_t disconnect_events_ = 0;
 uint32_t error_events_ = 0;
@@ -107,7 +113,9 @@ ZoneSetpointTransition zsp_t_[state::NUM_ZONES];
 
 // ---- Helpers ------------------------------------------------------------
 
-uint32_t now_ms() { return millis(); }
+// Filtered clock (ledger shq-suite-0034): a raw millis() here occasionally returns a far-future
+// value, and any deadline stamped from one stops firing until the real clock catches up.
+uint32_t now_ms() { return mono::now(); }
 
 // Arm (or replace) a pulse transition: store the rules so we can re-fire on a miss, fire the
 // first pulse now, and start the retry/attempt accounting. Latest-wins — calling this again
@@ -256,6 +264,7 @@ void sendStateToClient(uint8_t client_id, const state::ControllerState& s) {
 }
 
 void broadcastState(const state::ControllerState& s) {
+  hb_broadcasts_++;
   JsonDocument doc;
   buildStatePayload(doc, s);
   String out;
@@ -478,7 +487,7 @@ bool didStateAdoptZeTarget() {
 void tickPulse(PulseTransition& tr, bool adopted, uint32_t t) {
   if (!tr.active) return;
   if (adopted) { tr.active = false; return; }
-  if ((int32_t)(t - tr.last_fire_ms) < (int32_t)PULSE_RETRY_INTERVAL_MS) return;
+  if ((uint32_t)(t - tr.last_fire_ms) < PULSE_RETRY_INTERVAL_MS) return;
   if (tr.attempts >= PULSE_MAX_FIRES) {
     tr.active = false;  // exhausted all attempts and the last window elapsed — write is lost
     return;
@@ -600,15 +609,21 @@ void begin(uint16_t port, const Hooks& hooks) {
   // expect a pong within 5 s, disconnect after 2 consecutive misses (~30 s to reap). This is the
   // primary fix for the recurring 30-40 s `unavailable` flaps (ledger shq-suite-0019).
   server.enableHeartbeat(15000, 5000, 2);
-  last_heartbeat_ms_ = millis();
+  last_heartbeat_ms_ = mono::now();
 }
 
 void loop() {
   server.loop();
   tickTransitions();
 
-  uint32_t t = millis();
-  if ((int32_t)(t - last_heartbeat_ms_) >= (int32_t)HEARTBEAT_INTERVAL_MS) {
+  uint32_t t = mono::now();
+  // UNSIGNED elapsed-time test, deliberately (ledger shq-suite-0034). The signed form read as
+  // "not due yet" whenever the stamp sat in the future, and a single far-future millis() read put
+  // it there — after which this device accepts connections and answers WS pings but never pushes
+  // state, which is exactly the "silent socket" HA has been flapping on (shq-suite-0019).
+  // Unsigned subtraction wraps a future stamp to a huge elapsed value, so the next loop fires and
+  // re-stamps it. mono::now() is the second layer: it filters the bad reads out up front.
+  if ((uint32_t)(t - last_heartbeat_ms_) >= HEARTBEAT_INTERVAL_MS) {
     broadcastState(current_state_);
     last_published_state_ = current_state_;
     last_published_valid_ = true;
@@ -643,7 +658,7 @@ void publishStateIfChanged(const state::ControllerState& s) {
     broadcastState(s);
     last_published_state_ = s;
     last_published_valid_ = true;
-    last_heartbeat_ms_ = millis();
+    last_heartbeat_ms_ = mono::now();
   }
 }
 
@@ -652,6 +667,10 @@ size_t connectedClients() { return server.connectedClients(); }
 uint32_t connectEvents() { return connect_events_; }
 uint32_t disconnectEvents() { return disconnect_events_; }
 uint32_t errorEvents() { return error_events_; }
+
+uint32_t heartbeatBroadcasts() { return hb_broadcasts_; }
+
+uint32_t heartbeatAgeMs() { return (uint32_t)(mono::now() - last_heartbeat_ms_); }
 
 size_t pendingTransitions() {
   size_t n = (mode_t_.active ? 1 : 0) + (fan_t_.active ? 1 : 0) +

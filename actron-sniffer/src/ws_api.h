@@ -67,4 +67,11 @@ uint32_t connectEvents();
 uint32_t disconnectEvents();
 uint32_t errorEvents();
 
+// Heartbeat health (ledger shq-suite-0034). `hb_age` is the age of the last state push: it should
+// never exceed HEARTBEAT_INTERVAL_MS by more than a loop or two. A large or growing value means
+// the push has stalled — which is what HA sees as a device that connects but never sends. Check
+// this BEFORE suspecting WiFi, lwIP or the WS library.
+uint32_t heartbeatBroadcasts();
+uint32_t heartbeatAgeMs();
+
 }  // namespace ws_api
