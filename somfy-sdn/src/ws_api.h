@@ -33,4 +33,11 @@ uint32_t connectEvents();
 uint32_t disconnectEvents();
 uint32_t errorEvents();
 
+// Heartbeat health (fw 1.5.1, ledger shq-suite-0034). `hb_age` in /stats is the age of the last
+// state broadcast: it should never exceed HEARTBEAT_INTERVAL_MS by more than a loop or two. A
+// large or growing value means the periodic push has stalled, which is what HA sees as a device
+// that connects but never sends — check this BEFORE suspecting WiFi, lwIP or the WS library.
+uint32_t heartbeatBroadcasts();
+uint32_t heartbeatAgeMs();
+
 }  // namespace ws_api

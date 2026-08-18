@@ -13,8 +13,9 @@ platform), same HTTP debug + WS controller + HTTP-pull OTA ergonomics, same OTA 
 discipline, same host-test discipline for the pure-C++ core.
 
 **Status:** firmware + HA component implemented and **hardware-verified on a TinyC6 + live
-motor (2026-06-05)**. Pure-C++ core host-unit-tested (`pio test -e native`, 22 cases). Full
-design rationale: [`SPEC.md`](SPEC.md).
+motor (2026-06-05)**. Pure-C++ core host-unit-tested (`pio test -e native`, 29 cases). Full
+design rationale: [`SPEC.md`](SPEC.md). **fw 1.5.1 is live on all 12 controllers (2026-08-19)** —
+the clock-glitch / heartbeat-wedge fix; see "Clock glitches" below.
 
 **Hardware bring-up results (bench, motor `16:5A:AB`, MAC `404cca512e64`):**
 - TX/RX, frame inversion + big-endian checksum (build *and* parse), and the retry/serialised
@@ -77,19 +78,61 @@ a dedicated FreeRTOS task owning UART1, and HTTP-pull OTA. New vs Actron: a **de
 
 | File | Purpose |
 |------|---------|
-| `platformio.ini` | `um_tinyc6` (Arduino, pioarduino C6 platform) + `um_tinyc6_ota` (espota) + `[env:native]` host tests (compiles `sdn.cpp`/`errlog.cpp`/`devices.cpp` only). |
+| `platformio.ini` | `um_tinyc6` (Arduino, pioarduino C6 platform) + `um_tinyc6_ota` (espota) + `[env:native]` host tests (compiles `sdn.cpp`/`errlog.cpp`/`devices.cpp`/`mono.cpp` only). |
 | `src/sdn.{h,cpp}` | **Pure C++, no Arduino deps.** Framing/checksum/inversion + command-payload builders + response parsers + address & HA-inversion helpers. Host-tested. |
 | `src/errlog.{h,cpp}` | **Pure C++.** Bounded ring buffer (128) of wire/protocol events + per-class counters. Host-tested. |
 | `src/devices.{h,cpp}` | **Pure C++.** Device table keyed by node addr — registration, position/limit application, stall + fault detection, comms-loss sweep. Host-tested. (This is the firmware's state model; there is intentionally no separate `state.cpp` — the table *is* the snapshot, serialised in `ws_api`/`http_api`.) |
+| `src/mono.{h,cpp}` | **Pure C++ core + a thin Arduino wrapper.** Glitch-filtered monotonic clock — `mono::now()` replaces `millis()` for every deadline, stamp and age in the firmware. Host-tested. See "Clock glitches" below. |
 | `src/bus.{h,cpp}` | Arduino. The **only** code touching UART1. FreeRTOS task: LISTEN/ACTIVE TX gate, command queue + raw request/response, retry, polling cadence, passive sniffing → device table + sniffer ring + errlog, OTA teardown. |
-| `src/ws_api.{h,cpp}` | WebSockets controller API (port 8767). Push `state` snapshots, command/`ack`/`error`, heartbeat. Broadcasts only from the main loop (dirty-flag set by the bus task). **Protocol-level ping/pong with dead-client eviction is enabled in `begin()` (`enableHeartbeat(15000,5000,2)`)** — the app-level state push is a data broadcast, not a liveness probe, so without this a half-open client left by a WiFi blip (no TCP FIN) lingers until lwIP's retransmit timeout (minutes), stalling the WS service loop and blocking new handshakes. That was the root cause of multi-minute HA `unavailable` stretches on weak-signal motors (port-80 HTTP stays responsive throughout, masking it). Fixed in fw 1.1.5. **Wedge watchdog (fw 1.3.0):** the heartbeat only evicts *non-responsive* clients — it can't help when all `WEBSOCKETS_SERVER_CLIENT_MAX` (5) slots fill with *live* zombies (a client leaking duplicate connections, each kept alive by its own keepalive). At capacity the library refuses every new handshake (accept→drop, no HTTP response) and the device looks dead to HA while HTTP/the bus stay healthy. A controller only ever has one legitimate HA coordinator, so `loop()` reboots if `connectedClients()` stays at the cap continuously for `WEDGE_REBOOT_MS` (5 min); any drop below the cap resets the timer (reboots via `wifi_prov::noteReboot("ws-wedge")` as of 1.5.0, so the cause survives into the next boot's `/stats`). This is the backstop for an HA-side connection leak fixed at source by the coordinator's close-before-reconnect (`somfy_sdn` 1.4.1) — it first wedged `bed_1_blinds_left`'s controller on 2026-06-14. **Silent-socket telemetry (fw 1.5.0, ledger shq-suite-0022):** lifetime `onEvent` counters `ws_conn`/`ws_disc`/`ws_err` (ported from actron-sniffer) surfaced in `/stats` + `/stats.json` — a growing `ws_conn − ws_disc` gap means sockets are dying without the WS library seeing a DISCONNECTED (the silent-death signature of the Actron/somfy ~5-day-fuse failure). |
+| `src/ws_api.{h,cpp}` | WebSockets controller API (port 8767). Push `state` snapshots, command/`ack`/`error`, heartbeat. Broadcasts only from the main loop (dirty-flag set by the bus task). **Protocol-level ping/pong with dead-client eviction is enabled in `begin()` (`enableHeartbeat(15000,5000,2)`)** — the app-level state push is a data broadcast, not a liveness probe, so without this a half-open client left by a WiFi blip (no TCP FIN) lingers until lwIP's retransmit timeout (minutes), stalling the WS service loop and blocking new handshakes. That was the root cause of multi-minute HA `unavailable` stretches on weak-signal motors (port-80 HTTP stays responsive throughout, masking it). Fixed in fw 1.1.5. **Wedge watchdog (fw 1.3.0):** the heartbeat only evicts *non-responsive* clients — it can't help when all `WEBSOCKETS_SERVER_CLIENT_MAX` (5) slots fill with *live* zombies (a client leaking duplicate connections, each kept alive by its own keepalive). At capacity the library refuses every new handshake (accept→drop, no HTTP response) and the device looks dead to HA while HTTP/the bus stay healthy. A controller only ever has one legitimate HA coordinator, so `loop()` reboots if `connectedClients()` stays at the cap continuously for `WEDGE_REBOOT_MS` (5 min); any drop below the cap resets the timer (reboots via `wifi_prov::noteReboot("ws-wedge")` as of 1.5.0, so the cause survives into the next boot's `/stats`). This is the backstop for an HA-side connection leak fixed at source by the coordinator's close-before-reconnect (`somfy_sdn` 1.4.1) — it first wedged `bed_1_blinds_left`'s controller on 2026-06-14. **Silent-socket telemetry (fw 1.5.0, ledger shq-suite-0022):** lifetime `onEvent` counters `ws_conn`/`ws_disc`/`ws_err` (ported from actron-sniffer) surfaced in `/stats` + `/stats.json` — a growing `ws_conn − ws_disc` gap means sockets are dying without the WS library seeing a DISCONNECTED (the silent-death signature of the Actron/somfy ~5-day-fuse failure). **Heartbeat-wedge fix (fw 1.5.1, ledger shq-suite-0034 — the actual root cause of the "silent socket"):** the periodic push was gated on `(int32_t)(t - g_last_heartbeat_ms) >= (int32_t)HEARTBEAT_INTERVAL_MS`, which reads as "not due yet" for as long as the stamp sits in the future — and an occasional far-future `millis()` read (see "Clock glitches") put it there. The socket, the WS-level pings and the connect-time snapshot all keep working, so HA goes available on connect, silent for 30 s, unavailable, reconnect — a 40 s flap cadence that ran 8 h on Bed 2 (701 cycles) and has hit gym, bed 4 and living-room-left before it. Now an **unsigned** elapsed test, so a future stamp wraps to a huge elapsed value and fires on the very next loop; `mono::now()` is the second layer. `hb_tx`/`hb_age` in `/stats` make it a one-curl diagnosis. |
 | `src/http_api.{h,cpp}` | HTTP debug API (port 80). `/stats /stats.json /devices /log /errors` (GET) and `/mode /send /discover /move /forget /wifi /reconnect /update /clear` (POST). `/send` is the RE workhorse. `/update` carries the **OTA app-guard** (see Device identity below). |
 | `src/app_desc.cpp` | **Native `esp_app_desc` override (Option A).** A strong `extern "C"` `esp_app_desc` in section `.rodata_desc` shadows the prebuilt Arduino one (`project_name="arduino-lib-builder"`), so the image's native descriptor reports `project_name="somfy-sdn"` + the real `SOMFY_FW_VERSION`. Read by `esp_ota_get_partition_description()` in the OTA guard and by `esptool image_info`. See "Device identity". |
 | `src/version.h` | `SOMFY_FW_VERSION` semver — bump on every flash (see root CLAUDE.md → Versioning). |
 | `src/wifi_prov.{h,cpp}` | NVS creds (Arduino `Preferences`), STA connect w/ retries, SoftAP captive portal, GPIO0 button (long = wipe, short = wink all), mDNS, configured-motor loading. **WiFi hardening (fw 1.5.0, ledger shq-suite-0022 — three in-wall controllers wedged off-network after infra outages, needing a breaker power-cycle):** after the one-shot boot connect the firmware previously relied entirely on the Arduino stack's implicit auto-reconnect; when that got stuck (the known ESP32 glitch class after an AP reboot/rekey/channel change) the device was stranded forever. Now layered: (1) **active link-retry** — after 20 s of continuous downtime (auto-reconnect gets the easy cases first), force a full `WiFi.disconnect()` + `begin()` every 30 s, resetting a stuck association state machine and re-applying the all-channel strongest-AP scan; (2) **WiFi-death reboot watchdog** — STA link down continuously for 5 min ⇒ `noteReboot("wifi-dead")` (backstop if even re-begin can't recover); (3) **mDNS re-announce on every (re)association** (`GOT_IP` event → `MDNS.end()` + restart from `loop()`): a reconnect may land on a NEW IP and HA's zeroconf host-healing only works if the advert re-fires — ESPmDNS's own IP-change behaviour is not dependable; (4) **event telemetry** — `WiFi.onEvent` counts lifetime STA disconnects + last 802.11 reason code, surfaced as `wifi_disc=`/`wifi_reason=` in `/stats` (handler stays minimal; logging happens from `loop()`). **Portal-purgatory retry (fw 1.5.0):** a device that boots while the AP is down (e.g. post-power-outage, AP slower to start) used to fall into the portal and stay there forever despite valid creds; with creds present the portal now reboots to retry STA every 15 min (`noteReboot("portal-retry")`); a creds-less portal never retries. **`noteReboot(reason)`/`bootNote()`:** records the reason for a deliberate self-reboot in NVS; the next boot reads + clears it and surfaces it as `note=` in `/stats` / `boot_note` in `/stats.json` (alongside `reset=` from `esp_reset_reason()`, so power-cycle vs watchdog vs crash is distinguishable per fleet sweep). **STA connect uses `WIFI_ALL_CHANNEL_SCAN` + `WIFI_CONNECT_AP_BY_SIGNAL`** (not the Arduino-default `WIFI_FAST_SCAN`, which joins the *first* matching BSSID — often a cached distant AP — and sticks there with no roaming), so every (re)connect joins the **strongest** AP for the SSID; a reboot/OTA now lands on the nearest AP. The stack has no live roaming once associated, so `requestReconnectBestAp()` (HTTP `POST /reconnect` / WS `reconnect_wifi` / HA button) forces an on-demand re-scan + reassociate — deferred to `loop()` so the ack flushes before the link drops. Hostname/SoftAP SSID = `somfy-sdn-<XXXX>` where `XXXX` is the last 2 octets of the **STA MAC** (`esp_read_mac(ESP_MAC_WIFI_STA)`), so it matches the device's label/MAC. (Do **not** use `ESP.getEfuseMac() & 0xFFFF` — that's the shared vendor OUI; every TinyC6 came out `4C40`. getEfuseMac also returns the *base* MAC, which differs from the STA MAC on the C6.) |
 | `src/main.cpp` | Boot wiring: bus task → WiFi/provisioning → HTTP+WS (when connected). |
-| `test/test_sdn`, `test/test_devices` | Unity host tests (22 cases). `pio test -e native`. |
+| `test/test_sdn`, `test/test_devices`, `test/test_mono` | Unity host tests (29 cases). `pio test -e native`. |
 | `WIRING.md` | Parallel-tap wiring (single transceiver, no terminator on a mid-bus tap). |
+
+### Clock glitches — the cause of the "silent socket" (fw 1.5.1, ledger shq-suite-0034)
+
+`millis()` on these C6 boards occasionally returns a value **far in the future**. It is rare
+(~once an hour on the worst unit) and self-correcting — the *next* read is fine — but any variable
+that captures one is poisoned for as long as the bogus offset lasts, which can be days.
+
+The proof is in the device's own error ring: `GET /errors` on the Bed 2 controller held six entries
+stamped up to **780,083 s on a device 31,300 s into its boot**. That ring is RAM-only and zeroed at
+boot, so those stamps came from live `millis()` calls. Healthy siblings show none.
+
+Two layers of defence, and both matter:
+
+1. **`mono::now()`** (`src/mono.{h,cpp}`) replaces `millis()` everywhere in `bus.cpp`,
+   `ws_api.cpp`, `wifi_prov.cpp` and `http_api.cpp`. It samples the clock **twice** and returns the
+   *earlier* of the pair — a glitch is a single bad read, so its partner is sane — then clamps the
+   result monotonic. Large forward steps are **counted, not suppressed**: a genuine multi-second
+   stall happens (OTA download, long bus transaction) and freezing time would be worse than the
+   bug. Counters surface as `clk_torn` / `clk_back` / `clk_jump` / `clk_jumpms` in `/stats`.
+   (A `clk_back` of 1–2 shortly after boot is normal: the filter is deliberately lock-free and the
+   bus task and main loop race benignly for it.)
+2. **Unsigned elapsed-time comparisons** at the call sites. `(uint32_t)(now - last) >= interval`
+   wraps a future stamp to a huge elapsed value and therefore fires *immediately*; the old
+   `(int32_t)(...)` form does the opposite and waits for the real clock to catch up. Prefer the
+   unsigned elapsed form over an absolute `deadline` variable wherever the choice exists.
+
+**Diagnosing a recurrence** — any controller whose HA entities flap `unavailable`/`available` on a
+~40 s cadence:
+
+```bash
+curl -s http://<ip>/stats     # hb_age >> 10000 with hb_tx frozen = the heartbeat has stalled;
+                              # wifi_disc=0 and ws_conn≈ws_disc climbing ~90/h confirm it is NOT WiFi
+```
+
+A stalled heartbeat can be unwedged **without a reboot** by sending any WS command (e.g.
+`{"type":"command","command":"set_mode","mode":"active"}`) — that sets the dirty flag, which
+re-stamps the heartbeat. Useful when you want the blind working right now and the diagnosis later.
+
+Note the knock-on: while flapping, each HA reconnect costs ~170 B of heap that a wedged controller
+never gives back (healthy ones release it within ~2 min). 700 flap cycles took Bed 2 from 240 kB to
+122 kB — a halved heap is a *consequence* of the flap, not its cause. Don't chase it as a leak.
 
 ### Concurrency / OTA (carried from the Actron brick fix)
 
@@ -213,8 +256,8 @@ other TinyC6 here share the `40:4c:ca:51` OUI **and** the `POST /update` endpoin
 |----------|---------|
 | `GET /` | human-friendly **HTML dashboard** (auto-refreshes every 3 s; polls `/stats.json` + `/devices` client-side) |
 | `GET /help` | the old text endpoint listing + status line (RE/curl workflow) |
-| `GET /stats` | status line, text (mode, devices, counters, fw, rssi, ip; **1.5.0 adds** `heap/minheap/maxblk/uptime`, `ws/ws_conn/ws_disc/ws_err`, `wifi_disc/wifi_reason`, `reset=`/`note=` — the silent-socket + link-churn telemetry; note `ws_clients=` was renamed `ws=` for actron parity) — consumed by the OTA flash scripts |
-| `GET /stats.json` | controller status as JSON (fw, build, mode, hostname, ip, mac, ssid, rssi, uptime, heap, counters; **1.5.0 adds** `heap_min`, `heap_maxblk`, `ws_conn`/`ws_disc`/`ws_err`, `wifi_disc`/`wifi_reason`, `reset_reason`, `boot_note`) — drives the dashboard |
+| `GET /stats` | status line, text (mode, devices, counters, fw, rssi, ip; **1.5.0 adds** `heap/minheap/maxblk/uptime`, `ws/ws_conn/ws_disc/ws_err`, `wifi_disc/wifi_reason`, `reset=`/`note=` — the silent-socket + link-churn telemetry; note `ws_clients=` was renamed `ws=` for actron parity; **1.5.1 adds** `hb_age`/`hb_tx` and `clk_torn`/`clk_back`/`clk_jump`/`clk_jumpms`) — consumed by the OTA flash scripts |
+| `GET /stats.json` | controller status as JSON (fw, build, mode, hostname, ip, mac, ssid, rssi, uptime, heap, counters; **1.5.0 adds** `heap_min`, `heap_maxblk`, `ws_conn`/`ws_disc`/`ws_err`, `wifi_disc`/`wifi_reason`, `reset_reason`, `boot_note`; **1.5.1 adds** `hb_age_ms`, `hb_tx`, `clk{torn,back,jumps,last_jump_ms}`) — drives the dashboard |
 | `GET /devices` | JSON device table |
 | `GET /log?since=&n=` | sniffed frames (incremental, like Actron) |
 | `GET /errors?n=` | error ring (newest first) |

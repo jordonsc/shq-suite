@@ -11,6 +11,7 @@
 #include <cstring>
 
 #include "bus.h"
+#include "mono.h"
 #include "sdn.h"
 #include "version.h"
 
@@ -75,8 +76,8 @@ uint32_t g_btn_down_ms = 0;
 bool g_reconnect_requested = false;
 
 // Watchdog state.
-uint32_t g_wifi_down_since_ms = 0;   // millis() when the STA link was first seen down; 0 = up
-uint32_t g_portal_started_ms = 0;    // millis() when the portal started
+uint32_t g_wifi_down_since_ms = 0;   // mono::now() when the STA link was first seen down; 0 = up
+uint32_t g_portal_started_ms = 0;    // mono::now() when the portal started
 bool g_portal_has_creds = false;     // creds exist => portal retry applies
 char g_boot_note[24] = "none";       // previous boot's noteReboot() reason
 uint32_t g_last_link_retry_ms = 0;   // last forced re-begin attempt; 0 = none this outage
@@ -139,8 +140,8 @@ bool tryConnect(const String& ssid, const String& pass) {
   for (uint8_t attempt = 0; attempt <= STA_RETRIES; attempt++) {
     Serial.printf("# WiFi connecting to \"%s\" (attempt %d)", ssid.c_str(), attempt + 1);
     WiFi.begin(ssid.c_str(), pass.c_str());
-    uint32_t t0 = millis();
-    while (!WiFi.isConnected() && millis() - t0 < STA_CONNECT_TIMEOUT_MS) {
+    uint32_t t0 = mono::now();
+    while (!WiFi.isConnected() && mono::now() - t0 < STA_CONNECT_TIMEOUT_MS) {
       delay(250);
       Serial.print('.');
     }
@@ -331,7 +332,7 @@ void portalScanMotors() {
 }
 
 void startPortal() {
-  g_portal_started_ms = millis();
+  g_portal_started_ms = mono::now();
   {
     String s, p;
     g_portal_has_creds = readCreds(s, p);
@@ -358,7 +359,7 @@ void startPortal() {
 
 void serviceButton() {
   bool pressed = (digitalRead(PIN_BUTTON) == LOW);
-  uint32_t now = millis();
+  uint32_t now = mono::now();
   if (pressed && !g_btn_down) {
     g_btn_down = true;
     g_btn_down_ms = now;
@@ -461,7 +462,7 @@ void serviceWifiEvents() {
 
 // WiFi-death watchdog + link-retry loop + portal-purgatory retry (constants up top for rationale).
 void serviceWatchdogs() {
-  uint32_t now = millis();
+  uint32_t now = mono::now();
   if (g_status == Status::CONNECTED) {
     if (WiFi.isConnected()) {
       g_wifi_down_since_ms = 0;

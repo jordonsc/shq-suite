@@ -9,6 +9,7 @@
 
 #include "bus.h"
 #include "devices.h"
+#include "mono.h"
 #include "sdn.h"
 #include "version.h"
 #include "wifi_prov.h"
@@ -37,6 +38,11 @@ uint32_t g_at_capacity_since_ms = 0;                 // millis() when we hit the
 uint32_t g_conn_events = 0;
 uint32_t g_disc_events = 0;
 uint32_t g_err_events = 0;
+
+// Lifetime count of state broadcasts pushed to clients (fw 1.5.1). Paired with hb_age in /stats
+// this is the one-curl answer to "is the heartbeat still running?" — the question that cost a
+// morning of packet captures the first time (ledger shq-suite-0034).
+uint32_t g_hb_broadcasts = 0;
 
 const char* movementName(sdn::MovementState m) {
   switch (m) {
@@ -94,6 +100,7 @@ void buildState(JsonDocument& doc) {
 
 void broadcastState() {
   if (g_server == nullptr) return;
+  g_hb_broadcasts++;
   JsonDocument doc;
   buildState(doc);
   String out;
@@ -306,7 +313,7 @@ void begin(uint16_t port) {
   // which writes to it stall the WS service loop and new connections can't be served. Ping every
   // 15 s, expect a pong within 5 s, disconnect after 2 consecutive misses (~30 s to reap).
   g_server->enableHeartbeat(15000, 5000, 2);
-  g_last_heartbeat_ms = millis();
+  g_last_heartbeat_ms = mono::now();
 }
 
 void loop() {
@@ -316,11 +323,20 @@ void loop() {
   if (g_dirty) {
     g_dirty = false;
     broadcastState();
-    g_last_heartbeat_ms = millis();
+    g_last_heartbeat_ms = mono::now();
   }
 
-  uint32_t t = millis();
-  if ((int32_t)(t - g_last_heartbeat_ms) >= (int32_t)HEARTBEAT_INTERVAL_MS) {
+  uint32_t t = mono::now();
+  // UNSIGNED elapsed-time test, deliberately (fw 1.5.1, ledger shq-suite-0034). This was
+  // `(int32_t)(t - g_last_heartbeat_ms) >= (int32_t)HEARTBEAT_INTERVAL_MS`, which reads as
+  // "not due yet" whenever the stamp sits in the future — and an occasional far-future millis()
+  // read put it there, wedging the heartbeat for 8 h on Bed 2. HA then sees a device that
+  // accepts connections and answers WS pings but never pushes state: available for one snapshot,
+  // unavailable 30 s later, forever, at a 40 s cadence. Unsigned subtraction wraps a
+  // future stamp to a huge elapsed value, so the very next loop fires a broadcast and re-stamps
+  // it — the failure self-corrects in 10 ms instead of lasting until the clock catches up.
+  // mono::now() (above) is the second layer: it filters the bad reads out in the first place.
+  if ((uint32_t)(t - g_last_heartbeat_ms) >= HEARTBEAT_INTERVAL_MS) {
     broadcastState();
     g_last_heartbeat_ms = t;
   }
@@ -352,5 +368,13 @@ uint32_t connectedClients() {
 uint32_t connectEvents() { return g_conn_events; }
 uint32_t disconnectEvents() { return g_disc_events; }
 uint32_t errorEvents() { return g_err_events; }
+
+uint32_t heartbeatBroadcasts() { return g_hb_broadcasts; }
+
+uint32_t heartbeatAgeMs() {
+  // Unsigned like the gate itself, so a (filtered-out but not impossible) future stamp shows up
+  // as an absurd age rather than silently reading as "just fired".
+  return (uint32_t)(mono::now() - g_last_heartbeat_ms);
+}
 
 }  // namespace ws_api

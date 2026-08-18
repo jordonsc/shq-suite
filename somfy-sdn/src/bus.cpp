@@ -8,6 +8,8 @@
 
 #include <cstring>
 
+#include "mono.h"
+
 namespace bus {
 
 namespace {
@@ -87,7 +89,7 @@ void startUart(uint32_t baud, char parity) {
 
 void logErr(errlog::Class c, const uint8_t* addr, const char* msg, const uint8_t* raw,
             size_t raw_len) {
-  g_errlog.record(millis(), c, addr, msg, raw, raw_len);
+  g_errlog.record(mono::now(), c, addr, msg, raw, raw_len);
 }
 
 void recordSniff(const uint8_t* bytes, size_t len, bool valid) {
@@ -95,7 +97,7 @@ void recordSniff(const uint8_t* bytes, size_t len, bool valid) {
   uint32_t s = ++g_sniff_seq;
   SniffEntry& e = g_sniff[(s - 1) % SNIFF_RING];
   e.seq = s;
-  e.t_ms = millis();
+  e.t_ms = mono::now();
   e.gap_us = g_last_frame_end_us ? (now - g_last_frame_end_us) : 0;
   e.len = (uint8_t)((len > sdn::MAX_FRAME_LEN) ? sdn::MAX_FRAME_LEN : len);
   e.valid = valid ? 1 : 0;
@@ -115,9 +117,9 @@ bool motorAddrOf(const sdn::ParsedFrame& pf, uint8_t out[3]) {
 }
 
 bool readByte(uint8_t* b, uint32_t timeout_ms) {
-  uint32_t deadline = millis() + timeout_ms;
+  uint32_t deadline = mono::now() + timeout_ms;
   while (!UART.available()) {
-    if ((int32_t)(millis() - deadline) >= 0) return false;
+    if ((int32_t)(mono::now() - deadline) >= 0) return false;
     vTaskDelay(1);  // blocking, CPU-yielding wait — never busy-spin (SPEC §6.5)
   }
   int v = UART.read();
@@ -128,14 +130,14 @@ bool readByte(uint8_t* b, uint32_t timeout_ms) {
 
 bool readBytes(uint8_t* buf, size_t n, uint32_t timeout_ms) {
   size_t got = 0;
-  uint32_t deadline = millis() + timeout_ms;
+  uint32_t deadline = mono::now() + timeout_ms;
   while (got < n) {
     if (UART.available()) {
       int v = UART.read();
       if (v < 0) break;
       buf[got++] = (uint8_t)v;
     } else {
-      if ((int32_t)(millis() - deadline) >= 0) break;
+      if ((int32_t)(mono::now() - deadline) >= 0) break;
       vTaskDelay(1);
     }
   }
@@ -197,17 +199,17 @@ bool processInbound(const uint8_t* raw, size_t len) {
   uint8_t addr[3];
   if (!motorAddrOf(pf, addr)) return false;  // broadcast-only frame, nothing to attribute
 
-  devices::Device* d = g_table.upsert(addr, devices::Source::OBSERVED, millis());
+  devices::Device* d = g_table.upsert(addr, devices::Source::OBSERVED, mono::now());
   if (d == nullptr) return false;
   bool became_online = false;
-  g_table.touch(d, millis(), &became_online);
+  g_table.touch(d, mono::now(), &became_online);
   bool changed = became_online;
   if (became_online) logErr(errlog::Class::ONLINE, addr, "device online", nullptr, 0);
 
   switch (pf.msg_id) {
     case sdn::MSG_POST_MOTOR_POSITION: {
       sdn::PositionReport pr = sdn::parsePosition(pf.data, pf.data_len);
-      devices::PosResult r = g_table.applyPosition(d, pr, millis());
+      devices::PosResult r = g_table.applyPosition(d, pr, mono::now());
       if (r.became_fault) {
         logErr(r.stalled ? errlog::Class::STALL : errlog::Class::POS_UNKNOWN, addr,
                r.stalled ? "motor stalled" : "position unknown", pf.data, pf.data_len);
@@ -331,9 +333,9 @@ void discover() {
       uint8_t addr[3];
       memcpy(addr, reply.src_addr, 3);
       if (!sdn::addrIsBroadcast(addr)) {
-        devices::Device* d = g_table.upsert(addr, devices::Source::DISCOVERED, millis());
+        devices::Device* d = g_table.upsert(addr, devices::Source::DISCOVERED, mono::now());
         if (d) {
-          g_table.touch(d, millis(), nullptr);
+          g_table.touch(d, mono::now(), nullptr);
           // Acknowledge discovery to the motor.
           uint8_t ack[1] = {0x01};
           sdn::ParsedFrame ar;
@@ -381,14 +383,14 @@ void execCommand(const Command& c) {
       g_stats.tx_frames++;
       g_raw_result.sent = true;
       size_t n = 0;
-      uint32_t deadline = millis() + (c.u16 ? c.u16 : 400);
+      uint32_t deadline = mono::now() + (c.u16 ? c.u16 : 400);
       while (n < sizeof(g_raw_result.raw)) {
         if (UART.available()) {
           int v = UART.read();
           if (v < 0) break;
           g_raw_result.raw[n++] = (uint8_t)v;
         } else {
-          if ((int32_t)(millis() - deadline) >= 0) break;
+          if ((int32_t)(mono::now() - deadline) >= 0) break;
           vTaskDelay(1);
         }
       }
@@ -522,7 +524,7 @@ bool anyMoving() {
 
 // Poll due devices (ACTIVE only). Moving devices polled fast; idle devices on a slow refresh.
 void pollCycle() {
-  uint32_t now = millis();
+  uint32_t now = mono::now();
   for (size_t i = 0; i < g_table.count(); i++) {
     devices::Device* d = g_table.at(i);
     if (d == nullptr) continue;
@@ -564,7 +566,7 @@ void busTask(void* /*arg*/) {
 
     // 3. Active discovery: one sweep on boot, then retry while the table stays empty.
     if (g_mode == Mode::ACTIVE) {
-      uint32_t now = millis();
+      uint32_t now = mono::now();
       if (!g_boot_discovery_done) {
         g_boot_discovery_done = true;
         g_last_discovery_ms = now;
@@ -581,7 +583,7 @@ void busTask(void* /*arg*/) {
 
     // 4. Comms-loss sweep.
     devices::Device* offline[devices::MAX_DEVICES];
-    size_t n = g_table.sweepOffline(millis(), devices::DEFAULT_OFFLINE_MS, offline,
+    size_t n = g_table.sweepOffline(mono::now(), devices::DEFAULT_OFFLINE_MS, offline,
                                     devices::MAX_DEVICES);
     if (n > 0) {
       for (size_t i = 0; i < n; i++) {
@@ -654,7 +656,7 @@ bool requestRaw(const uint8_t addr[3], bool broadcast, uint8_t msg, const uint8_
 }
 
 void addConfiguredDevice(const uint8_t addr[3]) {
-  g_table.upsert(addr, devices::Source::CONFIGURED, millis());
+  g_table.upsert(addr, devices::Source::CONFIGURED, mono::now());
 }
 
 devices::DeviceTable& table() { return g_table; }

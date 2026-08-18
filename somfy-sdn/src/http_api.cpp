@@ -13,6 +13,7 @@
 
 #include "bus.h"
 #include "devices.h"
+#include "mono.h"
 #include "sdn.h"
 #include "version.h"
 #include "wifi_prov.h"
@@ -83,7 +84,7 @@ String statusLine() {
     devices::Device* d = t.at(i);
     if (d && d->online) online++;
   }
-  char buf[560];
+  char buf[700];
   snprintf(buf, sizeof(buf),
            "# app=%s mode=%s devices=%u online=%u "
            "tx=%u rx=%u polls=%u "
@@ -93,6 +94,11 @@ String statusLine() {
            // library seeing a DISCONNECTED. reset/note say why THIS boot happened.
            "heap=%u minheap=%u maxblk=%u uptime=%lus "
            "ws=%u ws_conn=%u ws_disc=%u ws_err=%u "
+           // Heartbeat health + clock-glitch counters (fw 1.5.1, ledger shq-suite-0034).
+           // hb_age should stay under ~10 s; anything larger means the state push has stalled
+           // and HA is about to start its 40 s unavailable/available flap. clk_torn/clk_jump
+           // count the bad millis() reads that used to cause exactly that.
+           "hb_age=%u hb_tx=%u clk_torn=%u clk_back=%u clk_jump=%u clk_jumpms=%u "
            "wifi_disc=%u wifi_reason=%u reset=%s note=%s "
            "rssi=%d ip=%s fw=\"%s\"",
            APP_ID, modeStr(), (unsigned)t.count(), (unsigned)online,
@@ -100,9 +106,12 @@ String statusLine() {
            st.err_checksum, st.err_framing, st.err_timeout, st.err_nack,
            (unsigned)bus::errors().total(),
            (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
-           (unsigned)ESP.getMaxAllocHeap(), (unsigned long)(millis() / 1000),
+           (unsigned)ESP.getMaxAllocHeap(), (unsigned long)(mono::now() / 1000),
            (unsigned)ws_api::connectedClients(), (unsigned)ws_api::connectEvents(),
            (unsigned)ws_api::disconnectEvents(), (unsigned)ws_api::errorEvents(),
+           (unsigned)ws_api::heartbeatAgeMs(), (unsigned)ws_api::heartbeatBroadcasts(),
+           (unsigned)mono::tornReads(), (unsigned)mono::backwardReads(),
+           (unsigned)mono::forwardJumps(), (unsigned)mono::lastJumpMs(),
            (unsigned)wifi_prov::staDisconnectCount(), (unsigned)wifi_prov::lastDisconnectReason(),
            resetReasonStr(), wifi_prov::bootNote(),
            WiFi.isConnected() ? WiFi.RSSI() : 0,
@@ -240,7 +249,7 @@ void handleStatsJson() {
   doc["mac"] = WiFi.macAddress();
   doc["ssid"] = WiFi.SSID();
   doc["rssi"] = WiFi.isConnected() ? WiFi.RSSI() : 0;
-  doc["uptime_s"] = (uint32_t)(millis() / 1000);
+  doc["uptime_s"] = (uint32_t)(mono::now() / 1000);
   doc["heap_free"] = (uint32_t)ESP.getFreeHeap();
   doc["heap_min"] = (uint32_t)ESP.getMinFreeHeap();
   doc["heap_maxblk"] = (uint32_t)ESP.getMaxAllocHeap();
@@ -252,6 +261,13 @@ void handleStatsJson() {
   doc["ws_conn"] = ws_api::connectEvents();
   doc["ws_disc"] = ws_api::disconnectEvents();
   doc["ws_err"] = ws_api::errorEvents();
+  doc["hb_age_ms"] = ws_api::heartbeatAgeMs();
+  doc["hb_tx"] = ws_api::heartbeatBroadcasts();
+  JsonObject clk = doc["clk"].to<JsonObject>();
+  clk["torn"] = mono::tornReads();
+  clk["back"] = mono::backwardReads();
+  clk["jumps"] = mono::forwardJumps();
+  clk["last_jump_ms"] = mono::lastJumpMs();
   doc["wifi_disc"] = wifi_prov::staDisconnectCount();
   doc["wifi_reason"] = wifi_prov::lastDisconnectReason();
   doc["tx"] = st.tx_frames;
