@@ -4,7 +4,7 @@ import os
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import List
+from typing import List, Optional, Sequence, Tuple
 
 from .base import BaseDeployer
 
@@ -20,6 +20,7 @@ class HomeAssistantDeployer(BaseDeployer):
         source_path: str,
         destination_path: str,
         service_name: str,
+        components: Optional[Sequence[str]] = None,
     ):
         """
         Initialize the Home Assistant deployer.
@@ -29,8 +30,13 @@ class HomeAssistantDeployer(BaseDeployer):
             user: SSH username for remote hosts
             private_key: Path to SSH private key
             source_path: Base source path for custom components
-            destination_path: Destination path on remote host
+            destination_path: Destination path on remote host (the HA config
+                root, e.g. /etc/hass — custom_components/ hangs off it)
             service_name: Name of the systemd service
+            components: The custom components to deploy. `None` means the WHOLE
+                `custom_components/` tree, which is the behaviour that caused
+                `shq-suite-0033` — the CLI only ever passes `None` for an
+                explicit `--all-components`.
         """
         super().__init__(hostnames, user, private_key, source_path, destination_path, service_name)
         # configuration.yaml lives in deploy/config/ha/ (gitignored, user-specific)
@@ -39,6 +45,41 @@ class HomeAssistantDeployer(BaseDeployer):
         self.www_path = Path(source_path).parent / "www"
         # blueprints/ directory for automation blueprints
         self.blueprints_path = Path(source_path).parent / "blueprints"
+        # Which custom components to push. None == the whole tree (opt-in only).
+        self.components: Optional[List[str]] = list(components) if components else None
+
+    @property
+    def custom_components_dest(self) -> str:
+        """Remote `custom_components/` directory, beneath the HA config root."""
+        return str(Path(self.destination_path) / "custom_components")
+
+    def resolve_component_sources(self) -> List[Tuple[str, str]]:
+        """
+        Work out the (source, destination) rsync pairs for the components.
+
+        Scoped deploys sync `<source>/<component>` into `<dest>/custom_components`,
+        so a deploy touches ONLY the named component. An unscoped deploy keeps the
+        legacy whole-tree behaviour.
+
+        Raises:
+            FileNotFoundError: if a named component does not exist locally. This
+                is deliberately checked BEFORE any remote write — a typo must
+                fail locally rather than push a partial tree.
+        """
+        if self.components is None:
+            # Legacy whole-tree sync: `<source>` -> `<dest>`, landing the
+            # `custom_components` directory itself inside the config root.
+            return [(str(self.source_path), str(self.destination_path))]
+
+        pairs: List[Tuple[str, str]] = []
+        for component in self.components:
+            source = Path(self.source_path) / component
+            if not source.is_dir():
+                raise FileNotFoundError(
+                    f"custom component '{component}' not found at {source}"
+                )
+            pairs.append((str(source), self.custom_components_dest))
+        return pairs
 
     def _reload_ha_config(self, verbose: bool = False) -> bool:
         """
@@ -93,11 +134,21 @@ class HomeAssistantDeployer(BaseDeployer):
         """
         print(f"\n=== Setting up HA server at {hostname} ===")
 
-        # Rsync the component files
-        print(f" * Deploying components.. ", end="", flush=True)
-        if not self.run_rsync(self.source_path, self.destination_path, hostname, verbose=verbose, delete=False):
-            print("FAILED")
+        # Rsync the component files. A scoped deploy pushes ONLY the named
+        # components; see `shq-suite-0033` for why the whole-tree sync is not
+        # the default any more.
+        try:
+            pairs = self.resolve_component_sources()
+        except FileNotFoundError as e:
+            print(f" * Deploying components.. FAILED\n   {e}")
             return False
+
+        scope = "the whole custom_components tree" if self.components is None else ", ".join(self.components)
+        print(f" * Deploying components ({scope}).. ", end="", flush=True)
+        for source, destination in pairs:
+            if not self.run_rsync(source, destination, hostname, verbose=verbose, delete=False):
+                print("FAILED")
+                return False
         print("done", flush=True)
 
         # Deploy www/ directory if it exists (needs sudo as /etc/hass is root-owned)

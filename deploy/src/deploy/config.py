@@ -210,7 +210,7 @@ class ConfigPresets:
             user=auth.get("username", ""),
             private_key=auth.get("private_key", ""),
             source_path=hass.get("source_path"),  # None if not specified, will use default
-            component_path=hass.get("component_path", "/etc/home-assistant/custom_components"),
+            component_path=hass.get("component_path", "/etc/home-assistant"),
             systemd_service=hass.get("systemd_service", "homeassistant"),
         )
 

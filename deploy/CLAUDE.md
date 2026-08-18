@@ -5,14 +5,24 @@ Python CLI tool for deploying all SHQ components to their respective Raspberry P
 ## Usage
 
 ```bash
-./setup ha                          # Deploy HA components + reload config
-./setup ha --restart                # Deploy HA components + full service restart
+./setup ha -c dosa                  # Deploy ONE HA component + reload config
+./setup ha -c dosa -c centurion     # Deploy several
+./setup ha -c dosa --restart        # Deploy + full service restart
+./setup ha --all-components         # Sync the WHOLE tree (dangerous — see below)
 ./setup kiosk                       # Deploy Nyx to all kiosks
 ./setup kiosk -h redacted.host    # Deploy to specific kiosk
 ./setup overwatch --build           # Build + deploy Overwatch
 ./setup dosa --build                # Build + deploy DOSA
 ./setup argus --build               # Build (NATIVE) + deploy Argus to atlas
 ```
+
+> **`./setup ha` is scoped, and refuses to run unscoped.** You must name the component(s) with `-c`
+> (repeatable) or opt in explicitly with `--all-components`. `-c` used to be accepted and then
+> *ignored* — the rsync pushed the entire `custom_components/` tree regardless. On 2026-08-18 that
+> overwrote the live Argus integration (owned by `jordonsc/argus`, 1.68.1) with a dead stub still
+> carried here, HA failed to import it, and all ten wall kiosks lost their dashboard for ~6 hours.
+> See ledger **shq-suite-0033**. A named component that doesn't exist locally fails *before* any
+> remote write. Regression tests: `deploy/tests/test_ha_deployer.py`.
 
 For the ARM64 apps (`kiosk`/nyx, `overwatch`, `dosa`) the `--build` flag runs `build-rpi.sh` (`cross`/Podman) in the relevant project directory before deploying.
 
@@ -30,6 +40,7 @@ For the ARM64 apps (`kiosk`/nyx, `overwatch`, `dosa`) the `--build` flag runs `b
 | `src/deploy/overwatch_deployer.py` | Overwatch binary, sounds, config, ALSA |
 | `src/deploy/dosa_deployer.py` | DOSA binary, config |
 | `src/deploy/argus_deployer.py` | Argus (native x86_64) binary → `~/.local/bin/argus`, HUD `web/` assets, config, service |
+| `tests/test_ha_deployer.py` | Scoped-deploy regression tests (`python3 -m unittest discover -s deploy/tests -t deploy/tests`) |
 | `assets/pi_splash.png` | Kiosk wallpaper |
 | `assets/asound.conf` | ALSA dmix config for Overwatch USB audio |
 

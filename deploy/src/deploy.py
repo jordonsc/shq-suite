@@ -157,8 +157,17 @@ def cli():
 @click.option(
     "--component",
     "-c",
-    default="shq_display",
-    help="Name of the custom component to deploy (default: shq_display).",
+    multiple=True,
+    help="Custom component to deploy. Repeat for several. Required unless --all-components.",
+)
+@click.option(
+    "--all-components",
+    is_flag=True,
+    help=(
+        "Deploy the ENTIRE custom_components/ tree. Dangerous: this overwrites every "
+        "component on the target, including ones this repo no longer owns (see "
+        "ledger shq-suite-0033). Prefer -c."
+    ),
 )
 @click.option(
     "--restart",
@@ -166,16 +175,29 @@ def cli():
     is_flag=True,
     help="Full service restart instead of config reload (use when custom component code has changed).",
 )
-def ha(hostname, user, key, verbose, component, restart):
+def ha(hostname, user, key, verbose, component, all_components, restart):
     """
-    Deploy Home Assistant custom component.
+    Deploy Home Assistant custom component(s).
 
-    Deploys the SHQ Display custom component to Home Assistant hosts
-    and reloads the configuration. Use --restart for a full service restart
-    (needed when custom component Python code has changed).
+    Deploys the named custom component(s) to the Home Assistant host and reloads
+    the configuration. Use --restart for a full service restart (needed when
+    custom component Python code has changed).
+
+    A deploy is SCOPED to the components named with -c. Syncing the whole
+    custom_components/ tree requires the explicit --all-components flag — an
+    unscoped sync once overwrote the live Argus integration with a dead stub and
+    broke every wall kiosk (ledger shq-suite-0033).
 
     Configuration loaded from config/deployment/ha.yaml
     """
+    if component and all_components:
+        raise click.UsageError("--component and --all-components are mutually exclusive.")
+    if not component and not all_components:
+        raise click.UsageError(
+            "No component selected. Use -c <component> (repeatable), or "
+            "--all-components to sync the whole custom_components/ tree."
+        )
+
     config = ConfigPresets.get_ha_config()
 
     # Override defaults if provided
@@ -183,7 +205,9 @@ def ha(hostname, user, key, verbose, component, restart):
     ssh_user = user if user else config.user
     ssh_key = key if key else config.private_key
 
-    click.echo(f"Deploying Home Assistant component '{component}' to {len(hostnames)} host(s)...")
+    components = list(component) if component else None
+    scope = "the whole custom_components tree" if components is None else ", ".join(components)
+    click.echo(f"Deploying Home Assistant components ({scope}) to {len(hostnames)} host(s)...")
 
     deployer = HomeAssistantDeployer(
         hostnames=hostnames,
@@ -192,6 +216,7 @@ def ha(hostname, user, key, verbose, component, restart):
         source_path=config.source_path,
         destination_path=config.component_path,
         service_name=config.systemd_service,
+        components=components,
     )
 
     deployer.deploy_all(verbose=verbose, restart=restart)
