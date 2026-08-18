@@ -83,7 +83,17 @@ dosa:
 
 **Architecture**: Same coordinator pattern as shq_display. Cover supports OPEN, CLOSE, STOP, SET_POSITION.
 
-**Key files**: `client.py` (WebSocket), `coordinator.py`, `cover.py`, `button.py`
+**Reply correlation + no polling (1.1.0, 2026-08-18)** — fixes a permanent reconnect loop that silently ate door commands. Three linked changes; see ledger **shq-suite-0025**.
+
+`client.start_receiving` pushes *every* inbound `response`/`error`/`status` onto `_response_queue`, and the 15 s keep-alive NOOP draws a reply the server tags `command: "noop"`. Nothing drained them, and the only consumer was the coordinator's 5-minute "fallback poll" — so the queue grew unboundedly (~5,760 messages/day; the client and its queue are built once and survived every reconnect). `get_status()` then popped the *oldest* entry — a stale NOOP reply — saw `type != "status"` and returned `None` down its one silent path, so the coordinator raised `UpdateFailed`, dropped `_connected` and rebuilt the socket. **1,871 times in 7 days, dead on 300 s intervals.** Because `async_send_command` returned `False` immediately when disconnected — discarding the command, no queue, no retry — and the reconnect was scheduled 5 s out, every 5 min opened a ~5 s window (~1.7%) in which a door command vanished. Confirmed live: floor mat fired 2026-08-17 09:34:56.959, poll had failed at .683, `Not connected, triggering reconnect` at .962, door never moved, user opened it by hand 14 s later.
+
+1. **`update_interval=None`** (`coordinator.py`). This is `local_push`; the socket already streams state. `_async_update_data` now returns `self.data` when it has it, so even a manual refresh can't tear the socket down.
+2. **`_send_command(command, expect_type=…)`** (`client.py`) loops until it sees the reply that matches what it sent, discarding unrelated traffic, bounded by one 10 s deadline. The server tags every `Response` with the originating command (`dosa/src/websocket.rs`, strings identical to the client's `type` values), so matching is exact; a `Status` satisfies a status request, and an `error` terminates the wait rather than blocking. `connect()` also drains the queue, so a stale backlog can't outlive its socket.
+3. **`async_send_command` waits out an in-flight reconnect** (`RECONNECT_WAIT = 6`s, two attempts) instead of discarding the command.
+
+> Side effect worth knowing: before this, `open_door()`/`close_door()` return values were meaningless — they popped stale queue entries too. The door still worked because the *send* precedes the queue read; nothing could tell whether a command had actually succeeded.
+
+**Key files**: `client.py` (WebSocket + reply correlation), `coordinator.py`, `cover.py`, `button.py`
 
 ## argus (AI Alarm Assessment)
 
@@ -232,6 +242,14 @@ For automations/scripts/scenes, edit them in the HA UI directly — they live in
 - `tab_group.yaml` — mutually-exclusive boolean group (radio behaviour) for kiosk UI tab-groups. Single input: the group's `input_boolean`s; any one turning on turns the rest off (`mode: restart`). One automation per tab-group instead of one per tab. Instances: "UI - Kitchen Tabs" (`ui_kitchen_main/dimmers/info`), "UI - Bedroom Tabs" (`ui_bedroom_main/ensuite/aux`) — these replaced the six per-tab automations on 2026-06-12. **Deliberate**: all-booleans-off is a valid state (used as an implicit extra tab on the kiosk dashboards) — do not add a default-tab re-assert.
 
 `secrets.yaml` and the `.storage/` directory are server-side only; never overwrite them via deploy.
+
+**⚠️ Deploy gotcha — `./setup ha` ALWAYS pushes `configuration.yaml`, even with `-c <component>`.** The run prints "Deploying configuration.yaml.. done" regardless of which component you named, so a stale `deploy/config/ha/configuration.yaml` will overwrite the live server config on *any* deploy. That file is **gitignored**, so nothing in git protects it from drifting — the authoritative copy is the mirror in `shq-suite-config/ha/configuration.yaml`. **Diff the two before deploying:**
+
+```bash
+diff ~/repos/shq-suite-config/ha/configuration.yaml deploy/config/ha/configuration.yaml
+```
+
+This bit hard on 2026-08-18 (ledger **shq-suite-0032**): the local copy still carried the pre-cutover `alarm_control_panel:` block with `code: !secret alarm_code`, 17 days after the Argus cutover deleted both the panel and that secret. Deploying it put HA into **recovery mode** for ~7 min. Two traps in diagnosing it: HA in recovery still answers `/api/` with "API running" and serves a few `backup.*` entities so it *looks* alive, and `/api/error_log` does **not** show the bootstrap failure — `sudo podman logs hass` is the only place the parse error appears. Also note `ha_deployer.py` rsyncs with no `--backup`, so the live config is **unrecoverable** after an overwrite; recovery depended entirely on the shq-suite-config mirror. Worth fixing: validate every `!secret` against the target's `secrets.yaml` before writing, and back up the live file first.
 
 **Deploy gotcha — orphan components**: `./setup ha` uses `rsync` without `--delete`, so removing a custom component from the repo doesn't remove it from `/etc/hass/custom_components/` on atlas. The orphan dir keeps existing `.pyc` files and `home-assistant.loader` will continue to discover the integration on each restart (just won't load it without a config entry). To fully remove a component you must (a) `sudo rm -rf /etc/hass/custom_components/<name>` on atlas, plus (b) delete the HA config entry, plus (c) clean up any orphan entities the entity registry restored. Future fix: switch `ha_deployer.py` to `rsync --delete-after` for `custom_components/`.
 
