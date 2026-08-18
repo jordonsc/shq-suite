@@ -2,7 +2,6 @@
 import asyncio
 import logging
 import time
-from datetime import timedelta
 from typing import Any, Dict, Optional
 
 from homeassistant.core import HomeAssistant, callback
@@ -14,6 +13,9 @@ _LOGGER = logging.getLogger(__name__)
 
 # Grace period before marking device unavailable (seconds)
 AVAILABILITY_TIMEOUT = 30
+
+# How long a command will wait for an in-flight reconnect before giving up (seconds)
+RECONNECT_WAIT = 6
 
 
 class DosaCoordinator(DataUpdateCoordinator):
@@ -32,7 +34,10 @@ class DosaCoordinator(DataUpdateCoordinator):
             hass,
             _LOGGER,
             name=f"DOSA {name}",
-            update_interval=timedelta(minutes=5),  # Fallback polling only (WebSocket provides real-time updates)
+            # No polling. This is a local_push integration: the WebSocket delivers
+            # status in real time. The old 5-minute "fallback poll" did a status
+            # round-trip that tore down a perfectly healthy socket on every cycle.
+            update_interval=None,
         )
         self.device_id = device_id
         self.host = host
@@ -185,13 +190,18 @@ class DosaCoordinator(DataUpdateCoordinator):
                 _LOGGER.error(f"Error in availability monitor: {err}")
 
     async def _async_update_data(self) -> Dict[str, Any]:
-        """Fetch data from API endpoint (fallback polling)."""
+        """Return current state. Only runs on an explicit refresh, never on a timer."""
         if not self._connected:
             # Don't try to reconnect from polling - let the reconnect task handle it
             # Just schedule one if not already scheduled
             if not self._connecting and not self._reconnect_task:
                 self._schedule_reconnect(delay=0)
             raise UpdateFailed("Not connected to DOSA server")
+
+        # The socket pushes state, so whatever we already hold is current. Avoid a
+        # needless round-trip — that request is what used to fail and drop the socket.
+        if self.data is not None:
+            return self.data
 
         try:
             status = await self.client.get_status()
@@ -240,18 +250,40 @@ class DosaCoordinator(DataUpdateCoordinator):
         await self.client.disconnect()
 
     async def async_send_command(self, command_func, *args, **kwargs) -> bool:
-        """Send a command to the server."""
-        if not self._connected:
-            _LOGGER.warning("Not connected, triggering reconnect")
-            self._schedule_reconnect(delay=0)
-            return False
+        """Send a command to the server, waiting out a reconnect if one is in flight.
 
-        try:
-            result = await command_func(*args, **kwargs)
-            # Don't request refresh - WebSocket broadcasts provide real-time updates
-            return result
-        except Exception as err:
-            _LOGGER.error(f"Error sending command: {err}")
-            self._connected = False
-            self._schedule_reconnect()
-            return False
+        A door command must not be silently discarded because the socket happened to
+        be down: dropping one is how a floor-mat trigger ends up opening nothing.
+        """
+        for attempt in (1, 2):
+            if not self._connected:
+                _LOGGER.warning(
+                    "Not connected, awaiting reconnect before sending (attempt %s)",
+                    attempt,
+                )
+                self._schedule_reconnect(delay=0)
+                for _ in range(int(RECONNECT_WAIT / 0.1)):
+                    await asyncio.sleep(0.1)
+                    if self._connected:
+                        break
+
+            if not self._connected:
+                if attempt == 2:
+                    _LOGGER.error(
+                        "Command dropped: still not connected after %ss", RECONNECT_WAIT
+                    )
+                    return False
+                continue
+
+            try:
+                result = await command_func(*args, **kwargs)
+                # Don't request refresh - WebSocket broadcasts provide real-time updates
+                return result
+            except Exception as err:
+                _LOGGER.error(f"Error sending command: {err}")
+                self._connected = False
+                self._schedule_reconnect()
+                if attempt == 2:
+                    return False
+
+        return False

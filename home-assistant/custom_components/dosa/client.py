@@ -35,6 +35,10 @@ class DosaClient:
         try:
             self._websocket = await websockets.connect(self.uri)
             self._connected = True
+            # Anything still queued belongs to the socket we just replaced. Carrying it
+            # over would make the next command read a reply to a request that no longer
+            # exists, so start every connection with an empty queue.
+            self._drain_queue()
             _LOGGER.info(f"Connected to {self.uri}")
             return True
         except Exception as e:
@@ -56,30 +60,76 @@ class DosaClient:
             await self._websocket.close()
             self._connected = False
 
-    async def _send_command(self, command: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Send a command and wait for response."""
+    def _drain_queue(self):
+        """Discard anything sitting in the response queue."""
+        dropped = 0
+        while True:
+            try:
+                self._response_queue.get_nowait()
+                dropped += 1
+            except asyncio.QueueEmpty:
+                break
+        if dropped:
+            _LOGGER.debug(f"Discarded {dropped} stale queued message(s)")
+
+    @staticmethod
+    def _is_reply_to(message: Dict[str, Any], expect_type: str, cmd_name: str) -> bool:
+        """Is this message the reply to the command we just sent?
+
+        The queue also carries unsolicited status broadcasts and the replies to the
+        15 s keep-alive NOOPs, so the head of the queue is usually NOT our reply.
+        The server tags every Response with the originating command, which lets us
+        match precisely; a Status satisfies a status request (an unsolicited
+        broadcast is still a valid current status).
+        """
+        msg_type = message.get('type')
+        if msg_type == 'error':
+            # Errors carry no command tag, but they do terminate a request — surface
+            # it rather than blocking until the timeout.
+            return True
+        if expect_type == 'status':
+            return msg_type == 'status'
+        return msg_type == 'response' and message.get('command') == cmd_name
+
+    async def _send_command(
+        self,
+        command: Dict[str, Any],
+        expect_type: str = 'response',
+    ) -> Optional[Dict[str, Any]]:
+        """Send a command and wait for the reply that matches it."""
         if not self._connected:
             if not await self.connect():
                 return None
 
+        cmd_name = command.get('type')
+
         try:
             # Send command
             await self._websocket.send(json.dumps(command))
-            _LOGGER.info(f"Sent command: {command} (listening mode: {self._listening})")
+            _LOGGER.debug(f"Sent command: {command} (listening mode: {self._listening})")
 
             # If we're in listening mode, wait for response from queue
             if self._listening:
-                try:
-                    # Wait for a response message (status, response, or error)
-                    response = await asyncio.wait_for(
-                        self._response_queue.get(),
-                        timeout=10.0
-                    )
-                    _LOGGER.debug(f"Received response: {response}")
-                    return response
-                except asyncio.TimeoutError:
-                    _LOGGER.error("Timeout waiting for response")
-                    return None
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + 10.0
+                while True:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        _LOGGER.error(f"Timeout waiting for reply to '{cmd_name}'")
+                        return None
+                    try:
+                        message = await asyncio.wait_for(
+                            self._response_queue.get(),
+                            timeout=remaining
+                        )
+                    except asyncio.TimeoutError:
+                        _LOGGER.error(f"Timeout waiting for reply to '{cmd_name}'")
+                        return None
+                    if self._is_reply_to(message, expect_type, cmd_name):
+                        _LOGGER.debug(f"Received reply to '{cmd_name}': {message}")
+                        return message
+                    # Not ours (a status broadcast or a NOOP reply) — keep waiting.
+                    _LOGGER.debug(f"Skipping unrelated message while awaiting '{cmd_name}'")
             else:
                 # Not in listening mode, read directly
                 response = await self._websocket.recv()
@@ -98,7 +148,7 @@ class DosaClient:
 
     async def get_status(self) -> Optional[Dict[str, Any]]:
         """Get current status."""
-        response = await self._send_command({'type': 'status'})
+        response = await self._send_command({'type': 'status'}, expect_type='status')
         return response if response and response.get('type') == 'status' else None
 
     async def open_door(self) -> bool:
