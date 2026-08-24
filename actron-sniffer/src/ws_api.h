@@ -51,9 +51,15 @@ void begin(uint16_t port, const Hooks& hooks);
 // the latest state, and emits heartbeats.
 void loop();
 
-// Called from the frame-decode hook in main when state may have changed. We diff against
-// what we last published; if anything tracked changed, push to all clients.
-void publishStateIfChanged(const state::ControllerState& s);
+// Called from the frame-decode hook when state may have changed — safe to call from the
+// priority-5 bridge task (its only entry point into this module). Cheap and socket-free:
+// copies a snapshot under a spinlock and sets a dirty flag; ws_api::loop() (main loop) diffs
+// against what was last published and broadcasts. The bridge task must never touch the WS
+// layer directly: arduinoWebSockets does blocking socket I/O (up to WEBSOCKETS_TCP_TIMEOUT
+// per client) with no internal locking, so a direct broadcast from the bridge task both
+// races the main loop's server.loop() and stalls the RS485 relay on a zombie client
+// (ledger shq-suite-0038). Ported from somfy-sdn's dirty-flag pattern.
+void notifyStateChanged(const state::ControllerState& s);
 
 // Stats — exposed so /stats can include client/transition counts.
 size_t connectedClients();

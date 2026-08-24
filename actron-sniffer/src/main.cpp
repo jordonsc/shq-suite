@@ -48,6 +48,7 @@
 #include <esp_ota_ops.h>
 
 #include "bridge.h"
+#include "diag.h"
 #include "mono.h"
 #include "state.h"
 #include "wifi_prov.h"
@@ -151,8 +152,9 @@ static uint16_t g_scramble_nonce = 0xACE0;      // seed
 //      replay templates. Operator-driven, exits on next /bridge?mode=.
 static bridge::StreamingBridge::Mode g_bridge_mode = bridge::StreamingBridge::INJECT;
 
-// State decoded from the NEO frames the bridge has seen — published to WS clients on
-// change. Kept on the main loop's side and copied into ws_api via publishStateIfChanged.
+// State decoded from the NEO frames the bridge has seen — published to WS clients on change.
+// Owned by the bridge task (feedNeoFrame runs in flushFrame); handed to ws_api as a snapshot
+// via notifyStateChanged, and broadcast from the main loop only (ledger shq-suite-0038).
 static state::ControllerState g_ctrl_state;
 
 // ---- 0x67 controller emulation (tap mode only) ---------------------------
@@ -271,7 +273,9 @@ static void flushFrame(BusEndpoint& ep, bool was_modified) {
   // here accurately reflect committed state with ~1-cycle lag.
   if (ep.source_tag == 1) {
     if (state::feedNeoFrame(g_ctrl_state, r.data, r.len)) {
-      ws_api::publishStateIfChanged(g_ctrl_state);
+      // Snapshot handoff only — this runs on the priority-5 bridge task, which must never
+      // touch the WS layer (blocking socket I/O + no locking; ledger shq-suite-0038).
+      ws_api::notifyStateChanged(g_ctrl_state);
     }
   }
 
@@ -532,7 +536,13 @@ static size_t statusLine(char *out, size_t cap) {
     // HEARTBEAT_INTERVAL_MS; a large value means the state push has stalled and HA is about to
     // start its unavailable/available flap. clk_torn/clk_jump count the bad millis() reads that
     // used to cause exactly that.
-    "hb_age=%u hb_tx=%u clk_torn=%u clk_back=%u clk_jump=%u clk_jumpms=%u fw=\"%s\"",
+    "hb_age=%u hb_tx=%u clk_torn=%u clk_back=%u clk_jump=%u clk_jumpms=%u "
+    // Self-diagnostics summary (ledger shq-suite-0038). `sock` is spare lwIP sockets — 0 means the
+    // pool HTTP and WS share is exhausted. `loop_max`/`http_max` are the worst main-loop and
+    // handleClient() stalls since boot; anything near the 5 s pong deadline explains an eviction.
+    // `pongto`/`peerclose`/`txerr` split the disconnects by who caused them. Full records at /diag.
+    "sock=%u loop_max=%u http_max=%u stalls=%u "
+    "pongto=%u peerclose=%u txerr=%u wifi_disc=%u diag_seq=%u fw=\"%s\"",
     g_seq, g_baud, g_parity, g_gap_us, g_capture ? "on" : "off",
     (unsigned long long)g_a.total_bytes, g_a.total_frames, g_a.modified_frames, g_a.rx_errors,
     (unsigned long long)g_b.total_bytes, g_b.total_frames, g_b.modified_frames, g_b.rx_errors,
@@ -550,6 +560,10 @@ static size_t statusLine(char *out, size_t cap) {
     (unsigned)ws_api::heartbeatAgeMs(), (unsigned)ws_api::heartbeatBroadcasts(),
     (unsigned)mono::tornReads(), (unsigned)mono::backwardReads(),
     (unsigned)mono::forwardJumps(), (unsigned)mono::lastJumpMs(),
+    (unsigned)diag::spareSockets(), (unsigned)diag::loopMaxMs(), (unsigned)diag::httpMaxMs(),
+    (unsigned)diag::loopStalls(), (unsigned)diag::pongTimeouts(), (unsigned)diag::peerCloses(),
+    (unsigned)diag::transportErrors(), (unsigned)diag::wifiDisconnects(),
+    (unsigned)diag::lastSeq(),
     __DATE__ " " __TIME__);
 }
 
@@ -617,7 +631,7 @@ static String measureBaud() {
 
 // ---- HTTP handlers --------------------------------------------------------
 static void handleRoot() {
-  char st[800];
+  char st[1024];
   statusLine(st, sizeof(st));
   String b = "Actron RS485 sniffer + MITM bridge\n";
   b += String(st) + "\n\n";
@@ -646,7 +660,7 @@ static void handleRoot() {
 }
 
 static void handleStats() {
-  char st[800];
+  char st[1024];
   statusLine(st, sizeof(st));
   server.send(200, "text/plain", String(st) + "\n");
 }
@@ -665,6 +679,45 @@ static void handleStatsJson() {
   server.send(200, "application/json", buf);
 }
 
+// Why the WS service dropped, and what the box looked like when it did (ledger shq-suite-0038).
+// The same records HA receives over the socket, readable without a WS client — and reachable when
+// the WS layer is precisely the thing that has stopped working.
+static void handleDiag() {
+  // ~6 kB transient rather than a permanent static: this endpoint is read by a human occasionally,
+  // and the fault under investigation is memory pressure.
+  constexpr size_t CAP = 6144;
+  char* buf = (char*)malloc(CAP);
+  if (buf == nullptr) {
+    server.send(503, "text/plain", "# diag: out of memory\n");
+    return;
+  }
+  diag::renderText(buf, CAP);
+  server.send(200, "text/plain", buf);
+  free(buf);
+}
+
+static void handleDiagJson() {
+  JsonDocument doc;
+  JsonObject health = doc["health"].to<JsonObject>();
+  diag::healthToJson(health);
+  health["ws_conn"] = ws_api::connectEvents();
+  health["ws_disc"] = ws_api::disconnectEvents();
+  health["ws_err"] = ws_api::errorEvents();
+  health["hb_age_ms"] = ws_api::heartbeatAgeMs();
+  health["hb_tx"] = ws_api::heartbeatBroadcasts();
+  health["fw"] = __DATE__ " " __TIME__;
+
+  JsonArray arr = doc["events"].to<JsonArray>();
+  for (uint32_t seq = diag::firstSeq(); seq != 0 && seq <= diag::lastSeq(); seq++) {
+    const diag::Record* r = diag::bySeq(seq);
+    if (r != nullptr) diag::toJson(*r, arr.add<JsonObject>());
+  }
+
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
 static void handleLog() {
   uint32_t since = server.hasArg("since")
                        ? strtoul(server.arg("since").c_str(), nullptr, 10) : 0;
@@ -673,7 +726,7 @@ static void handleLog() {
 
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/plain", "");
-  char st[800];
+  char st[1024];
   statusLine(st, sizeof(st));
   server.sendContent(String(st) + "\n");
 
@@ -708,7 +761,7 @@ static void handleSet() {
     if (v > 0) g_gap_us = v;
   }
   startBuses();
-  char st[800];
+  char st[1024];
   statusLine(st, sizeof(st));
   server.send(200, "text/plain", String(st) + "\n");
 }
@@ -1296,7 +1349,7 @@ static void pumpConsole() {
     if (c == '\r') continue;
     if (c == '\n') {
       buf[len] = '\0';
-      char st[800];
+      char st[1024];
       switch (buf[0]) {
         case 'm': Serial.print(measureBaud()); break;
         case 's': statusLine(st, sizeof(st)); Serial.println(st); break;
@@ -1327,6 +1380,8 @@ static void startAppServer() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/stats", HTTP_GET, handleStats);
   server.on("/stats.json", HTTP_GET, handleStatsJson);
+  server.on("/diag", HTTP_GET, handleDiag);
+  server.on("/diag.json", HTTP_GET, handleDiagJson);
   server.on("/log", HTTP_GET, handleLog);
   server.on("/measure", HTTP_GET, handleMeasure);
   server.on("/set", HTTP_POST, handleSet);
@@ -1390,7 +1445,11 @@ void setup() {
     Serial.println("# Unprovisioned — SoftAP portal up; A/C bridge still running.");
   }
 
-  char st[800];
+  // Start diagnostics last so its Boot record carries a settled picture of the machine (heap
+  // after all the servers have allocated, socket headroom with them already bound).
+  diag::begin();
+
+  char st[1024];
   statusLine(st, sizeof(st));
   Serial.println(st);
 
@@ -1401,13 +1460,28 @@ void setup() {
 }
 
 void loop() {
+  // Phase timing (ledger shq-suite-0038). A WS client evicted for a late pong is indistinguishable
+  // from a dead one unless you know whether THIS loop was stalled at the time — and knowing which
+  // phase stalled is what separates "a slow HTTP peer blocked the pump" (handleClient blocks for
+  // as long as its client dawdles) from a fault in the WS layer itself. Costs four clock reads.
+  const uint32_t t_start = mono::now();
+  uint32_t ota_ms = 0, http_ms = 0, ws_ms = 0;
+
   wifi_prov::loop();  // captive portal (PORTAL) + GPIO0 button + on-demand reconnect
   pumpConsole();
   if (wifi_prov::isConnected()) {
+    const uint32_t t_ota = mono::now();
     ArduinoOTA.handle();
+    const uint32_t t_http = mono::now();
     server.handleClient();
+    const uint32_t t_ws = mono::now();
     ws_api::loop();
+    const uint32_t t_end = mono::now();
+    ota_ms = t_http - t_ota;
+    http_ms = t_ws - t_http;
+    ws_ms = t_end - t_ws;
   }
+  diag::noteLoop((uint32_t)(mono::now() - t_start), ota_ms, http_ms, ws_ms);
   // pumpCapture() / the A/C bridge run on their own FreeRTOS task — see bridgeTask() — so the
   // bridge keeps relaying in both CONNECTED and PORTAL modes.
 }

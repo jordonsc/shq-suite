@@ -115,4 +115,13 @@ Claude Code has direct access to the HA REST API via the `./ha` helper script (u
 - **Chrome CDP reads**: Parse `Content-Length` and `read_exact`, never `read_to_end` (hangs waiting for EOF)
 - **Cross-compilation**: Uses Podman, not Docker (`CROSS_CONTAINER_ENGINE=podman`)
 - **Overwatch proto**: The `.proto` file lives in `overwatch/proto/voice.proto`; the HA component symlinks to it and has generated Python stubs
+- **Don't diagnose an ESP32-C6 by polling its HTTP server — you will measure your own probe.** On the actron bridge, `GET /stats` every 15 s **quadrupled** the HA `unavailable` flap rate (22 events in 40 min against a 4-8/hour baseline) and drew free heap from 172 k down to 148 k, recovering once polling stopped: `WebServer` on port 80 and `WebSocketsServer` on 8767 share one small lwIP socket pool and one main loop, so HTTP requests starve the WS service (ledger shq-suite-0038). Read `GET /diag` / `/diag.json` **once**, or take the telemetry off the WS push the firmware already sends — both firmwares now instrument themselves (`src/diag.{h,cpp}` in `actron-sniffer` and `somfy-sdn` — **twins, keep them in step**) and the `actron_mitm_controller` / `somfy_sdn` diagnostic sensors record it all continuously in HA without touching the device at all.
+- **arduinoWebSockets blocks, and only the Arduino main loop may touch it.** The library's socket
+  reads/writes are blocking spin loops bounded by `WEBSOCKETS_TCP_TIMEOUT` (library default
+  5000 ms — one zombie client could stall the loop for 10-60 s per pass, which is what drove the
+  post-0034 availability flapping; ledger shq-suite-0038). Both firmwares now build with
+  `-D WEBSOCKETS_TCP_TIMEOUT=500` (`platformio.ini`) — keep it on any new firmware using this
+  library. And never call the WS server from another FreeRTOS task: it has no internal locking,
+  and a blocking write from a bus/bridge task stalls that task's real work. Use the dirty-flag
+  handoff both firmwares now share (`ws_api::notifyStateChanged` → drained by `ws_api::loop()`).
 - **ESP32-C6 `millis()` glitches**: on the TinyC6 boards `millis()` occasionally returns a value **far in the future** (proved by error-ring entries stamped beyond a device's own uptime). Any deadline variable that captures one stops firing until the real clock catches up — that is what wedged the somfy/actron WS state heartbeat and produced months of 40 s-cadence HA `unavailable` flapping (ledger shq-suite-0034). Both firmwares now use `mono::now()` (`src/mono.{h,cpp}`, keep the two copies in step) and **unsigned** elapsed-time comparisons: `(uint32_t)(now - last) >= interval`, never `(int32_t)(...)`. Any new timing code on these boards should follow the same two rules.

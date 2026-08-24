@@ -6,6 +6,7 @@
 
 #include <cstring>
 
+#include "diag.h"
 #include "mono.h"
 
 namespace ws_api {
@@ -50,6 +51,15 @@ state::ControllerState last_published_state_;
 bool last_published_valid_ = false;
 state::ControllerState current_state_;  // most recent decoder output for transition checks
 
+// Cross-task state handoff (ledger shq-suite-0038, dirty-flag pattern ported from somfy-sdn).
+// The priority-5 bridge task decodes NEO frames and hands the result over here; ONLY the main
+// loop (ws_api::loop) may touch the WS server, transitions, or the heartbeat stamp. The copy is
+// guarded by a spinlock because tickTransitions clears transitions on exact-equality matches
+// against setpoints — a torn snapshot could prematurely clear or re-fire a pulse.
+portMUX_TYPE pending_state_mux_ = portMUX_INITIALIZER_UNLOCKED;
+state::ControllerState pending_state_;  // written under pending_state_mux_ by notifyStateChanged
+volatile bool pending_state_dirty_ = false;
+
 uint32_t last_heartbeat_ms_ = 0;
 
 // Wedge watchdog (ported from somfy-sdn ws_api, fw 1.3.0). WebSocketsServer has a hard
@@ -72,6 +82,17 @@ uint32_t hb_broadcasts_ = 0;
 uint32_t connect_events_ = 0;
 uint32_t disconnect_events_ = 0;
 uint32_t error_events_ = 0;
+
+// Diagnostics fan-out cursor (ledger shq-suite-0038). diag records are POLLED from loop() rather
+// than pushed from a callback: emitting a WS frame from inside the library's own event dispatch —
+// which is where every record originates — would re-enter the server mid-iteration.
+uint32_t last_diag_seq_sent_ = 0;
+uint32_t last_health_ms_ = 0;
+
+// Records replayed to a client the moment it connects. A socket can never be told about its own
+// death, so the ONLY way HA learns why the previous session ended is to be handed the backlog on
+// the next one. Capped because the whole batch is serialised into one heap-allocated frame.
+constexpr uint32_t DIAG_BACKLOG_MAX = 12;
 
 // ---- Transition table --------------------------------------------------
 //
@@ -265,8 +286,59 @@ void sendStateToClient(uint8_t client_id, const state::ControllerState& s) {
 
 void broadcastState(const state::ControllerState& s) {
   hb_broadcasts_++;
+  diag::noteWsTx();
   JsonDocument doc;
   buildStatePayload(doc, s);
+  String out;
+  serializeJson(doc, out);
+  server.broadcastTXT(out);
+}
+
+// ---- diagnostics fan-out ------------------------------------------------
+
+void sendDiagRecord(const diag::Record& r) {
+  JsonDocument doc;
+  doc["type"] = "diag";
+  JsonObject obj = doc["event"].to<JsonObject>();
+  diag::toJson(r, obj);
+  String out;
+  serializeJson(doc, out);
+  server.broadcastTXT(out);
+}
+
+// Deliberately does NOT advance last_diag_seq_sent_: a second client would otherwise be starved of
+// everything this backlog covered. HA keys on `seq`, so a record arriving twice is discarded there.
+void sendDiagBacklog(uint8_t client_id) {
+  const uint32_t last = diag::lastSeq();
+  if (last == 0) return;
+  uint32_t first = diag::firstSeq();
+  if (last - first + 1 > DIAG_BACKLOG_MAX) first = last - DIAG_BACKLOG_MAX + 1;
+
+  JsonDocument doc;
+  doc["type"] = "diag_backlog";
+  JsonArray arr = doc["events"].to<JsonArray>();
+  for (uint32_t seq = first; seq <= last; seq++) {
+    const diag::Record* r = diag::bySeq(seq);
+    if (r != nullptr) diag::toJson(*r, arr.add<JsonObject>());
+  }
+  String out;
+  serializeJson(doc, out);
+  server.sendTXT(client_id, out);
+}
+
+void sendHealth() {
+  JsonDocument doc;
+  doc["type"] = "health";
+  JsonObject obj = doc["data"].to<JsonObject>();
+  diag::healthToJson(obj);
+  // WS-layer counters live here, not in diag, so diag stays independent of the server it watches.
+  obj["clients"] = server.connectedClients();
+  obj["ws_conn"] = connect_events_;
+  obj["ws_disc"] = disconnect_events_;
+  obj["ws_err"] = error_events_;
+  obj["hb_age_ms"] = (uint32_t)(mono::now() - last_heartbeat_ms_);
+  obj["hb_tx"] = hb_broadcasts_;
+  obj["fw"] = __DATE__ " " __TIME__;
   String out;
   serializeJson(doc, out);
   server.broadcastTXT(out);
@@ -543,17 +615,33 @@ void tickTransitions() {
 
 void onEvent(uint8_t client_id, WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
-    case WStype_CONNECTED:
+    case WStype_CONNECTED: {
       connect_events_++;
+      const IPAddress ip = server.remoteIP(client_id);
+      diag::noteWsConnect(client_id, ip.toString().c_str(), server.connectedClients());
       sendStateToClient(client_id, current_state_);
+      // After the snapshot, so a client always has state before it has history.
+      sendDiagBacklog(client_id);
       break;
+    }
     case WStype_DISCONNECTED:
       disconnect_events_++;
+      diag::noteWsDisconnect(client_id, server.connectedClients());
       break;
     case WStype_ERROR:
       error_events_++;
+      diag::noteWsError(client_id, server.connectedClients());
+      break;
+    case WStype_PONG:
+      // Proof the peer answered our reaper's ping. Its absence is what gets a client evicted, so
+      // the age of the last one is the primary evidence in a disconnect classification.
+      diag::noteWsPong(client_id);
+      break;
+    case WStype_PING:
+      diag::noteWsRx(client_id);
       break;
     case WStype_TEXT: {
+      diag::noteWsRx(client_id);
       JsonDocument doc;
       DeserializationError err = deserializeJson(doc, payload, length);
       if (err) {
@@ -564,7 +652,7 @@ void onEvent(uint8_t client_id, WStype_t type, uint8_t* payload, size_t length) 
       break;
     }
     default:
-      break;  // BIN / PING / PONG: no-op
+      break;  // BIN and friends: no-op
   }
 }
 
@@ -608,15 +696,63 @@ void begin(uint16_t port, const Hooks& hooks) {
   // writes to it stall the WS service loop and HA sees no state → `unavailable`. Ping every 15 s,
   // expect a pong within 5 s, disconnect after 2 consecutive misses (~30 s to reap). This is the
   // primary fix for the recurring 30-40 s `unavailable` flaps (ledger shq-suite-0019).
-  server.enableHeartbeat(15000, 5000, 2);
+  // Parameters live in diag.h so the disconnect classifier reasons about exactly the deadlines
+  // that trigger an eviction here (ledger shq-suite-0038).
+  server.enableHeartbeat(diag::WS_PING_INTERVAL_MS, diag::WS_PONG_TIMEOUT_MS, diag::WS_PONG_MISSES);
   last_heartbeat_ms_ = mono::now();
+  last_health_ms_ = last_heartbeat_ms_;
+  last_diag_seq_sent_ = diag::lastSeq();
 }
 
 void loop() {
   server.loop();
+
+  // Drain the bridge task's state handoff. Dirty is cleared inside the critical section BEFORE
+  // the broadcast (same ordering as somfy-sdn): a bus update landing mid-broadcast re-sets the
+  // flag and gets published next pass instead of being lost.
+  bool fresh_state = false;
+  if (pending_state_dirty_) {
+    portENTER_CRITICAL(&pending_state_mux_);
+    current_state_ = pending_state_;
+    pending_state_dirty_ = false;
+    portEXIT_CRITICAL(&pending_state_mux_);
+    fresh_state = true;
+  }
+
+  // Tick AFTER the copy so the published payload reflects transitions that just completed on
+  // this frame (previously done inside publishStateIfChanged on the bridge task).
   tickTransitions();
 
+  if (fresh_state && (!last_published_valid_ || stateChanged(current_state_, last_published_state_))) {
+    broadcastState(current_state_);
+    last_published_state_ = current_state_;
+    last_published_valid_ = true;
+    last_heartbeat_ms_ = mono::now();
+  }
+
   uint32_t t = mono::now();
+
+  // Drain new diagnostics to any listener. Bounded per iteration so a burst (a reconnect storm
+  // produces several records at once) can't turn one loop pass into the very stall it reports.
+  if (server.connectedClients() > 0) {
+    const uint32_t newest = diag::lastSeq();
+    if (last_diag_seq_sent_ < diag::firstSeq()) last_diag_seq_sent_ = diag::firstSeq() - 1;
+    uint8_t budget = 4;
+    while (last_diag_seq_sent_ < newest && budget-- > 0) {
+      const diag::Record* r = diag::bySeq(++last_diag_seq_sent_);
+      if (r != nullptr) sendDiagRecord(*r);
+    }
+    if ((uint32_t)(t - last_health_ms_) >= diag::HEALTH_INTERVAL_MS) {
+      last_health_ms_ = t;
+      sendHealth();
+    }
+  } else {
+    // Nobody listening: keep the cursor at the head so a fresh client gets the backlog once,
+    // rather than the backlog and then a replay of the same records.
+    last_diag_seq_sent_ = diag::lastSeq();
+  }
+
+  diag::tick((uint32_t)(t - last_heartbeat_ms_));
   // UNSIGNED elapsed-time test, deliberately (ledger shq-suite-0034). The signed form read as
   // "not due yet" whenever the stamp sat in the future, and a single far-future millis() read put
   // it there — after which this device accepts connections and answers WS pings but never pushes
@@ -648,18 +784,13 @@ void loop() {
   }
 }
 
-void publishStateIfChanged(const state::ControllerState& s) {
-  current_state_ = s;
-  // Recheck transitions against the fresh state now (before we publish), so the published
-  // payload reflects any transitions that just completed on this frame.
-  tickTransitions();
-
-  if (!last_published_valid_ || stateChanged(s, last_published_state_)) {
-    broadcastState(s);
-    last_published_state_ = s;
-    last_published_valid_ = true;
-    last_heartbeat_ms_ = mono::now();
-  }
+void notifyStateChanged(const state::ControllerState& s) {
+  // Bridge-task side of the handoff: a ~100-byte struct copy under a spinlock, nothing else.
+  // Microseconds — three orders of magnitude under the RS485 t3.5 frame-gap budget.
+  portENTER_CRITICAL(&pending_state_mux_);
+  pending_state_ = s;
+  pending_state_dirty_ = true;
+  portEXIT_CRITICAL(&pending_state_mux_);
 }
 
 size_t connectedClients() { return server.connectedClients(); }

@@ -116,6 +116,110 @@ flap. Fixed on both firmwares (actron build "Aug 18 2026 23:07:14"): the gate is
 (how often the clock misbehaves). If the flaps return with `hb_age` small and `hb_tx` still
 climbing, it is a *different* fault — go back to the exhaustion hypothesis then, not before.
 
+**⇒ FLAPS RETURNED 2026-08-20, DIFFERENT FAULT AGAIN (ledger shq-suite-0038) — and this time the
+device instruments itself.** Exactly the condition the note above told a future session to watch
+for: `hb_age` small, `hb_tx` climbing, `clk_*` flat zero, uptime unbroken, and 154 HA `unavailable`
+events in 35 h anyway (median 23 s, 4-8/hour) after 48 completely clean hours post-flash. Two
+measurements narrowed it before any code changed: 40 min of 1 Hz ICMP returned **2397/2398** replies
+from the device against **2344/2344** from the gateway (so the radio and IP stack never left —
+association/rekey/power-save theories are dead), while plain `GET /stats` **timed out at 5 s on 16
+of 151 requests**. The device answers ICMP and stalls TCP. Polling `/stats` every 15 s **quadrupled
+the flap rate** (22 events in 40 min vs 4-8/hour) and drew free heap down 172 k → 148 k, recovering
+once polling stopped — HTTP requests starve the WS service, which is both a finding and an
+on-demand reproducer. `ss -tn` on atlas showed exactly one socket to `:8767`, so it is not an
+HA-side coordinator leak.
+
+**Rather than keep guessing, the firmware now records why.** `src/diag.{h,cpp}` classifies every WS
+disconnect from evidence held at the instant it fires and stamps it with the machine's condition —
+see "Self-diagnostics" below. The two live hypotheses it exists to separate:
+* **`pong_timeout` with a large `loop_max_ms`** ⇒ the main loop stalls past the library's ping/pong
+  deadline and `enableHeartbeat` evicts a perfectly healthy HA. Check `http_ms` — Arduino's
+  `WebServer::handleClient()` blocks the whole loop while a slow request dawdles.
+* **any disconnect with `sock=0`** ⇒ the lwIP socket pool is exhausted. HTTP and WS share it.
+
+**⇒ ROOT CAUSE FOUND AND FIXED (2026-08-24, ledger shq-suite-0038).** 20.3 h of self-recorded
+diagnostics answered it: 149 loop stalls, worst **60,069 ms with 60,068 ms in the `ws_api::loop()`
+phase** (`http_max=9ms`, `ota_max=3ms` over the whole window — the HTTP and socket-pool hypotheses
+are both dead: `sock=3` on every disconnect record, heap flat, `wifi_disc=0`, `clk_*=0`).
+arduinoWebSockets does **blocking socket I/O bounded by `WEBSOCKETS_TCP_TIMEOUT` (default
+5000 ms)** — hand-rolled spin loops in `WebSockets.cpp` — so one zombie client cost the main loop
+5 s per operation, stalls compounded across the 5 client slots (observed stalls were clean
+multiples: 10 s / 20 s / 60 s), late pongs made `enableHeartbeat`'s reaper evict the *healthy* HA
+client, and each reconnect fed the loop (five slots seen dying in the same second). The fix, on
+both twins (actron build "Aug 24 2026 00:39:51", somfy fw 1.6.1):
+* **`-D WEBSOCKETS_TCP_TIMEOUT=500`** (`platformio.ini`) — bounds the worst per-client stall 10×,
+  keeping even a pathological loop pass under the 5 s pong deadline. This is the load-bearing
+  stall fix; somfy already had the dirty-flag architecture and still hit a 50 s stall without it.
+* **Dirty-flag broadcast port** (somfy's pattern): `ws_api::publishStateIfChanged` (called from
+  the priority-5 bridge task) is gone; `notifyStateChanged` copies a `ControllerState` snapshot
+  under a `portMUX` spinlock and sets a flag, and `ws_api::loop()` (main loop) drains, diffs and
+  broadcasts. The bridge task never touches a socket again — previously a zombie client could
+  stall the **RS485 relay itself** for seconds mid-broadcast, and the unsynchronised cross-task
+  use of the WS library (no internal locking) was a data race in its own right.
+* **`WEBSOCKETS_SERVER_CLIENT_MAX` deliberately stays at the library default 5** — with the 500 ms
+  bound the slot count no longer matters for the feedback loop, and lowering it interacts badly
+  with the wedge watchdog (5 min continuously at cap ⇒ reboot: a small cap turns "HA + a couple of
+  debug clients" into a self-reboot) and refuses debug connections during zombie windows.
+* **`diag::tick()` wrap guard**: an `hb_age` ≥ 0x80000000 is a wrapped "negative" (future stamp),
+  clamped to 0 so it can never latch a bogus `heartbeat_stall` record (the ~4.29e9 values in the
+  0038 data). The race that produced them died with the port (single writer), guard kept anyway.
+
+## Self-diagnostics (`src/diag.{h,cpp}`, 2026-08-23)
+
+Twin of `somfy-sdn/src/diag.{h,cpp}` (ported there in somfy fw 1.6.0) — **keep the two in step**,
+same standing rule as `mono.{h,cpp}`.
+
+Both twins carry the `clk_back` fix (`clockGlitchTotal()` counts torn + jump only, never
+`mono::backwardReads()` — ledger shq-suite-0039); it is inert here (`bridgeTask` never calls
+`mono::now()`, so `clk_back` stays 0) and load-bearing on somfy, where the bus task drives it to
+~72/s. Source and flashed binary are in step as of 2026-08-24 00:39 (the shq-suite-0038 fix
+build — dirty-flag port + `WEBSOCKETS_TCP_TIMEOUT=500` + diag wrap guard).
+
+A 48-entry RAM ring of `Record`s (~3 kB held permanently). Each carries the event, an inferred
+reason, and the machine's condition at capture: free heap, largest allocatable block, spare lwIP
+sockets, worst main-loop and `handleClient()` stall since the previous record, RSSI, client count.
+
+**Events:** `boot` (with `esp_reset_reason()`), `ws_connect`, `ws_disconnect`, `ws_error`,
+`ws_at_cap`, `loop_stall`, `heap_low`, `socket_low`, `wifi_down`/`wifi_up`, `clock_glitch`,
+`heartbeat_stall`.
+
+**Disconnect reasons**, inferred conservatively — `unclassified` is preferred to a confident wrong
+answer, and the raw evidence rides along so a verdict can be re-judged from history without a
+reflash:
+| Reason | Inferred when |
+|--------|---------------|
+| `pong_timeout` | last pong ≥ 20 s old (ping 15 s + pong 5 s) ⇒ **our own reaper** evicted it |
+| `peer_close` | a pong landed within the last ping cycle, or inbound traffic within 10 s ⇒ not us |
+| `transport_error` | a `WStype_ERROR` arrived for that slot in the preceding 2 s |
+| `unclassified` | quiet socket, pong not yet overdue — nothing to pin it on |
+
+The WS library gives no callback for a received close frame, so `peer_close` is inferred rather
+than observed; HA's own `ha_clean`/`ha_closed` bus event is the confirming half.
+
+**Spare sockets** are measured, not guessed: `probeSockets()` asks lwIP for sockets until it
+refuses (up to 3) and closes them again. `sock=0` is the direct test of pool exhaustion. Re-probed
+at the instant of every disconnect, not reused from the 15 s sample.
+
+**Loop phase timing.** `loop()` times `ArduinoOTA.handle()`, `server.handleClient()` and
+`ws_api::loop()` separately and feeds `diag::noteLoop()`. A `loop_stall` record therefore says
+*which* phase held the loop — an HTTP problem, an OTA problem, and a WS problem need different
+fixes. `diag::tick()` is called every iteration but rate-limits its own body to 1 Hz:
+`ESP.getFreeHeap()` takes a heap lock and running it at loop rate would perturb the subsystem
+under investigation.
+
+**Delivery — three surfaces, and the backlog is the load-bearing one:**
+1. Live over WS as `{"type":"diag","event":{…}}`, **polled** from `ws_api::loop()` (max 4/iteration)
+   rather than pushed from a callback — emitting a frame from inside the library's own event
+   dispatch would re-enter the server mid-iteration.
+2. `{"type":"diag_backlog","events":[…]}` — the last 12 records, replayed to every client the
+   moment it connects. **A socket can never be told about its own death**, so this is the only way
+   HA ever learns why the previous session ended. Records are deliberately re-sent (the live
+   cursor is not advanced past a backlog) — HA de-duplicates on `seq`.
+3. `{"type":"health","data":{…}}` every 30 s, plus `GET /diag` (text) and `GET /diag.json`.
+
+`/stats` gained a summary line: `sock` `loop_max` `http_max` `stalls` `pongto` `peerclose` `txerr`
+`wifi_disc` `diag_seq`.
+
 **Open:** command codes for **away / turbo / continuous-fan** still to map (page-1, quick
 `findpulse.py` loop — likely on bits 3/4/5/7 of reg 14 by the bitfield pattern). Firmware
 is receive-only unless `/armwrite` is called OR `/bridge?mode=` is set to a non-OFF value
@@ -282,7 +386,9 @@ ESP32-C6 needs the **pioarduino** platform fork (pinned in `platformio.ini`; bum
 | Endpoint | Purpose |
 |----------|---------|
 | `GET /` | help + status |
-| `GET /stats` | one-line status; starts `# app=actron-mitm …`. Carries `heap/minheap/maxblk/uptime`, `ws/ws_conn/ws_disc/ws_err`, and (2026-08-19) `hb_age`/`hb_tx` + `clk_torn`/`clk_back`/`clk_jump`/`clk_jumpms` |
+| `GET /stats` | one-line status; starts `# app=actron-mitm …`. Carries `heap/minheap/maxblk/uptime`, `ws/ws_conn/ws_disc/ws_err`, and (2026-08-19) `hb_age`/`hb_tx` + `clk_torn`/`clk_back`/`clk_jump`/`clk_jumpms`, and (2026-08-23) `sock`/`loop_max`/`http_max`/`stalls`/`pongto`/`peerclose`/`txerr`/`wifi_disc`/`diag_seq` |
+| `GET /diag` | **self-diagnostics** — health line + the event ring, newest last. Reachable when the WS layer is precisely what has stopped working |
+| `GET /diag.json` | same, machine-readable (`{"health":{…},"events":[…]}`) |
 | `GET /stats.json` | machine-readable identity + status (`app`/`model`/`mac`/`ip`/`fw`/`rssi`/`bridge`) — uniform with somfy-sdn so any TinyC6 on the LAN is positively identifiable |
 | `GET /log?since=<seq>&n=<max>` | frames; `since` returns only newer ones (incremental polling) |
 | `POST /set?baud=&parity=N\|E\|O&gap=<us>` | change capture settings live |
@@ -409,6 +515,7 @@ push directly: `pio run -e um_tinyc6_ota -t upload`.
 | `src/bridge.h` / `src/bridge.cpp` | Pure C++ (no Arduino deps) streaming MITM bridge — frame-aware byte forwarder with inline register substitution and on-the-fly CRC re-stamping. Unit-tested on the host. |
 | `src/state.h` / `src/state.cpp` | Pure C++ NEO frame decoder — parses page-1/page-2 func-03 responses into a `ControllerState` struct (mode/fan/setpoints/zones/temps) per FINDINGS §7. Used by ws_api to publish state and tick transitions. Host-testable. |
 | `src/ws_api.h` / `src/ws_api.cpp` | WebSockets server on port 8767 — JSON command/state schema, transition table with per-field `*_transitioning` values, write orchestration mapping each command to the LOCAL-CONTROL-RECIPES recipes. Bridge stays in INJECT permanently; pulse rules auto-expire, persistent rules (zone setpoints) are cleared on board adoption or `GRACE_PERIOD_MS` timeout. **WS liveness (2026-07-13):** `begin()` calls `enableHeartbeat(15000,5000,2)` to evict half-open zombie clients (a WiFi blip leaving a client's TCP half-open, no FIN). **This was NOT the actual cure for the recurring ~30 s `unavailable` flaps** — root cause (found 2026-07-19) is `bridgeTask` loop-starvation, fixed by the yield budget in `main.cpp` (see the "Yield budget" note up top); the heartbeat can't help when the WS loop that *sends* it is the starved thing. Kept as belt-and-braces for genuine half-open clients. Plus a **wedge-watchdog**: `loop()` reboots if all `WEBSOCKETS_SERVER_CLIENT_MAX` (5) slots stay occupied continuously for 5 min (backstop to the client-side leak fixed in `actron_mitm_controller` 1.1.1; any drop below the cap resets the timer, so it can't boot-loop). Both ported from `somfy-sdn/src/ws_api.cpp` (fw 1.1.5 + 1.3.0). See ledger shq-suite-0019. **Heartbeat-wedge fix (2026-08-19, ledger shq-suite-0034):** the periodic push is now gated on an *unsigned* elapsed test and `now_ms()` returns `mono::now()` — see the Regression #2 note up top for why the signed form wedged for hours. `hb_age`/`hb_tx` in `/stats` say whether the push is alive. |
+| `src/diag.h` / `src/diag.cpp` | **Self-diagnostics** (ledger shq-suite-0038; twin ported to somfy-sdn fw 1.6.0) — WS disconnect classification with the machine's condition attached, loop/HTTP phase-stall timing, an lwIP spare-socket probe, and a 48-entry event ring served at `/diag`, `/diag.json`, and pushed over WS (live + replayed as a backlog on connect). Twin of `somfy-sdn/src/diag.{h,cpp}` — keep them in step; note the source-ahead-of-binary warning in that section. |
 | `src/mono.h` / `src/mono.cpp` | Pure C++ glitch-filtered monotonic clock (twin of `somfy-sdn/src/mono.{h,cpp}` — keep them in step). `mono::now()` backs `ws_api`'s `now_ms()`, so every transition deadline and the heartbeat stamp are immune to a single far-future `millis()` read. Host-tested. |
 | `test/test_mono/test_mono.cpp` | Unity host-side tests for the clock filter. 7 cases: normal progression, a far-future glitch in either sample, backwards reads, a genuine long stall being accepted, torn tolerance, 49.7-day wrap. |
 | `test/test_bridge/test_bridge.cpp` | Unity host-side tests for the bridge logic. 21 cases covering passthrough, injection, CRC re-stamping, multi-rule, boundary registers, mid-frame gap reset, pulse expiry, replay templates. Run with `pio test -e native`. |
