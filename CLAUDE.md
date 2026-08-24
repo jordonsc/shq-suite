@@ -61,6 +61,7 @@ Argus is unusual: the daemon runs **on the HA host itself (atlas)**, and HA also
 | `shelly/` | Python | CLI for discovering and configuring Shelly smart devices |
 | `actron-sniffer/` | C++ (Arduino/PlatformIO) | RS485 sniffer + MITM bridge (ESP32-C6 / TinyC6) for the Actron NEO↔indoor protocol. Dual-purpose: HTTP RE toolkit + WebSockets Controller API on port 8767 for the `actron_mitm_controller` HA integration. |
 | `somfy-sdn/` | C++ (Arduino/PlatformIO) | ESP32-C6 controller for Somfy SDN RS485 blind motors; `actron-sniffer` design twin (HTTP debug + WS:8767 + HA `cover`). Normal bus participant (not a MITM); ports the SDN protocol from the separate `matter-apps` repo (`common/features/app_sdn.cpp`). Firmware + `somfy_sdn` HA component (zeroconf-discoverable) **hardware-verified** on a TinyC6 + live motor. Design in [`somfy-sdn/SPEC.md`](somfy-sdn/SPEC.md). |
+| `skopos/` | Rust | **Spec only — no code yet.** mmWave sensing nodes: Raspberry Pi 5 + DreamHAT+ (Infineon BGT60TR13C, 60 GHz raw IQ over SPI) running an owned Rust DSP pipeline (range/Doppler FFT → CFAR → per-role classifier). One node design, per-node role config: `corridor` (walk-past crossing events) / `wet_area` (shower occupancy despite running water). WS:8768 + HTTP:8080 debug/research UI + planned `skopos` HA component (zeroconf). Deliberately NOT an ESP32/module design — vendor radar modules only expose post-DSP summaries (ledger shq-suite-0036/0037). Design in [`skopos/SPEC.md`](skopos/SPEC.md). |
 
 ## Reference Docs
 
