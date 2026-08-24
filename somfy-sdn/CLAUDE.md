@@ -85,6 +85,7 @@ a dedicated FreeRTOS task owning UART1, and HTTP-pull OTA. New vs Actron: a **de
 | `src/mono.{h,cpp}` | **Pure C++ core + a thin Arduino wrapper.** Glitch-filtered monotonic clock — `mono::now()` replaces `millis()` for every deadline, stamp and age in the firmware. Host-tested. See "Clock glitches" below. |
 | `src/bus.{h,cpp}` | Arduino. The **only** code touching UART1. FreeRTOS task: LISTEN/ACTIVE TX gate, command queue + raw request/response, retry, polling cadence, passive sniffing → device table + sniffer ring + errlog, OTA teardown. |
 | `src/ws_api.{h,cpp}` | WebSockets controller API (port 8767). Push `state` snapshots, command/`ack`/`error`, heartbeat. Broadcasts only from the main loop (dirty-flag set by the bus task). **Protocol-level ping/pong with dead-client eviction is enabled in `begin()` (`enableHeartbeat(15000,5000,2)`)** — the app-level state push is a data broadcast, not a liveness probe, so without this a half-open client left by a WiFi blip (no TCP FIN) lingers until lwIP's retransmit timeout (minutes), stalling the WS service loop and blocking new handshakes. That was the root cause of multi-minute HA `unavailable` stretches on weak-signal motors (port-80 HTTP stays responsive throughout, masking it). Fixed in fw 1.1.5. **Wedge watchdog (fw 1.3.0):** the heartbeat only evicts *non-responsive* clients — it can't help when all `WEBSOCKETS_SERVER_CLIENT_MAX` (5) slots fill with *live* zombies (a client leaking duplicate connections, each kept alive by its own keepalive). At capacity the library refuses every new handshake (accept→drop, no HTTP response) and the device looks dead to HA while HTTP/the bus stay healthy. A controller only ever has one legitimate HA coordinator, so `loop()` reboots if `connectedClients()` stays at the cap continuously for `WEDGE_REBOOT_MS` (5 min); any drop below the cap resets the timer (reboots via `wifi_prov::noteReboot("ws-wedge")` as of 1.5.0, so the cause survives into the next boot's `/stats`). This is the backstop for an HA-side connection leak fixed at source by the coordinator's close-before-reconnect (`somfy_sdn` 1.4.1) — it first wedged `bed_1_blinds_left`'s controller on 2026-06-14. **Silent-socket telemetry (fw 1.5.0, ledger shq-suite-0022):** lifetime `onEvent` counters `ws_conn`/`ws_disc`/`ws_err` (ported from actron-sniffer) surfaced in `/stats` + `/stats.json` — a growing `ws_conn − ws_disc` gap means sockets are dying without the WS library seeing a DISCONNECTED (the silent-death signature of the Actron/somfy ~5-day-fuse failure). **Heartbeat-wedge fix (fw 1.5.1, ledger shq-suite-0034 — the actual root cause of the "silent socket"):** the periodic push was gated on `(int32_t)(t - g_last_heartbeat_ms) >= (int32_t)HEARTBEAT_INTERVAL_MS`, which reads as "not due yet" for as long as the stamp sits in the future — and an occasional far-future `millis()` read (see "Clock glitches") put it there. The socket, the WS-level pings and the connect-time snapshot all keep working, so HA goes available on connect, silent for 30 s, unavailable, reconnect — a 40 s flap cadence that ran 8 h on Bed 2 (701 cycles) and has hit gym, bed 4 and living-room-left before it. Now an **unsigned** elapsed test, so a future stamp wraps to a huge elapsed value and fires on the very next loop; `mono::now()` is the second layer. `hb_tx`/`hb_age` in `/stats` make it a one-curl diagnosis. |
+| `src/diag.{h,cpp}` | **Self-diagnostics** (fw 1.6.0, ledger shq-suite-0038 — twin of `actron-sniffer/src/diag.{h,cpp}`, keep them in step). Classifies every WS disconnect from evidence held at the instant it fires and stamps it with the machine's condition; 48-entry RAM ring served at `/diag`, `/diag.json`, pushed over WS live and replayed as a backlog on connect. See "Self-diagnostics" below. |
 | `src/http_api.{h,cpp}` | HTTP debug API (port 80). `/stats /stats.json /devices /log /errors` (GET) and `/mode /send /discover /move /forget /wifi /reconnect /update /clear` (POST). `/send` is the RE workhorse. `/update` carries the **OTA app-guard** (see Device identity below). |
 | `src/app_desc.cpp` | **Native `esp_app_desc` override (Option A).** A strong `extern "C"` `esp_app_desc` in section `.rodata_desc` shadows the prebuilt Arduino one (`project_name="arduino-lib-builder"`), so the image's native descriptor reports `project_name="somfy-sdn"` + the real `SOMFY_FW_VERSION`. Read by `esp_ota_get_partition_description()` in the OTA guard and by `esptool image_info`. See "Device identity". |
 | `src/version.h` | `SOMFY_FW_VERSION` semver — bump on every flash (see root CLAUDE.md → Versioning). |
@@ -256,7 +257,9 @@ other TinyC6 here share the `40:4c:ca:51` OUI **and** the `POST /update` endpoin
 |----------|---------|
 | `GET /` | human-friendly **HTML dashboard** (auto-refreshes every 3 s; polls `/stats.json` + `/devices` client-side) |
 | `GET /help` | the old text endpoint listing + status line (RE/curl workflow) |
-| `GET /stats` | status line, text (mode, devices, counters, fw, rssi, ip; **1.5.0 adds** `heap/minheap/maxblk/uptime`, `ws/ws_conn/ws_disc/ws_err`, `wifi_disc/wifi_reason`, `reset=`/`note=` — the silent-socket + link-churn telemetry; note `ws_clients=` was renamed `ws=` for actron parity; **1.5.1 adds** `hb_age`/`hb_tx` and `clk_torn`/`clk_back`/`clk_jump`/`clk_jumpms`) — consumed by the OTA flash scripts |
+| `GET /stats` | status line, text (mode, devices, counters, fw, rssi, ip; **1.5.0 adds** `heap/minheap/maxblk/uptime`, `ws/ws_conn/ws_disc/ws_err`, `wifi_disc/wifi_reason`, `reset=`/`note=` — the silent-socket + link-churn telemetry; note `ws_clients=` was renamed `ws=` for actron parity; **1.5.1 adds** `hb_age`/`hb_tx` and `clk_torn`/`clk_back`/`clk_jump`/`clk_jumpms`; **1.6.0 adds** `sock`/`loop_max`/`http_max`/`stalls`/`pongto`/`peerclose`/`txerr`/`diag_seq` — see Self-diagnostics, and note `clk_back` is noise on this firmware, shq-suite-0039) — consumed by the OTA flash scripts |
+| `GET /diag` | **self-diagnostics** (1.6.0) — health line + the WS-disconnect event ring, newest last. Reachable when the WS layer is precisely what has stopped working. Read it ONCE; polling it is what perturbs the fault |
+| `GET /diag.json` | same, machine-readable (`{"health":{…},"events":[…]}`) |
 | `GET /stats.json` | controller status as JSON (fw, build, mode, hostname, ip, mac, ssid, rssi, uptime, heap, counters; **1.5.0 adds** `heap_min`, `heap_maxblk`, `ws_conn`/`ws_disc`/`ws_err`, `wifi_disc`/`wifi_reason`, `reset_reason`, `boot_note`; **1.5.1 adds** `hb_age_ms`, `hb_tx`, `clk{torn,back,jumps,last_jump_ms}`) — drives the dashboard |
 | `GET /devices` | JSON device table |
 | `GET /log?since=&n=` | sniffed frames (incremental, like Actron) |
@@ -361,6 +364,85 @@ clear) left the cache — and the HA "Reversed" switch — showing the old value
 and looked rejected even when it worked. `execCommand` now re-reads direction after
 `SET_DIRECTION` (mirrors the post-limit-set re-read). This is independent of the `0x2F` block
 above: 1.3.1 fixes *reporting*; the motor still won't accept the change until limits are cleared.
+
+## Self-diagnostics (`src/diag.{h,cpp}`, fw 1.6.0, 2026-08-23)
+
+**Twin of `actron-sniffer/src/diag.{h,cpp}` — keep the two in step**, same standing rule as
+`mono.{h,cpp}`. Ported here because this fleet has the same fault and could not explain it:
+**Bed 4 was caught in a locked 40 s `unavailable` flap with `hb_age=9338`** — the
+heartbeat firing exactly on schedule while HA received nothing, `wifi_disc=0`, `reset=sw`, heap
+240 k. Same silent-socket-at-TCP pattern as the actron bridge (ledger shq-suite-0038).
+
+**⚠️ The 40 s cadence is NOT a device signature.** It is HA's own arithmetic —
+`AVAILABILITY_TIMEOUT_S` (30 s) plus the coordinator's 10 s availability-monitor tick. A locked
+40 s rhythm means "the device accepts the connection, sends its connect-time snapshot, then goes
+quiet". Earlier ledger entries (0030, 0034) read the exact-40 s median as a property of the
+firmware; it isn't, and that misreading sent at least one investigation the wrong way.
+
+**⇒ ROOT CAUSE FOUND AND FIXED (fw 1.6.1, 2026-08-24, ledger shq-suite-0038).** The diagnostics
+answered it on the actron twin in 20 h: arduinoWebSockets does **blocking socket I/O bounded by
+`WEBSOCKETS_TCP_TIMEOUT` (default 5000 ms)**, so one zombie client stalled the main loop for
+multiples of 5 s per pass (this fleet mostly escapes because the dirty-flag design keeps the bus
+task off the sockets and it pushes far less payload — but `somfy_sdn_06` still hit a 50 s stall),
+late pongs made `enableHeartbeat`'s reaper evict the healthy HA client, and reconnect churn
+compounded it. fw 1.6.1 = **`-D WEBSOCKETS_TCP_TIMEOUT=500`** in `platformio.ini` (bounds any
+stall well under the 5 s pong deadline) + a `diag::tick()` wrap guard (`hb_age` ≥ 0x80000000 is a
+wrapped future-stamp read, clamped to 0, never latched as a `heartbeat_stall`).
+`WEBSOCKETS_SERVER_CLIENT_MAX` deliberately stays 5 — a smaller cap interacts badly with the
+wedge watchdog (5 min at cap ⇒ reboot) and refuses debug clients during zombie windows. The
+actron twin additionally ported THIS firmware's dirty-flag broadcast (its bridge task used to
+write sockets directly); the two ws_api designs are architecturally aligned again.
+
+A 48-entry RAM ring (~3 kB). Each record carries the event, an inferred reason, and the machine's
+condition at capture: free heap, largest allocatable block, spare lwIP sockets, worst main-loop and
+HTTP-pump stall since the previous record, RSSI, client count.
+
+**Events:** `boot` (with `esp_reset_reason()`), `ws_connect`, `ws_disconnect`, `ws_error`,
+`ws_at_cap`, `loop_stall`, `heap_low`, `socket_low`, `wifi_down`/`wifi_up`, `clock_glitch`,
+`heartbeat_stall`.
+
+**Disconnect reasons**, inferred conservatively — `unclassified` beats a confident wrong answer,
+and the raw evidence rides along so a verdict can be re-judged from history without reflashing
+twelve controllers:
+
+| Reason | Inferred when |
+|--------|---------------|
+| `pong_timeout` | last pong ≥ 20 s old (ping 15 s + pong 5 s) ⇒ **our own reaper** evicted it |
+| `peer_close` | a pong landed within the last ping cycle, or inbound traffic within 10 s ⇒ not us |
+| `transport_error` | a `WStype_ERROR` arrived for that slot in the preceding 2 s |
+| `unclassified` | quiet socket, pong not yet overdue — nothing to pin it on |
+
+**Spare sockets are measured, not guessed:** `probeSockets()` asks lwIP for sockets until it
+refuses (up to 3) and closes them again, re-probed at the instant of every disconnect. `sock=0`
+means the pool HTTP, WS, OTA and mDNS all share is exhausted.
+
+**Loop phase timing:** `loop()` times `ArduinoOTA.handle()`, `http_api::loop()` and
+`ws_api::loop()` separately, so a `loop_stall` record says *which* phase held the loop. `tick()`
+runs every iteration but rate-limits its body to 1 Hz — `ESP.getFreeHeap()` takes a heap lock.
+
+**`clock_glitch` deliberately ignores `clk_back` (ledger shq-suite-0039).** `mono::Filter` is
+documented as not internally synchronised, and **this firmware calls `mono::now()` from tight
+deadline-poll loops in the bus task** (`bus.cpp:120-140`) concurrently with the Arduino loop —
+which produced **25.4 million "backward" reads on Bed 4 over four days (~72/s) with a perfectly
+healthy clock**. Alarming on it would fire a record every tick and flood the ring. Judge the
+shq-suite-0034 far-future-millis glitch on `clk_torn`/`clk_jump` only; `clk_back` is a race
+artifact on somfy and is reported but never alarmed on.
+
+**Delivery — three surfaces, and the backlog is the load-bearing one:**
+1. Live over WS as `{"type":"diag","event":{…}}`, **polled** from `ws_api::loop()` (max 4/iteration)
+   rather than pushed from a callback — every record originates inside the WS library's own event
+   dispatch, and emitting from there would re-enter the server mid-iteration.
+2. `{"type":"diag_backlog","events":[…]}` — the last 12, replayed to every client on connect.
+   **A socket can never be told about its own death**, so this is the only way HA learns why the
+   previous session ended. Records are deliberately re-sent; HA de-duplicates on `seq`.
+3. `{"type":"health","data":{…}}` every 30 s, plus `GET /diag` (text) and `GET /diag.json`.
+
+`/stats` gained `sock` `loop_max` `http_max` `stalls` `pongto` `peerclose` `txerr` `diag_seq`.
+
+**Do not diagnose these controllers by polling their HTTP server.** On the actron twin, `GET
+/stats` every 15 s quadrupled the flap rate and drew heap down 24 k — HTTP and WS share the socket
+pool and the main loop. Read `/diag` once, or take it off the WS push, which is what the
+`somfy_sdn` HA component's diagnostic sensors now do continuously without touching the device.
 
 ## Open items (need a Somfy Set Pro capture — SPEC §13)
 

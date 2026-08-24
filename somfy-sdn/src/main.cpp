@@ -18,6 +18,8 @@
 
 #include "bus.h"
 #include "devices.h"
+#include "diag.h"
+#include "mono.h"
 #include "http_api.h"
 #include "version.h"
 #include "wifi_prov.h"
@@ -273,6 +275,9 @@ void setup() {
     ws_api::begin(8767);
     ArduinoOTA.setHostname(wifi_prov::hostname());
     ArduinoOTA.begin();
+    // Diagnostics last, so its Boot record carries a settled picture of the machine (heap after
+    // the servers have allocated, socket headroom with them already bound).
+    diag::begin();
     Serial.printf("# ready: http://%s.local/  ws://%s.local:8767/\n", wifi_prov::hostname(),
                   wifi_prov::hostname());
   } else {
@@ -281,12 +286,27 @@ void setup() {
 }
 
 void loop() {
+  // Phase timing (ledger shq-suite-0038). A WS client evicted for a late pong is indistinguishable
+  // from a dead one unless you know whether THIS loop was stalled at the time — and knowing which
+  // phase stalled separates "a slow HTTP peer blocked the pump" from a fault in the WS layer
+  // itself. Costs four clock reads per iteration.
+  const uint32_t t_start = mono::now();
+  uint32_t ota_ms = 0, http_ms = 0, ws_ms = 0;
+
   pumpConsole();      // USB serial debug console (works with or without WiFi)
   wifi_prov::loop();  // button (both modes) + captive portal (PORTAL mode)
   if (wifi_prov::isConnected()) {
+    const uint32_t t_ota = mono::now();
     ArduinoOTA.handle();
+    const uint32_t t_http = mono::now();
     http_api::loop();
+    const uint32_t t_ws = mono::now();
     ws_api::loop();
+    const uint32_t t_end = mono::now();
+    ota_ms = t_http - t_ota;
+    http_ms = t_ws - t_http;
+    ws_ms = t_end - t_ws;
   }
+  diag::noteLoop((uint32_t)(mono::now() - t_start), ota_ms, http_ms, ws_ms);
   // The SDN bus runs on its own FreeRTOS task (bus::begin) — see bus.cpp.
 }

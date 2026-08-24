@@ -13,6 +13,7 @@
 
 #include "bus.h"
 #include "devices.h"
+#include "diag.h"
 #include "mono.h"
 #include "sdn.h"
 #include "version.h"
@@ -84,7 +85,7 @@ String statusLine() {
     devices::Device* d = t.at(i);
     if (d && d->online) online++;
   }
-  char buf[700];
+  char buf[1024];
   snprintf(buf, sizeof(buf),
            "# app=%s mode=%s devices=%u online=%u "
            "tx=%u rx=%u polls=%u "
@@ -100,6 +101,15 @@ String statusLine() {
            // count the bad millis() reads that used to cause exactly that.
            "hb_age=%u hb_tx=%u clk_torn=%u clk_back=%u clk_jump=%u clk_jumpms=%u "
            "wifi_disc=%u wifi_reason=%u reset=%s note=%s "
+           // Self-diagnostics summary (ledger shq-suite-0038). `sock` is spare lwIP sockets — 0
+           // means the pool HTTP and WS share is exhausted. `loop_max`/`http_max` are the worst
+           // main-loop and HTTP-pump stalls since boot; anything near the 5 s pong deadline
+           // explains an eviction. `pongto`/`peerclose`/`txerr` split the disconnects by who
+           // caused them. Full records at /diag. NOTE clk_back above is noise on this firmware —
+           // the bus task races the unsynchronised clock filter (shq-suite-0039); judge the
+           // millis glitch on clk_torn/clk_jump only.
+           "sock=%u loop_max=%u http_max=%u stalls=%u "
+           "pongto=%u peerclose=%u txerr=%u diag_seq=%u "
            "rssi=%d ip=%s fw=\"%s\"",
            APP_ID, modeStr(), (unsigned)t.count(), (unsigned)online,
            st.tx_frames, st.rx_frames, st.polls,
@@ -114,9 +124,51 @@ String statusLine() {
            (unsigned)mono::forwardJumps(), (unsigned)mono::lastJumpMs(),
            (unsigned)wifi_prov::staDisconnectCount(), (unsigned)wifi_prov::lastDisconnectReason(),
            resetReasonStr(), wifi_prov::bootNote(),
+           (unsigned)diag::spareSockets(), (unsigned)diag::loopMaxMs(), (unsigned)diag::httpMaxMs(),
+           (unsigned)diag::loopStalls(), (unsigned)diag::pongTimeouts(), (unsigned)diag::peerCloses(),
+           (unsigned)diag::transportErrors(), (unsigned)diag::lastSeq(),
            WiFi.isConnected() ? WiFi.RSSI() : 0,
            WiFi.localIP().toString().c_str(), SOMFY_FW_VERSION " (" __DATE__ " " __TIME__ ")");
   return String(buf);
+}
+
+// Why the WS service dropped, and what the box looked like when it did (ledger shq-suite-0038).
+// The same records HA receives over the socket, readable without a WS client — and reachable when
+// the WS layer is precisely the thing that has stopped working.
+static void handleDiag() {
+  // ~6 kB transient rather than a permanent static: this endpoint is read by a human occasionally,
+  // and the fault under investigation is memory pressure.
+  constexpr size_t CAP = 6144;
+  char* buf = (char*)malloc(CAP);
+  if (buf == nullptr) {
+    g_server->send(503, "text/plain", "# diag: out of memory\n");
+    return;
+  }
+  diag::renderText(buf, CAP);
+  g_server->send(200, "text/plain", buf);
+  free(buf);
+}
+
+static void handleDiagJson() {
+  JsonDocument doc;
+  JsonObject health = doc["health"].to<JsonObject>();
+  diag::healthToJson(health);
+  health["ws_conn"] = ws_api::connectEvents();
+  health["ws_disc"] = ws_api::disconnectEvents();
+  health["ws_err"] = ws_api::errorEvents();
+  health["hb_age_ms"] = ws_api::heartbeatAgeMs();
+  health["hb_tx"] = ws_api::heartbeatBroadcasts();
+  health["fw"] = SOMFY_FW_VERSION " " __DATE__ " " __TIME__;
+
+  JsonArray arr = doc["events"].to<JsonArray>();
+  for (uint32_t seq = diag::firstSeq(); seq != 0 && seq <= diag::lastSeq(); seq++) {
+    const diag::Record* r = diag::bySeq(seq);
+    if (r != nullptr) diag::toJson(*r, arr.add<JsonObject>());
+  }
+
+  String out;
+  serializeJson(doc, out);
+  g_server->send(200, "application/json", out);
 }
 
 // Human-friendly dashboard served at `/`. Static page; it polls /stats.json + /devices (JSON)
@@ -584,6 +636,8 @@ void begin(uint16_t port) {
   g_server->on("/stats", HTTP_GET, handleStats);
   g_server->on("/stats.json", HTTP_GET, handleStatsJson);
   g_server->on("/devices", HTTP_GET, handleDevices);
+  g_server->on("/diag", HTTP_GET, handleDiag);
+  g_server->on("/diag.json", HTTP_GET, handleDiagJson);
   g_server->on("/log", HTTP_GET, handleLog);
   g_server->on("/errors", HTTP_GET, handleErrors);
   g_server->on("/mode", HTTP_POST, handleMode);

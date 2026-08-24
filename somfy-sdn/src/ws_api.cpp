@@ -9,6 +9,7 @@
 
 #include "bus.h"
 #include "devices.h"
+#include "diag.h"
 #include "mono.h"
 #include "sdn.h"
 #include "version.h"
@@ -43,6 +44,16 @@ uint32_t g_err_events = 0;
 // this is the one-curl answer to "is the heartbeat still running?" — the question that cost a
 // morning of packet captures the first time (ledger shq-suite-0034).
 uint32_t g_hb_broadcasts = 0;
+
+// Diagnostics fan-out cursor (ledger shq-suite-0038). diag records are POLLED from loop() rather
+// than pushed from a callback: every record originates inside the WS library's own event dispatch,
+// and emitting a frame from there would re-enter the server mid-iteration.
+uint32_t g_last_diag_seq_sent = 0;
+uint32_t g_last_health_ms = 0;
+
+// Records replayed to a client the moment it connects. A socket can never be told about its own
+// death, so this is the ONLY way HA learns why the previous session ended.
+constexpr uint32_t DIAG_BACKLOG_MAX = 12;
 
 const char* movementName(sdn::MovementState m) {
   switch (m) {
@@ -101,6 +112,7 @@ void buildState(JsonDocument& doc) {
 void broadcastState() {
   if (g_server == nullptr) return;
   g_hb_broadcasts++;
+  diag::noteWsTx();
   JsonDocument doc;
   buildState(doc);
   String out;
@@ -276,19 +288,88 @@ void handleCommand(uint8_t client, JsonDocument& doc) {
   }
 }
 
+// ---- diagnostics fan-out ------------------------------------------------
+
+void sendDiagRecord(const diag::Record& r) {
+  if (g_server == nullptr) return;
+  JsonDocument doc;
+  doc["type"] = "diag";
+  JsonObject obj = doc["event"].to<JsonObject>();
+  diag::toJson(r, obj);
+  String out;
+  serializeJson(doc, out);
+  g_server->broadcastTXT(out);
+}
+
+// Deliberately does NOT advance g_last_diag_seq_sent: a second client would otherwise be starved
+// of everything this backlog covered. HA keys on `seq`, so a repeat is discarded there.
+void sendDiagBacklog(uint8_t client) {
+  if (g_server == nullptr) return;
+  const uint32_t last = diag::lastSeq();
+  if (last == 0) return;
+  uint32_t first = diag::firstSeq();
+  if (last - first + 1 > DIAG_BACKLOG_MAX) first = last - DIAG_BACKLOG_MAX + 1;
+
+  JsonDocument doc;
+  doc["type"] = "diag_backlog";
+  JsonArray arr = doc["events"].to<JsonArray>();
+  for (uint32_t seq = first; seq <= last; seq++) {
+    const diag::Record* r = diag::bySeq(seq);
+    if (r != nullptr) diag::toJson(*r, arr.add<JsonObject>());
+  }
+  String out;
+  serializeJson(doc, out);
+  g_server->sendTXT(client, out);
+}
+
+void sendHealth() {
+  if (g_server == nullptr) return;
+  JsonDocument doc;
+  doc["type"] = "health";
+  JsonObject obj = doc["data"].to<JsonObject>();
+  diag::healthToJson(obj);
+  // WS-layer counters live here, not in diag, so diag stays independent of the server it watches.
+  obj["clients"] = g_server->connectedClients();
+  obj["ws_conn"] = g_conn_events;
+  obj["ws_disc"] = g_disc_events;
+  obj["ws_err"] = g_err_events;
+  obj["hb_age_ms"] = (uint32_t)(mono::now() - g_last_heartbeat_ms);
+  obj["hb_tx"] = g_hb_broadcasts;
+  obj["fw"] = SOMFY_FW_VERSION " " __DATE__ " " __TIME__;
+  String out;
+  serializeJson(doc, out);
+  g_server->broadcastTXT(out);
+}
+
 void onEvent(uint8_t client, WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
-    case WStype_CONNECTED:
+    case WStype_CONNECTED: {
       g_conn_events++;
+      const IPAddress ip = g_server->remoteIP(client);
+      diag::noteWsConnect(client, ip.toString().c_str(), g_server->connectedClients());
       sendStateTo(client);
+      // After the snapshot, so a client always has state before it has history.
+      sendDiagBacklog(client);
       break;
+    }
     case WStype_DISCONNECTED:
       g_disc_events++;
+      diag::noteWsDisconnect(client, g_server->connectedClients());
       break;
     case WStype_ERROR:
       g_err_events++;
+      diag::noteWsError(client, g_server->connectedClients());
+      break;
+    case WStype_PONG:
+      // Proof the peer answered our reaper's ping. Its absence is what gets a client evicted, so
+      // the age of the last one is the primary evidence in a disconnect classification.
+      diag::noteWsPong(client);
+      break;
+    case WStype_PING:
+      diag::noteWsRx(client);
       break;
     case WStype_TEXT: {
+      diag::noteWsRx(client);
       JsonDocument doc;
       DeserializationError e = deserializeJson(doc, payload, length);
       if (e) { sendError(client, nullptr, "invalid JSON"); return; }
@@ -312,8 +393,13 @@ void begin(uint16_t port) {
   // with no FIN; without this the zombie lingers until lwIP's retransmit timeout (minutes), during
   // which writes to it stall the WS service loop and new connections can't be served. Ping every
   // 15 s, expect a pong within 5 s, disconnect after 2 consecutive misses (~30 s to reap).
-  g_server->enableHeartbeat(15000, 5000, 2);
+  // Parameters live in diag.h so the disconnect classifier reasons about exactly the deadlines
+  // that trigger an eviction here (ledger shq-suite-0038).
+  g_server->enableHeartbeat(diag::WS_PING_INTERVAL_MS, diag::WS_PONG_TIMEOUT_MS,
+                            diag::WS_PONG_MISSES);
   g_last_heartbeat_ms = mono::now();
+  g_last_health_ms = g_last_heartbeat_ms;
+  g_last_diag_seq_sent = diag::lastSeq();
 }
 
 void loop() {
@@ -340,6 +426,28 @@ void loop() {
     broadcastState();
     g_last_heartbeat_ms = t;
   }
+
+  // Drain new diagnostics to any listener. Bounded per iteration so a reconnect burst can't turn
+  // one loop pass into the very stall it reports.
+  if (g_server->connectedClients() > 0) {
+    const uint32_t newest = diag::lastSeq();
+    if (g_last_diag_seq_sent < diag::firstSeq()) g_last_diag_seq_sent = diag::firstSeq() - 1;
+    uint8_t budget = 4;
+    while (g_last_diag_seq_sent < newest && budget-- > 0) {
+      const diag::Record* r = diag::bySeq(++g_last_diag_seq_sent);
+      if (r != nullptr) sendDiagRecord(*r);
+    }
+    if ((uint32_t)(t - g_last_health_ms) >= diag::HEALTH_INTERVAL_MS) {
+      g_last_health_ms = t;
+      sendHealth();
+    }
+  } else {
+    // Nobody listening: keep the cursor at the head so a fresh client gets the backlog once,
+    // rather than the backlog and then a replay of the same records.
+    g_last_diag_seq_sent = diag::lastSeq();
+  }
+
+  diag::tick((uint32_t)(t - g_last_heartbeat_ms));
 
   // Wedge watchdog (see the note by g_at_capacity_since_ms): if every WS slot has been occupied
   // continuously for WEDGE_REBOOT_MS, the server can no longer accept the HA coordinator — reboot
