@@ -9,15 +9,35 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
+from homeassistant.helpers.dispatcher import async_dispatcher_send
+
 from .client import ActronMitmClient
 from .const import (
     AVAILABILITY_TIMEOUT_S,
     CONF_HOST,
     CONF_PORT,
     DEFAULT_PORT,
+    DIAG_SEEN_MAX,
     DOMAIN,
+    EVENT_DIAG,
     RECONNECT_DELAY_S,
+    SOURCE_DEVICE,
+    SOURCE_HA,
 )
+
+# Firmware events that indicate something went wrong, logged at WARNING so they surface in
+# /api/error_log without turning on debug. Everything else is INFO.
+_NOTABLE_EVENTS = {
+    "ws_disconnect",
+    "ws_error",
+    "ws_at_cap",
+    "loop_stall",
+    "heap_low",
+    "socket_low",
+    "wifi_down",
+    "clock_glitch",
+    "heartbeat_stall",
+}
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -36,7 +56,21 @@ class ActronMitmCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.port: int = entry.data.get(CONF_PORT, DEFAULT_PORT)
         self.client = ActronMitmClient(self.host, self.port)
         self.client.set_state_callback(self._on_state)
+        self.client.set_diag_callback(self._on_diag)
+        self.client.set_health_callback(self._on_health)
+        self.client.set_message_callback(self._on_any_message)
         self.client.set_disconnect_callback(self._on_disconnect)
+
+        self.entry_id: str = entry.entry_id
+        # Latest firmware vitals, read by the diagnostic sensors. None until the first push.
+        self.health: dict[str, Any] | None = None
+        # Sequence numbers already turned into bus events. The firmware replays a backlog on every
+        # connect, so without this every reconnect would re-fire the same history.
+        self._seen_diag_seqs: set[int] = set()
+        self._seen_diag_order: list[int] = []
+        # Most recent firmware ws_disconnect record, surfaced as a sensor with its evidence
+        # attached so the recorder keeps a timeline of CAUSES, not just a disconnect count.
+        self.last_disconnect: dict[str, Any] | None = None
 
         self._run_task: Optional[asyncio.Task] = None
         self._reconnect_task: Optional[asyncio.Task] = None
@@ -87,9 +121,16 @@ class ActronMitmCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 await self.client.connect()
             except Exception as err:  # noqa: BLE001
                 _LOGGER.warning("Connect to %s:%s failed: %s", self.host, self.port, err)
+                # A refused/timed-out connect is itself a finding: it is what socket-pool
+                # exhaustion on the device looks like from here, as distinct from an established
+                # socket going quiet.
+                self._fire_diag(SOURCE_HA, "ha_connect_failed", {
+                    "error": f"{type(err).__name__}: {err}",
+                })
                 self._schedule_reconnect()
                 return
             _LOGGER.info("Connected to actron-mitm at %s:%s", self.host, self.port)
+            self._fire_diag(SOURCE_HA, "ha_connected", {})
             self._run_task = asyncio.create_task(self.client.run())
         finally:
             self._connecting = False
@@ -124,15 +165,84 @@ class ActronMitmCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     # ---- callbacks from client ------------------------------------------
 
+    @callback
+    def _on_any_message(self):
+        """Liveness stamp for EVERY inbound frame, not just state.
+
+        Before this the timer was only reset by a state push, so a device that was talking to us
+        perfectly well — heartbeats, diagnostics, health — could still be declared unavailable if
+        the state push specifically stalled. Now the availability timeout means what it says.
+        """
+        self._last_msg_time = time.time()
+
     async def _on_state(self, data: dict[str, Any]):
         self._last_msg_time = time.time()
         # Push to all subscribed entities. HA's update coordinator handles dispatch.
         self.async_set_updated_data(data)
 
-    async def _on_disconnect(self):
-        _LOGGER.info("Disconnected from actron-mitm — will reconnect")
+    async def _on_diag(self, event: dict[str, Any]):
+        """One firmware diagnostic record -> one HA bus event.
+
+        Deduplicated on the firmware's `seq`, which never repeats: the same records arrive twice
+        by design (live broadcast, then replayed in the backlog to the next client to connect).
+        """
+        seq = event.get("seq")
+        if isinstance(seq, int):
+            if seq in self._seen_diag_seqs:
+                return
+            self._seen_diag_seqs.add(seq)
+            self._seen_diag_order.append(seq)
+            if len(self._seen_diag_order) > DIAG_SEEN_MAX:
+                self._seen_diag_seqs.discard(self._seen_diag_order.pop(0))
+
+        kind = event.get("event", "unknown")
+        if kind == "ws_disconnect":
+            self.last_disconnect = {
+                # "unclassified" not "unknown": HA renders the literal string `unknown` as the
+                # no-data state, which would make a firmware verdict of "no evidence" look
+                # identical to never having heard from the device at all.
+                "reason": event.get("reason") or "unclassified",
+                **{k: v for k, v in event.items() if k not in ("event", "reason")},
+            }
+            async_dispatcher_send(self.hass, f"{DOMAIN}_disconnect_{self.entry_id}")
+        _LOGGER.log(
+            logging.WARNING if kind in _NOTABLE_EVENTS else logging.INFO,
+            "actron-mitm diag: %s%s %s",
+            kind,
+            f" ({event['reason']})" if event.get("reason") else "",
+            {k: v for k, v in event.items() if k not in ("event", "reason")},
+        )
+        self._fire_diag(SOURCE_DEVICE, kind, event)
+
+    async def _on_health(self, data: dict[str, Any]):
+        self.health = data
+        # Sensors listen on their own signal rather than the coordinator's update, so a 30 s health
+        # push doesn't drag every climate entity through a state write.
+        async_dispatcher_send(self.hass, f"{DOMAIN}_health_{self.entry_id}")
+
+    async def _on_disconnect(self, kind: str, close_code: Any, lifetime_s: float):
+        _LOGGER.info(
+            "Disconnected from actron-mitm after %.1fs (%s, code=%s) — will reconnect",
+            lifetime_s, kind, close_code,
+        )
+        # Our end of the story. The firmware records why IT dropped the socket; this records why
+        # WE saw it drop, and the two together settle who hung up on whom (ledger shq-suite-0038).
+        self._fire_diag(SOURCE_HA, f"ha_{kind}", {
+            "close_code": close_code,
+            "lifetime_s": round(lifetime_s, 1),
+        })
         if not self._shutdown:
             self._schedule_reconnect()
+
+    @callback
+    def _fire_diag(self, source: str, kind: str, payload: dict[str, Any]):
+        self.hass.bus.async_fire(EVENT_DIAG, {
+            "entry_id": self.entry_id,
+            "host": self.host,
+            "source": source,
+            "event": kind,
+            **{k: v for k, v in payload.items() if k != "event"},
+        })
 
     # ---- availability --------------------------------------------------
 

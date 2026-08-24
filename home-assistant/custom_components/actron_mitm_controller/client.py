@@ -19,6 +19,8 @@ from .const import COMMAND_RESPONSE_TIMEOUT_S, CONNECT_TIMEOUT_S
 _LOGGER = logging.getLogger(__name__)
 
 StateCallback = Callable[[dict[str, Any]], Awaitable[None]]
+DiagCallback = Callable[[dict[str, Any]], Awaitable[None]]
+HealthCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
 
 class ActronMitmClient:
@@ -31,7 +33,11 @@ class ActronMitmClient:
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._pending: dict[str, asyncio.Future] = {}
         self._on_state: Optional[StateCallback] = None
-        self._on_disconnect: Optional[Callable[[], Awaitable[None]]] = None
+        self._on_diag: Optional[DiagCallback] = None
+        self._on_health: Optional[HealthCallback] = None
+        self._on_message: Optional[Callable[[], None]] = None
+        self._on_disconnect: Optional[Callable[[str, Any, float], Awaitable[None]]] = None
+        self._opened_at: float = 0.0
 
     async def connect(self):
         # Keepalive is load-bearing: when the ESP32 reboots (e.g. during OTA) it doesn't
@@ -58,7 +64,24 @@ class ActronMitmClient:
     def set_state_callback(self, cb: StateCallback):
         self._on_state = cb
 
-    def set_disconnect_callback(self, cb: Callable[[], Awaitable[None]]):
+    def set_diag_callback(self, cb: DiagCallback):
+        self._on_diag = cb
+
+    def set_health_callback(self, cb: HealthCallback):
+        self._on_health = cb
+
+    def set_message_callback(self, cb: Callable[[], None]):
+        """Called for EVERY inbound frame, whatever its type.
+
+        Availability keys off "have we heard anything at all", not "have we had state". A `health`
+        or `diag` frame proves the socket is alive just as well as a state push does, and treating
+        it as such stops a device that is talking to us being marked unavailable (ledger
+        shq-suite-0038).
+        """
+        self._on_message = cb
+
+    def set_disconnect_callback(self, cb: Callable[[str, Any, float], Awaitable[None]]):
+        """cb(kind, close_code, lifetime_s) — `kind` is one of clean/closed/error."""
         self._on_disconnect = cb
 
     async def run(self):
@@ -66,6 +89,9 @@ class ActronMitmClient:
         if self._ws is None:
             return
         started = asyncio.get_running_loop().time()
+        self._opened_at = started
+        kind = "clean"
+        close_code: Any = None
         try:
             async for raw in self._ws:
                 try:
@@ -75,10 +101,11 @@ class ActronMitmClient:
                     continue
                 await self._handle_message(msg)
             # Iterator ended without raising = peer closed cleanly (code 1000/1001).
+            close_code = getattr(self._ws, "close_code", None)
             _LOGGER.info(
                 "WebSocket closed cleanly after %.1fs (code=%s reason=%r)",
                 asyncio.get_running_loop().time() - started,
-                getattr(self._ws, "close_code", None),
+                close_code,
                 getattr(self._ws, "close_reason", None),
             )
         except websockets.ConnectionClosed as exc:
@@ -90,21 +117,45 @@ class ActronMitmClient:
             # coordinator's availability path, not here. This branch fires only when a command
             # hits an already-silent socket ("no close frame received or sent", 1006) or on a
             # genuine close. Bump to WARNING again if you need it visible in /api/error_log.
+            kind = "closed"
+            close_code = getattr(exc, "code", None) or getattr(self._ws, "close_code", None)
             _LOGGER.info(
                 "WebSocket closed after %.1fs: %s: %s",
                 asyncio.get_running_loop().time() - started,
                 type(exc).__name__,
                 exc,
             )
+        except Exception as exc:  # noqa: BLE001
+            # Anything else that kills the reader is a transport failure, and it used to vanish
+            # into the generic reconnect path with no record of what it was (shq-suite-0038).
+            kind = "error"
+            close_code = type(exc).__name__
+            _LOGGER.warning("WebSocket reader failed after %.1fs: %s",
+                            asyncio.get_running_loop().time() - started, exc)
         finally:
             if self._on_disconnect is not None:
-                await self._on_disconnect()
+                lifetime = asyncio.get_running_loop().time() - started
+                await self._on_disconnect(kind, close_code, lifetime)
 
     async def _handle_message(self, msg: dict[str, Any]):
         kind = msg.get("type")
+        if self._on_message is not None:
+            self._on_message()
         if kind == "state":
             if self._on_state is not None:
                 await self._on_state(msg.get("data") or {})
+        elif kind == "diag":
+            if self._on_diag is not None:
+                await self._on_diag(msg.get("event") or {})
+        elif kind == "diag_backlog":
+            # Replayed history from before this socket existed. Ordered oldest-first by the
+            # firmware; the coordinator de-duplicates on `seq`.
+            if self._on_diag is not None:
+                for event in msg.get("events") or []:
+                    await self._on_diag(event)
+        elif kind == "health":
+            if self._on_health is not None:
+                await self._on_health(msg.get("data") or {})
         elif kind in ("ack", "error"):
             cmd_id = msg.get("id")
             fut = self._pending.pop(cmd_id, None) if cmd_id else None

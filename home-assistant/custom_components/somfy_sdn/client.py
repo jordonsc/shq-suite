@@ -34,7 +34,10 @@ class SomfySdnClient:
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._pending: dict[str, asyncio.Future] = {}
         self._on_state: Optional[StateCallback] = None
-        self._on_disconnect: Optional[Callable[[], Awaitable[None]]] = None
+        self._on_diag: Optional[Callable[[dict[str, Any]], Awaitable[None]]] = None
+        self._on_health: Optional[Callable[[dict[str, Any]], Awaitable[None]]] = None
+        self._on_message: Optional[Callable[[], None]] = None
+        self._on_disconnect: Optional[Callable[[str, Any, float], Awaitable[None]]] = None
 
     async def connect(self):
         # WS-level keepalive is load-bearing: when the ESP32 reboots (e.g. during OTA) it
@@ -57,13 +60,32 @@ class SomfySdnClient:
     def set_state_callback(self, cb: StateCallback):
         self._on_state = cb
 
-    def set_disconnect_callback(self, cb: Callable[[], Awaitable[None]]):
+    def set_diag_callback(self, cb):
+        self._on_diag = cb
+
+    def set_health_callback(self, cb):
+        self._on_health = cb
+
+    def set_message_callback(self, cb):
+        """Called for EVERY inbound frame, whatever its type.
+
+        Availability keys off "have we heard anything at all", not "have we had state". A `health`
+        or `diag` frame proves the socket is alive just as well as a state push does (ledger
+        shq-suite-0038).
+        """
+        self._on_message = cb
+
+    def set_disconnect_callback(self, cb):
+        """cb(kind, close_code, lifetime_s) — `kind` is one of clean/closed/error."""
         self._on_disconnect = cb
 
     async def run(self):
         """Drain incoming messages until the socket closes."""
         if self._ws is None:
             return
+        started = asyncio.get_running_loop().time()
+        kind = "clean"
+        close_code: Any = None
         try:
             async for raw in self._ws:
                 try:
@@ -72,17 +94,43 @@ class SomfySdnClient:
                     _LOGGER.warning("Invalid JSON from server: %r", raw)
                     continue
                 await self._handle_message(msg)
-        except websockets.ConnectionClosed:
-            _LOGGER.info("WebSocket closed by peer")
+            close_code = getattr(self._ws, "close_code", None)
+        except websockets.ConnectionClosed as exc:
+            # The close code and how long the socket lived are the HA half of the story; the
+            # firmware records its own verdict and the two together settle who hung up on whom.
+            kind = "closed"
+            close_code = getattr(exc, "code", None) or getattr(self._ws, "close_code", None)
+            _LOGGER.info("WebSocket closed after %.1fs: %s",
+                         asyncio.get_running_loop().time() - started, exc)
+        except Exception as exc:  # noqa: BLE001
+            kind = "error"
+            close_code = type(exc).__name__
+            _LOGGER.warning("WebSocket reader failed after %.1fs: %s",
+                            asyncio.get_running_loop().time() - started, exc)
         finally:
             if self._on_disconnect is not None:
-                await self._on_disconnect()
+                await self._on_disconnect(
+                    kind, close_code, asyncio.get_running_loop().time() - started
+                )
 
     async def _handle_message(self, msg: dict[str, Any]):
         kind = msg.get("type")
+        if self._on_message is not None:
+            self._on_message()
         if kind == "state":
             if self._on_state is not None:
                 await self._on_state(msg.get("data") or {})
+        elif kind == "diag":
+            if self._on_diag is not None:
+                await self._on_diag(msg.get("event") or {})
+        elif kind == "diag_backlog":
+            # Replayed history from before this socket existed; the coordinator dedupes on `seq`.
+            if self._on_diag is not None:
+                for event in msg.get("events") or []:
+                    await self._on_diag(event)
+        elif kind == "health":
+            if self._on_health is not None:
+                await self._on_health(msg.get("data") or {})
         elif kind in ("ack", "error"):
             cmd_id = msg.get("id")
             fut = self._pending.pop(cmd_id, None) if cmd_id else None
