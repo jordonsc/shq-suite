@@ -50,6 +50,7 @@ uint32_t loop_iters_ = 0;
 uint32_t loop_busy_ms_ = 0;  // summed iteration time, for a coarse duty figure
 
 uint32_t pong_timeouts_ = 0;
+uint32_t stall_reaps_ = 0;
 uint32_t peer_closes_ = 0;
 uint32_t transport_errors_ = 0;
 uint32_t wifi_disc_ = 0;
@@ -295,6 +296,25 @@ void noteWsError(uint8_t client_id, uint8_t clients) {
   r.clients = clients;
 }
 
+void noteWsStallReap(uint8_t client_id, uint32_t unwritable_ms, uint8_t clients) {
+  stall_reaps_++;
+  Record& r = push(Event::WsStallReap);
+  r.client_id = client_id;
+  r.clients = clients;
+  r.value = unwritable_ms;
+  // Carry the socket's history so a reap can be told apart from a merely idle client after
+  // the fact: a slot with live traffic that suddenly stopped accepting writes is a peer that
+  // went away, whereas one that never had any was probably never healthy.
+  if (client_id < MAX_SLOTS) {
+    const Slot& s = slots_[client_id];
+    r.lifetime_ms = s.active ? (uint32_t)(mono::now() - s.connected_ms) : 0;
+    r.pong_age_ms = s.last_pong_ms ? (uint32_t)(mono::now() - s.last_pong_ms) : 0;
+    r.rx_msgs = s.rx_msgs;
+    r.tx_msgs = s.tx_msgs;
+    memcpy(r.ip, s.ip, sizeof(r.ip));
+  }
+}
+
 void noteWsPong(uint8_t client_id) {
   if (client_id >= MAX_SLOTS) return;
   slots_[client_id].last_pong_ms = mono::now();
@@ -354,6 +374,7 @@ const char* eventName(Event e) {
     case Event::WifiUp: return "wifi_up";
     case Event::ClockGlitch: return "clock_glitch";
     case Event::HeartbeatStall: return "heartbeat_stall";
+    case Event::WsStallReap: return "ws_stall_reap";
   }
   return "unknown";
 }
@@ -410,6 +431,7 @@ void healthToJson(JsonObject obj) {
   obj["rssi"] = WiFi.isConnected() ? WiFi.RSSI() : 0;
   obj["wifi_disc"] = wifi_disc_;
   obj["pong_timeouts"] = pong_timeouts_;
+  obj["stall_reaps"] = stall_reaps_;
   obj["peer_closes"] = peer_closes_;
   obj["transport_errors"] = transport_errors_;
   obj["loop_max_ms"] = loop_max_;
@@ -441,14 +463,14 @@ size_t renderText(char* out, size_t cap) {
   appendClamped(out, cap, n, snprintf(out + n, cap - n,
                 "# diag uptime=%lus heap=%u minheap=%u maxblk=%u spare_sock=%u rssi=%d "
                 "wifi_disc=%u pong_timeouts=%u peer_closes=%u transport_errors=%u "
-                "loop_max=%ums http_max=%ums ota_max=%ums ws_max=%ums stalls=%u seq=%u\n",
+                "loop_max=%ums http_max=%ums ota_max=%ums ws_max=%ums stalls=%u reaps=%u seq=%u\n",
                 (unsigned long)(mono::now() / 1000), (unsigned)ESP.getFreeHeap(),
                 (unsigned)ESP.getMinFreeHeap(), (unsigned)ESP.getMaxAllocHeap(),
                 (unsigned)spare_sockets_, WiFi.isConnected() ? WiFi.RSSI() : 0,
                 (unsigned)wifi_disc_, (unsigned)pong_timeouts_, (unsigned)peer_closes_,
                 (unsigned)transport_errors_, (unsigned)loop_max_, (unsigned)http_max_,
                 (unsigned)ota_max_, (unsigned)ws_max_, (unsigned)loop_stalls_,
-                (unsigned)(next_seq_ - 1)));
+                (unsigned)stall_reaps_, (unsigned)(next_seq_ - 1)));
 
   for (uint32_t seq = firstSeq(); seq <= lastSeq() && seq != 0; seq++) {
     const Record* r = bySeq(seq);
@@ -469,6 +491,7 @@ size_t renderText(char* out, size_t cap) {
 }
 
 uint32_t pongTimeouts() { return pong_timeouts_; }
+uint32_t stallReaps() { return stall_reaps_; }
 uint32_t peerCloses() { return peer_closes_; }
 uint32_t transportErrors() { return transport_errors_; }
 uint32_t loopStalls() { return loop_stalls_; }

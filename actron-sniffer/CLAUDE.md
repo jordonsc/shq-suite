@@ -164,6 +164,34 @@ both twins (actron build "Aug 24 2026 00:39:51", somfy fw 1.6.1):
   clamped to 0 so it can never latch a bogus `heartbeat_stall` record (the ~4.29e9 values in the
   0038 data). The race that produced them died with the port (single writer), guard kept anyway.
 
+**⇒ SECOND MECHANISM, FOUND AND FIXED 2026-08-27 (build "Aug 27 2026").** The 72 h read on the
+fix above was a large partial win, not a cure: the quiet majority of the fleet dropped to a
+806-1629 ms worst loop stall (2-3 x the new 500 ms bound, exactly as designed) and the actron ran
+**63 hours completely clean** — then turned, with a residual **50,059 ms** stall. The same figure
+appeared on three somfy controllers within a 4 ms spread (50,056 / 50,057 / 50,058), which is one
+deterministic timeout, not an accumulation.
+
+It is in the **Arduino core**, not lwIP and not the WS library. `NetworkClient::write()` retries up
+to `WIFI_CLIENT_MAX_WRITE_RETRY` (10) times around a `select()` bounded by
+`WIFI_CLIENT_SELECT_TIMEOUT_US` (1 s) — so one write to a peer that stopped reading blocks **~10 s**.
+`WEBSOCKETS_TCP_TIMEOUT` only gets re-checked *between* write calls, and `SO_SNDTIMEO` is a red
+herring (the core's `send()` already uses `MSG_DONTWAIT`; the blocking is in the `select()`). Both
+constants are unguarded `#define`s, so no build flag reaches them, and patching the framework would
+be a machine-global change that a toolchain update silently reverts. `broadcastTXT()` walks every
+slot at a header + payload write each, so N dead slots multiply the 10 s quantum — which also
+re-reads the earlier numbers correctly: 60,069 / 50,05x / 20,024 / 10,015 ms are all clean multiples
+of **10 s**, not of the 5 s library timeout as first recorded.
+
+Fix: **`src/ws_guard.{h,cpp}`** (twin of somfy's), a `GuardedWebSocketsServer` subclass — the
+library's `_clients[]` is `protected`, so this needs no library patch. It polls each socket with a
+**zero-timeout `select()`** before writing, skips any that would block (`broadcastWritableTXT()`
+replaces `broadcastTXT()` at every site), and drops a socket that stays unwritable for
+`WS_STALL_REAP_MS` (10 s — under HA's 30 s availability timeout so the reconnect lands in time,
+well over any transient full send buffer). The reap closes the socket directly rather than sending a
+WS close frame, because that frame would be a write to the very socket that is refusing writes. New
+`ws_stall_reap` diag event + `stall_reaps` counter make the fix measurable: every reap is a ~10 s
+stall that did not happen.
+
 ## Self-diagnostics (`src/diag.{h,cpp}`, 2026-08-23)
 
 Twin of `somfy-sdn/src/diag.{h,cpp}` (ported there in somfy fw 1.6.0) — **keep the two in step**,

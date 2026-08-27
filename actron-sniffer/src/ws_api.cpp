@@ -8,6 +8,7 @@
 
 #include "diag.h"
 #include "mono.h"
+#include "ws_guard.h"
 
 namespace ws_api {
 
@@ -44,7 +45,7 @@ constexpr uint16_t CMD_ZONE_ENABLE = 0x0040;
 
 // ---- WS server + module state ------------------------------------------
 
-WebSocketsServer server(8767);
+GuardedWebSocketsServer server(8767);
 Hooks hooks_{};
 
 state::ControllerState last_published_state_;
@@ -291,7 +292,7 @@ void broadcastState(const state::ControllerState& s) {
   buildStatePayload(doc, s);
   String out;
   serializeJson(doc, out);
-  server.broadcastTXT(out);
+  server.broadcastWritableTXT(out);
 }
 
 // ---- diagnostics fan-out ------------------------------------------------
@@ -303,7 +304,7 @@ void sendDiagRecord(const diag::Record& r) {
   diag::toJson(r, obj);
   String out;
   serializeJson(doc, out);
-  server.broadcastTXT(out);
+  server.broadcastWritableTXT(out);
 }
 
 // Deliberately does NOT advance last_diag_seq_sent_: a second client would otherwise be starved of
@@ -341,7 +342,7 @@ void sendHealth() {
   obj["fw"] = __DATE__ " " __TIME__;
   String out;
   serializeJson(doc, out);
-  server.broadcastTXT(out);
+  server.broadcastWritableTXT(out);
 }
 
 void sendAck(uint8_t client_id, const char* id) {
@@ -706,6 +707,11 @@ void begin(uint16_t port, const Hooks& hooks) {
 
 void loop() {
   server.loop();
+
+  // Drop sockets that have gone unwritable (ledger shq-suite-0038, second mechanism). Must run
+  // BEFORE any broadcast: the write-guard skips a blocked slot so the loop never pays the ~10 s
+  // the Arduino core would spend retrying it, and this is what eventually frees the slot.
+  server.reapStalled(mono::now(), WS_STALL_REAP_MS);
 
   // Drain the bridge task's state handoff. Dirty is cleared inside the critical section BEFORE
   // the broadcast (same ordering as somfy-sdn): a bus update landing mid-broadcast re-sets the

@@ -116,6 +116,18 @@ Claude Code has direct access to the HA REST API via the `./ha` helper script (u
 - **Cross-compilation**: Uses Podman, not Docker (`CROSS_CONTAINER_ENGINE=podman`)
 - **Overwatch proto**: The `.proto` file lives in `overwatch/proto/voice.proto`; the HA component symlinks to it and has generated Python stubs
 - **Don't diagnose an ESP32-C6 by polling its HTTP server — you will measure your own probe.** On the actron bridge, `GET /stats` every 15 s **quadrupled** the HA `unavailable` flap rate (22 events in 40 min against a 4-8/hour baseline) and drew free heap from 172 k down to 148 k, recovering once polling stopped: `WebServer` on port 80 and `WebSocketsServer` on 8767 share one small lwIP socket pool and one main loop, so HTTP requests starve the WS service (ledger shq-suite-0038). Read `GET /diag` / `/diag.json` **once**, or take the telemetry off the WS push the firmware already sends — both firmwares now instrument themselves (`src/diag.{h,cpp}` in `actron-sniffer` and `somfy-sdn` — **twins, keep them in step**) and the `actron_mitm_controller` / `somfy_sdn` diagnostic sensors record it all continuously in HA without touching the device at all.
+- **A blocked TCP socket costs the main loop ~10 s per write, and no timeout you can set will
+  shorten it.** `NetworkClient::write()` (Arduino core) retries up to `WIFI_CLIENT_MAX_WRITE_RETRY`
+  (10) times around a `select()` bounded by `WIFI_CLIENT_SELECT_TIMEOUT_US` (1 s), so ONE write to
+  a peer that stopped reading blocks ~10 s. `WEBSOCKETS_TCP_TIMEOUT` is only re-checked *between*
+  write calls; `SO_SNDTIMEO` does nothing because the core's `send()` already uses `MSG_DONTWAIT`;
+  and both core constants are **unguarded `#define`s**, so no `-D` overrides them. `broadcastTXT()`
+  walks every slot at a header + payload write each, which is how N dead slots became the 50-60 s
+  main-loop stalls (all clean multiples of 10 s — ledger shq-suite-0038). The fix is ours, not the
+  library's: `src/ws_guard.{h,cpp}` (**twins, keep in step**) poll each socket with a ZERO-timeout
+  `select()` before writing, skip any that would block, and drop one that stays unwritable for
+  `WS_STALL_REAP_MS`. Never call `broadcastTXT()` directly on these firmwares — use
+  `broadcastWritableTXT()`.
 - **arduinoWebSockets blocks, and only the Arduino main loop may touch it.** The library's socket
   reads/writes are blocking spin loops bounded by `WEBSOCKETS_TCP_TIMEOUT` (library default
   5000 ms — one zombie client could stall the loop for 10-60 s per pass, which is what drove the

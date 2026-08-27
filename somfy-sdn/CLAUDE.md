@@ -393,6 +393,17 @@ wedge watchdog (5 min at cap ⇒ reboot) and refuses debug clients during zombie
 actron twin additionally ported THIS firmware's dirty-flag broadcast (its bridge task used to
 write sockets directly); the two ws_api designs are architecturally aligned again.
 
+**⇒ SECOND MECHANISM, FIXED IN fw 1.7.0 (2026-08-27).** The 1.6.1 timeout bound worked — 8 of 12
+controllers fell to a 806-1629 ms worst stall with zero pong timeouts — but `somfy_sdn_06`
+(living room back, 70 unavailable events post-flash) and `_04` (living room left, 31) kept a
+**~50,05x ms** stall, matching the actron to within 4 ms. Root cause is the Arduino core, not this
+firmware: `NetworkClient::write()` blocks ~10 s per write to a peer that stopped reading
+(`WIFI_CLIENT_MAX_WRITE_RETRY` x `WIFI_CLIENT_SELECT_TIMEOUT_US`), unreachable by any build flag.
+Fixed with **`src/ws_guard.{h,cpp}`** (twin of actron's — keep in step): zero-timeout `select()`
+writability poll before every write, `broadcastWritableTXT()` in place of `broadcastTXT()`, and a
+reaper that drops a socket unwritable for `WS_STALL_REAP_MS`. New `ws_stall_reap` diag event and
+`stall_reaps` counter. See `actron-sniffer/CLAUDE.md` for the full derivation.
+
 A 48-entry RAM ring (~3 kB). Each record carries the event, an inferred reason, and the machine's
 condition at capture: free heap, largest allocatable block, spare lwIP sockets, worst main-loop and
 HTTP-pump stall since the previous record, RSSI, client count.

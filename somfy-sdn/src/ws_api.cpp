@@ -12,6 +12,7 @@
 #include "diag.h"
 #include "mono.h"
 #include "sdn.h"
+#include "ws_guard.h"
 #include "version.h"
 #include "wifi_prov.h"
 
@@ -19,7 +20,7 @@ namespace ws_api {
 
 namespace {
 
-WebSocketsServer* g_server = nullptr;
+GuardedWebSocketsServer* g_server = nullptr;
 volatile bool g_dirty = false;
 uint32_t g_last_heartbeat_ms = 0;
 
@@ -117,7 +118,7 @@ void broadcastState() {
   buildState(doc);
   String out;
   serializeJson(doc, out);
-  g_server->broadcastTXT(out);
+  g_server->broadcastWritableTXT(out);
 }
 
 void sendStateTo(uint8_t client) {
@@ -298,7 +299,7 @@ void sendDiagRecord(const diag::Record& r) {
   diag::toJson(r, obj);
   String out;
   serializeJson(doc, out);
-  g_server->broadcastTXT(out);
+  g_server->broadcastWritableTXT(out);
 }
 
 // Deliberately does NOT advance g_last_diag_seq_sent: a second client would otherwise be starved
@@ -338,7 +339,7 @@ void sendHealth() {
   obj["fw"] = SOMFY_FW_VERSION " " __DATE__ " " __TIME__;
   String out;
   serializeJson(doc, out);
-  g_server->broadcastTXT(out);
+  g_server->broadcastWritableTXT(out);
 }
 
 void onEvent(uint8_t client, WStype_t type, uint8_t* payload, size_t length) {
@@ -384,7 +385,7 @@ void onEvent(uint8_t client, WStype_t type, uint8_t* payload, size_t length) {
 }  // namespace
 
 void begin(uint16_t port) {
-  g_server = new WebSocketsServer(port);
+  g_server = new GuardedWebSocketsServer(port);
   g_server->begin();
   g_server->onEvent(onEvent);
   // Protocol-level ping/pong with dead-client eviction. The app-level state heartbeat below is a
@@ -405,6 +406,11 @@ void begin(uint16_t port) {
 void loop() {
   if (g_server == nullptr) return;
   g_server->loop();
+
+  // Drop sockets that have gone unwritable (ledger shq-suite-0038, second mechanism). Must run
+  // BEFORE any broadcast: the write-guard skips a blocked slot so the loop never pays the ~10 s
+  // the Arduino core would spend retrying it, and this is what eventually frees the slot.
+  g_server->reapStalled(mono::now(), WS_STALL_REAP_MS);
 
   if (g_dirty) {
     g_dirty = false;

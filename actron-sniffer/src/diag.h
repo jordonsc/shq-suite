@@ -86,6 +86,8 @@ enum class Event : uint8_t {
   WifiUp,            // association regained; `value` = RSSI
   ClockGlitch,       // mono::Filter caught a torn/backward/far-future millis() read
   HeartbeatStall,    // hb_age exceeded 2x HEARTBEAT_INTERVAL_MS — the shq-suite-0034 signature
+  WsStallReap,       // a socket refused writes for WS_STALL_REAP_MS and was dropped;
+                     // `value` = how long it had been unwritable (shq-suite-0038)
 };
 
 // Why a socket died. Inferred, and deliberately conservative: `Unknown` is preferred to a
@@ -141,6 +143,11 @@ void noteWsConnect(uint8_t client_id, const char* ip, uint8_t clients);
 void noteWsDisconnect(uint8_t client_id, uint8_t clients);
 void noteWsError(uint8_t client_id, uint8_t clients);
 void noteWsPong(uint8_t client_id);      // pong received => the peer is alive
+
+// A slot was dropped by the write-guard because its socket stayed unwritable. This is the
+// stall that never happened: writing to it would have blocked the main loop ~10 s inside the
+// Arduino core's write retry loop (see ws_guard.h).
+void noteWsStallReap(uint8_t client_id, uint32_t unwritable_ms, uint8_t clients);
 void noteWsRx(uint8_t client_id);        // any inbound frame => the peer is alive and talking
 void noteWsTx();                         // a state push went to every client
 
@@ -176,6 +183,7 @@ const char* reasonName(Reason r);
 // Counters surfaced in /stats and in the health payload.
 uint32_t pongTimeouts();
 uint32_t peerCloses();
+uint32_t stallReaps();
 uint32_t transportErrors();
 uint32_t loopStalls();
 uint32_t loopMaxMs();       // worst main-loop iteration since boot
