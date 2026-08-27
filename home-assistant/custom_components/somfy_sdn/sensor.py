@@ -101,6 +101,17 @@ DIAG_SENSORS: tuple[SomfyDiagSensorDescription, ...] = (
         value_fn=lambda h: h.get("pong_timeouts"),
     ),
     SomfyDiagSensorDescription(
+        key="stall_reaps", name="Stalled sockets reaped",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        # Sockets the firmware's write-guard dropped for staying unwritable. Each one is a
+        # ~10 s main-loop stall that did NOT happen: writing to a blocked socket costs
+        # WIFI_CLIENT_MAX_WRITE_RETRY x WIFI_CLIENT_SELECT_TIMEOUT_US inside the Arduino
+        # core, which no timeout above it can shorten (ledger shq-suite-0038). A climbing
+        # count with a FLAT worst-loop-stall is the fix working, not a fault.
+        value_fn=lambda h: h.get("stall_reaps"),
+    ),
+    SomfyDiagSensorDescription(
         key="peer_closes", name="Peer closes",
         state_class=SensorStateClass.TOTAL_INCREASING,
         entity_category=EntityCategory.DIAGNOSTIC,
