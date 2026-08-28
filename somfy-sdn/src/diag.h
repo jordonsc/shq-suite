@@ -92,6 +92,8 @@ enum class Event : uint8_t {
   HeartbeatStall,    // hb_age exceeded 2x HEARTBEAT_INTERVAL_MS — the shq-suite-0034 signature
   WsStallReap,       // a socket refused writes for WS_STALL_REAP_MS and was dropped;
                      // `value` = how long it had been unwritable (shq-suite-0038)
+  ApChange,          // the station associated to a different BSSID; `value` = lifetime roam
+                     // count, `ip` = the NEW bssid, previous one in the serial log
 };
 
 // Why a socket died. Inferred, and deliberately conservative: `Unknown` is preferred to a
@@ -188,6 +190,12 @@ const char* reasonName(Reason r);
 uint32_t pongTimeouts();
 uint32_t peerCloses();
 uint32_t stallReaps();
+uint32_t wifiRoams();
+
+// Current BSSID as a printable string, or "-" when not associated. The station is the ONLY
+// authoritative source for which AP is serving this device — the UniFi controller's client list
+// has been observed reporting a different AP than the station itself (wiki estate/shq-network.md).
+const char* currentBssid();
 uint32_t transportErrors();
 uint32_t loopStalls();
 uint32_t loopMaxMs();       // worst main-loop iteration since boot

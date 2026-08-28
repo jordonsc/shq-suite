@@ -51,6 +51,8 @@ uint32_t loop_busy_ms_ = 0;  // summed iteration time, for a coarse duty figure
 
 uint32_t pong_timeouts_ = 0;
 uint32_t stall_reaps_ = 0;
+uint32_t wifi_roams_ = 0;
+char bssid_[18] = {'-', 0};
 uint32_t peer_closes_ = 0;
 uint32_t transport_errors_ = 0;
 uint32_t wifi_disc_ = 0;
@@ -202,6 +204,25 @@ void tick(uint32_t hb_age_ms) {
     r.value = hb_age_ms;
   } else if (hb_stall_latched_ && hb_age_ms < HEARTBEAT_STALL_MS / 2) {
     hb_stall_latched_ = false;
+  }
+
+  // Which AP is serving us, watched from the STATION side (ledger shq-suite-0038 / argus-0117).
+  // A flap that follows one BSSID rather than one device is an AP fault, not a firmware fault —
+  // and that distinction is unreachable without this, since the firmware previously never
+  // reported its association at all.
+  if (WiFi.isConnected()) {
+    const String b = WiFi.BSSIDstr();
+    if (b.length() > 0 && b != bssid_) {
+      const bool first = (bssid_[0] == '-' && bssid_[1] == 0);
+      if (!first) {
+        wifi_roams_++;
+        Record& r = push(Event::ApChange);
+        r.value = wifi_roams_;
+        snprintf(r.ip, sizeof(r.ip), "%s", b.c_str() + 6);  // last 3 octets identify the radio
+        Serial.printf("[diag] AP change: %s -> %s\n", bssid_, b.c_str());
+      }
+      snprintf(bssid_, sizeof(bssid_), "%s", b.c_str());
+    }
   }
 
   const bool up = WiFi.isConnected();
@@ -376,6 +397,7 @@ const char* eventName(Event e) {
     case Event::ClockGlitch: return "clock_glitch";
     case Event::HeartbeatStall: return "heartbeat_stall";
     case Event::WsStallReap: return "ws_stall_reap";
+    case Event::ApChange: return "ap_change";
   }
   return "unknown";
 }
@@ -433,6 +455,8 @@ void healthToJson(JsonObject obj) {
   obj["wifi_disc"] = wifi_disc_;
   obj["pong_timeouts"] = pong_timeouts_;
   obj["stall_reaps"] = stall_reaps_;
+  obj["bssid"] = bssid_;
+  obj["wifi_roams"] = wifi_roams_;
   obj["peer_closes"] = peer_closes_;
   obj["transport_errors"] = transport_errors_;
   obj["loop_max_ms"] = loop_max_;
@@ -464,14 +488,16 @@ size_t renderText(char* out, size_t cap) {
   appendClamped(out, cap, n, snprintf(out + n, cap - n,
                 "# diag uptime=%lus heap=%u minheap=%u maxblk=%u spare_sock=%u rssi=%d "
                 "wifi_disc=%u pong_timeouts=%u peer_closes=%u transport_errors=%u "
-                "loop_max=%ums http_max=%ums ota_max=%ums ws_max=%ums stalls=%u reaps=%u seq=%u\n",
+                "loop_max=%ums http_max=%ums ota_max=%ums ws_max=%ums stalls=%u reaps=%u "
+                "bssid=%s roams=%u seq=%u\n",
                 (unsigned long)(mono::now() / 1000), (unsigned)ESP.getFreeHeap(),
                 (unsigned)ESP.getMinFreeHeap(), (unsigned)ESP.getMaxAllocHeap(),
                 (unsigned)spare_sockets_, WiFi.isConnected() ? WiFi.RSSI() : 0,
                 (unsigned)wifi_disc_, (unsigned)pong_timeouts_, (unsigned)peer_closes_,
                 (unsigned)transport_errors_, (unsigned)loop_max_, (unsigned)http_max_,
                 (unsigned)ota_max_, (unsigned)ws_max_, (unsigned)loop_stalls_,
-                (unsigned)stall_reaps_, (unsigned)(next_seq_ - 1)));
+                (unsigned)stall_reaps_, bssid_, (unsigned)wifi_roams_,
+                (unsigned)(next_seq_ - 1)));
 
   for (uint32_t seq = firstSeq(); seq <= lastSeq() && seq != 0; seq++) {
     const Record* r = bySeq(seq);
@@ -493,6 +519,8 @@ size_t renderText(char* out, size_t cap) {
 
 uint32_t pongTimeouts() { return pong_timeouts_; }
 uint32_t stallReaps() { return stall_reaps_; }
+uint32_t wifiRoams() { return wifi_roams_; }
+const char* currentBssid() { return bssid_; }
 uint32_t peerCloses() { return peer_closes_; }
 uint32_t transportErrors() { return transport_errors_; }
 uint32_t loopStalls() { return loop_stalls_; }

@@ -54,6 +54,18 @@ uint8_t GuardedWebSocketsServer::broadcastWritableTXT(String& payload) {
   return skipped;
 }
 
+bool GuardedWebSocketsServer::sendWritableTXT(uint8_t num, String& payload) {
+  if (num >= WEBSOCKETS_SERVER_CLIENT_MAX) return false;
+  WSclient_t* c = &_clients[num];
+  if (c->status != WSC_CONNECTED) return false;
+  if (!socketWritable(c)) {
+    skipped_++;
+    return false;
+  }
+  sendTXT(num, payload);
+  return true;
+}
+
 uint8_t GuardedWebSocketsServer::reapStalled(uint32_t now_ms, uint32_t grace_ms) {
   uint8_t reaped = 0;
   for (uint8_t i = 0; i < WEBSOCKETS_SERVER_CLIENT_MAX; i++) {

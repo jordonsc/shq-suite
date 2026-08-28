@@ -14,8 +14,8 @@ discipline, same host-test discipline for the pure-C++ core.
 
 **Status:** firmware + HA component implemented and **hardware-verified on a TinyC6 + live
 motor (2026-06-05)**. Pure-C++ core host-unit-tested (`pio test -e native`, 29 cases). Full
-design rationale: [`SPEC.md`](SPEC.md). **fw 1.5.1 is live on all 12 controllers (2026-08-19)** —
-the clock-glitch / heartbeat-wedge fix; see "Clock glitches" below.
+design rationale: [`SPEC.md`](SPEC.md). **fw 1.8.0 is live on all 12 controllers (2026-08-28)** — the WS
+write-guard (`ws_guard.{h,cpp}`) plus station-side BSSID reporting; see "Self-diagnostics" below.
 
 **Hardware bring-up results (bench, motor `16:5A:AB`, MAC `404cca512e64`):**
 - TX/RX, frame inversion + big-endian checksum (build *and* parse), and the retry/serialised
@@ -392,6 +392,23 @@ wrapped future-stamp read, clamped to 0, never latched as a `heartbeat_stall`).
 wedge watchdog (5 min at cap ⇒ reboot) and refuses debug clients during zombie windows. The
 actron twin additionally ported THIS firmware's dirty-flag broadcast (its bridge task used to
 write sockets directly); the two ws_api designs are architecturally aligned again.
+
+**⇒ fw 1.8.0 (2026-08-28) — the guard closed properly, plus BSSID reporting.** Three changes on
+top of 1.7.x, all twins with actron: (1) `reapStalled()` now runs **BEFORE** `server.loop()` —
+`enableHeartbeat`'s ping is emitted from inside `loop()` and writes to the socket directly,
+bypassing the guard, so a blocked slot still present when the library ran cost the full ~10 s core
+write (this was the residual 10,016 ms stall); (2) `WS_STALL_REAP_MS` **10 s → 3 s**, comfortably
+under the 15 s ping interval so a dead socket is reaped several times over before the library can
+touch it, and still far above any transient full send buffer; (3) `sendWritableTXT()` guards the
+per-client paths too — the connect-time snapshot and the diag backlog are the largest frames this
+firmware emits and go to a client whose socket health is unknown.
+
+**Also new in 1.8.0: the firmware reports its own AP.** `bssid=` and `roams=` in `/stats` and
+`/diag`, `bssid`/`wifi_roams`/`skipped_writes` in the health push (HA sensors in `somfy_sdn`
+1.7.0), and an `ap_change` diag event on every roam. This exists because the flap question had
+become "is this a device fault or an AP fault?" and that was unanswerable — the firmware never
+reported its association. **Read the association from the STATION, never the UniFi controller
+client list** (wiki `estate/shq-network.md`: the controller has been observed disagreeing).
 
 **⇒ SECOND MECHANISM, FIXED IN fw 1.7.0 (2026-08-27).** The 1.6.1 timeout bound worked — 8 of 12
 controllers fell to a 806-1629 ms worst stall with zero pong timeouts — but `somfy_sdn_06`

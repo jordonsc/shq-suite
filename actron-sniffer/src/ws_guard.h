@@ -34,10 +34,15 @@
 
 #include <cstdint>
 
-// A socket continuously unwritable for this long is a zombie, not a busy peer. Chosen well
-// below HA's 30 s availability timeout (so the reconnect lands before HA gives up) and well
-// above any transient full send-buffer on a LAN.
-constexpr uint32_t WS_STALL_REAP_MS = 10000;
+// A socket continuously unwritable for this long is a zombie, not a busy peer.
+//
+// 3 s, lowered from 10 s in fw 1.8.0. The reaper is what stops the LIBRARY writing to a blocked
+// socket — `enableHeartbeat`'s ping is sent inside `server.loop()` and bypasses this class
+// entirely, so a slot that survives to the next ping costs the full ~10 s core write. The ping
+// interval is 15 s (diag::WS_PING_INTERVAL_MS), so a 3 s grace reaps a dead socket several times
+// over before the library can touch it, while still being far above any transient full send
+// buffer on a LAN (where a healthy peer drains in microseconds).
+constexpr uint32_t WS_STALL_REAP_MS = 3000;
 
 class GuardedWebSocketsServer : public WebSocketsServer {
  public:
@@ -49,6 +54,12 @@ class GuardedWebSocketsServer : public WebSocketsServer {
   // Send to every connected client that is currently writable, skipping those that would
   // block. Returns the number skipped. This replaces broadcastTXT() everywhere.
   uint8_t broadcastWritableTXT(String& payload);
+
+  // Single-client send with the same guard. Returns false (and counts a skip) if the socket
+  // would block. Used for the per-client paths — the connect-time snapshot and diag backlog in
+  // particular, which are the largest frames this firmware emits and go to a client whose
+  // socket health is not yet known.
+  bool sendWritableTXT(uint8_t num, String& payload);
 
   // Drop clients whose socket has been continuously unwritable for >= grace_ms. Returns the
   // number reaped. Call once per loop, before any broadcast.

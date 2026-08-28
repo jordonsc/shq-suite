@@ -37,6 +37,9 @@ uint32_t errorEvents();
 // state broadcast: it should never exceed HEARTBEAT_INTERVAL_MS by more than a loop or two. A
 // large or growing value means the periodic push has stalled, which is what HA sees as a device
 // that connects but never sends — check this BEFORE suspecting WiFi, lwIP or the WS library.
+// Writes the write-guard declined because the socket would have blocked (fw 1.8.0).
+uint32_t skippedWrites();
+
 uint32_t heartbeatBroadcasts();
 uint32_t heartbeatAgeMs();
 

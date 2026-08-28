@@ -126,7 +126,7 @@ void sendStateTo(uint8_t client) {
   buildState(doc);
   String out;
   serializeJson(doc, out);
-  g_server->sendTXT(client, out);
+  g_server->sendWritableTXT(client, out);
 }
 
 void sendAck(uint8_t client, const char* id) {
@@ -136,7 +136,7 @@ void sendAck(uint8_t client, const char* id) {
   doc["status"] = "accepted";
   String out;
   serializeJson(doc, out);
-  g_server->sendTXT(client, out);
+  g_server->sendWritableTXT(client, out);
 }
 
 void sendError(uint8_t client, const char* id, const char* msg) {
@@ -146,7 +146,7 @@ void sendError(uint8_t client, const char* id, const char* msg) {
   doc["message"] = msg;
   String out;
   serializeJson(doc, out);
-  g_server->sendTXT(client, out);
+  g_server->sendWritableTXT(client, out);
 }
 
 // Resolve the target addr for a command. Returns false (and sets *err) when required + invalid.
@@ -320,7 +320,7 @@ void sendDiagBacklog(uint8_t client) {
   }
   String out;
   serializeJson(doc, out);
-  g_server->sendTXT(client, out);
+  g_server->sendWritableTXT(client, out);
 }
 
 void sendHealth() {
@@ -335,6 +335,10 @@ void sendHealth() {
   obj["ws_disc"] = g_disc_events;
   obj["ws_err"] = g_err_events;
   obj["hb_age_ms"] = (uint32_t)(mono::now() - g_last_heartbeat_ms);
+  // Writes the guard declined because the socket would have blocked. Paired with
+  // stall_reaps this separates "briefly busy, skipped one frame, recovered" from
+  // "socket died" — the gradation an AP that black-holes delivery would paint.
+  obj["skipped_writes"] = g_server->skippedWrites();
   obj["hb_tx"] = g_hb_broadcasts;
   obj["fw"] = SOMFY_FW_VERSION " " __DATE__ " " __TIME__;
   String out;
@@ -405,12 +409,13 @@ void begin(uint16_t port) {
 
 void loop() {
   if (g_server == nullptr) return;
-  g_server->loop();
-
-  // Drop sockets that have gone unwritable (ledger shq-suite-0038, second mechanism). Must run
-  // BEFORE any broadcast: the write-guard skips a blocked slot so the loop never pays the ~10 s
-  // the Arduino core would spend retrying it, and this is what eventually frees the slot.
+  // Reap BEFORE loop(), not after (fw 1.8.0). enableHeartbeat's ping is sent from inside loop()
+  // and writes to the socket DIRECTLY, bypassing the write-guard — so a blocked slot still
+  // present when the library runs costs the full ~10 s core write. Dropping it first is what
+  // closes the residual 10,016 ms stall seen on this fleet's worst unit (shq-suite-0038).
   g_server->reapStalled(mono::now(), WS_STALL_REAP_MS);
+
+  g_server->loop();
 
   if (g_dirty) {
     g_dirty = false;
@@ -482,6 +487,8 @@ uint32_t connectedClients() {
 uint32_t connectEvents() { return g_conn_events; }
 uint32_t disconnectEvents() { return g_disc_events; }
 uint32_t errorEvents() { return g_err_events; }
+
+uint32_t skippedWrites() { return g_server ? g_server->skippedWrites() : 0; }
 
 uint32_t heartbeatBroadcasts() { return g_hb_broadcasts; }
 

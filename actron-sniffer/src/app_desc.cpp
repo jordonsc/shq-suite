@@ -8,6 +8,12 @@
 // Strong `extern "C"` symbol in section .rodata_desc → the linker resolves esp_app_desc from
 // here and never pulls the prebuilt arduino-lib-builder copy from libesp_app_format.a. This
 // firmware has no semver macro, so version carries the build date.
+//
+// NOTE: this file must be touched whenever you want the descriptor's date to refresh.
+// PlatformIO caches object files by content hash, so an unchanged app_desc.cpp keeps its
+// OLD __DATE__/__TIME__ even when the rest of the image rebuilds — which makes the
+// descriptor disagree with the `fw=` string in /stats (that one comes from main.cpp and
+// does refresh). Generation marker, bump on each flash: ws_guard reorder + BSSID (1.8.0-era).
 
 #include <esp_app_desc.h>
 

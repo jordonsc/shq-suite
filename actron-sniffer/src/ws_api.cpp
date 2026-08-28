@@ -282,7 +282,7 @@ void sendStateToClient(uint8_t client_id, const state::ControllerState& s) {
   buildStatePayload(doc, s);
   String out;
   serializeJson(doc, out);
-  server.sendTXT(client_id, out);
+  server.sendWritableTXT(client_id, out);
 }
 
 void broadcastState(const state::ControllerState& s) {
@@ -324,7 +324,7 @@ void sendDiagBacklog(uint8_t client_id) {
   }
   String out;
   serializeJson(doc, out);
-  server.sendTXT(client_id, out);
+  server.sendWritableTXT(client_id, out);
 }
 
 void sendHealth() {
@@ -338,6 +338,10 @@ void sendHealth() {
   obj["ws_disc"] = disconnect_events_;
   obj["ws_err"] = error_events_;
   obj["hb_age_ms"] = (uint32_t)(mono::now() - last_heartbeat_ms_);
+  // Writes the guard declined because the socket would have blocked. Paired with
+  // stall_reaps this separates "briefly busy, skipped one frame, recovered" from
+  // "socket died" — the gradation an AP that black-holes delivery would paint.
+  obj["skipped_writes"] = server.skippedWrites();
   obj["hb_tx"] = hb_broadcasts_;
   obj["fw"] = __DATE__ " " __TIME__;
   String out;
@@ -352,7 +356,7 @@ void sendAck(uint8_t client_id, const char* id) {
   doc["status"] = "accepted";
   String out;
   serializeJson(doc, out);
-  server.sendTXT(client_id, out);
+  server.sendWritableTXT(client_id, out);
 }
 
 void sendError(uint8_t client_id, const char* id, const char* message) {
@@ -362,7 +366,7 @@ void sendError(uint8_t client_id, const char* id, const char* message) {
   doc["message"] = message;
   String out;
   serializeJson(doc, out);
-  server.sendTXT(client_id, out);
+  server.sendWritableTXT(client_id, out);
 }
 
 // ---- Command handlers --------------------------------------------------
@@ -706,12 +710,13 @@ void begin(uint16_t port, const Hooks& hooks) {
 }
 
 void loop() {
-  server.loop();
-
-  // Drop sockets that have gone unwritable (ledger shq-suite-0038, second mechanism). Must run
-  // BEFORE any broadcast: the write-guard skips a blocked slot so the loop never pays the ~10 s
-  // the Arduino core would spend retrying it, and this is what eventually frees the slot.
+  // Reap BEFORE server.loop(), not after (fw 1.8.0). enableHeartbeat's ping is sent from inside
+  // server.loop() and writes to the socket DIRECTLY, bypassing the write-guard — so a blocked
+  // slot that is still present when the library runs costs the full ~10 s core write. Dropping
+  // it first is what closes the residual 10,016 ms stall seen on somfy_sdn_06 (shq-suite-0038).
   server.reapStalled(mono::now(), WS_STALL_REAP_MS);
+
+  server.loop();
 
   // Drain the bridge task's state handoff. Dirty is cleared inside the critical section BEFORE
   // the broadcast (same ordering as somfy-sdn): a bus update landing mid-broadcast re-sets the
@@ -804,6 +809,8 @@ size_t connectedClients() { return server.connectedClients(); }
 uint32_t connectEvents() { return connect_events_; }
 uint32_t disconnectEvents() { return disconnect_events_; }
 uint32_t errorEvents() { return error_events_; }
+
+uint32_t skippedWrites() { return server.skippedWrites(); }
 
 uint32_t heartbeatBroadcasts() { return hb_broadcasts_; }
 

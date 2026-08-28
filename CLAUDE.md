@@ -128,6 +128,16 @@ Claude Code has direct access to the HA REST API via the `./ha` helper script (u
   `select()` before writing, skip any that would block, and drop one that stays unwritable for
   `WS_STALL_REAP_MS`. Never call `broadcastTXT()` directly on these firmwares — use
   `broadcastWritableTXT()`.
+- **The firmware reports which AP is serving it — trust that, not the UniFi controller.** Both
+  firmwares publish `bssid=`/`roams=` in `/stats` + `/diag` and through the WS health push (HA
+  sensors `access_point_bssid` / `ap_roams`). The UniFi controller's client list has been observed
+  disagreeing with the station about association (wiki `estate/shq-network.md`), so the station
+  wins. Used to test whether the long-running availability flaps followed one AP — **they do not**
+  (ledger shq-suite-0040): one radio hosts both the worst and several of the cleanest devices.
+- **The write-guard must reap BEFORE `server.loop()`.** `enableHeartbeat`'s ping is emitted inside
+  `server.loop()` and writes to the socket directly, bypassing `broadcastWritableTXT()` — so a
+  blocked slot still present when the library runs costs the full ~10 s core write regardless of
+  the guard. Reap first, and keep `WS_STALL_REAP_MS` under the ping interval (3 s vs 15 s).
 - **arduinoWebSockets blocks, and only the Arduino main loop may touch it.** The library's socket
   reads/writes are blocking spin loops bounded by `WEBSOCKETS_TCP_TIMEOUT` (library default
   5000 ms — one zombie client could stall the loop for 10-60 s per pass, which is what drove the

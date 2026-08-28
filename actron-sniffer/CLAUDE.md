@@ -192,6 +192,30 @@ WS close frame, because that frame would be a write to the very socket that is r
 `ws_stall_reap` diag event + `stall_reaps` counter make the fix measurable: every reap is a ~10 s
 stall that did not happen.
 
+**⇒ fw generation "Aug 28 2026" — the guard closed, plus BSSID reporting.** The 1.7.x canary read
+was decisive both ways: the actron hit a **17 ms** worst loop stall with zero flaps over 16.6 h
+(against 50,059 ms and 4-8/hour), but the somfy twin still logged **10,016 ms** — one 10 s quantum
+where it had been five. Two holes in the guard explained the remainder, both now closed:
+* **`reapStalled()` now runs BEFORE `server.loop()`.** `enableHeartbeat`'s ping is emitted from
+  inside `server.loop()` and writes to the socket **directly**, bypassing `broadcastWritableTXT()`.
+  Reaping afterwards let the library ping a blocked socket first — the full ~10 s core write.
+* **`WS_STALL_REAP_MS` 10 s → 3 s**, under the 15 s ping interval so a dead socket is reaped
+  several times over before the library can touch it, still far above any transient full buffer.
+* **`sendWritableTXT()`** now guards the per-client paths too (connect-time snapshot, acks, and the
+  diag backlog — the largest frame emitted, sent to a client of unknown socket health).
+
+**Station-side BSSID reporting** landed in the same build: `bssid=`/`roams=` in `/stats` and
+`/diag`, `bssid`/`wifi_roams`/`skipped_writes` in the health push (HA sensors in
+`actron_mitm_controller` 1.4.0), plus an `ap_change` diag event. It exists to settle "device fault
+or AP fault?", and it did — **the answer was no AP clustering** (ledger shq-suite-0040). Read
+association from the **station**, never the UniFi controller client list (wiki
+`estate/shq-network.md` records the controller disagreeing with the station).
+
+**⚠️ Build gotcha:** `app_desc.cpp` keeps a STALE `__DATE__` across rebuilds — PlatformIO caches
+object files by content hash, so an unchanged `app_desc.cpp` reports the old date in the image
+descriptor while `main.cpp`'s `fw=` string refreshes normally. Touch that file when you want the
+descriptor to agree; a note in it says so.
+
 ## Self-diagnostics (`src/diag.{h,cpp}`, 2026-08-23)
 
 Twin of `somfy-sdn/src/diag.{h,cpp}` (ported there in somfy fw 1.6.0) — **keep the two in step**,
