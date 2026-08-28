@@ -101,6 +101,32 @@ DIAG_SENSORS: tuple[SomfyDiagSensorDescription, ...] = (
         value_fn=lambda h: h.get("pong_timeouts"),
     ),
     SomfyDiagSensorDescription(
+        key="skipped_writes", name="Skipped writes",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        # Frames the write-guard declined because the socket would have blocked.
+        # Paired with the reap count this grades the fault: skips that recover mean a
+        # briefly busy peer, skips ending in a reap mean the path died.
+        value_fn=lambda h: h.get("skipped_writes"),
+    ),
+    SomfyDiagSensorDescription(
+        key="bssid", name="Access point (BSSID)",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        # Which radio is actually serving this device, read from the STATION — the
+        # only authoritative source (the UniFi controller client list has been seen
+        # disagreeing with it). In history this is what separates an AP fault from a
+        # device fault: flaps that follow one BSSID across devices are the AP.
+        value_fn=lambda h: h.get("bssid"),
+    ),
+    SomfyDiagSensorDescription(
+        key="wifi_roams", name="AP roams",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        # Lifetime BSSID changes. Distinguishes "parked on the bad AP throughout"
+        # from "the flap coincided with a roam".
+        value_fn=lambda h: h.get("wifi_roams"),
+    ),
+    SomfyDiagSensorDescription(
         key="stall_reaps", name="Stalled sockets reaped",
         state_class=SensorStateClass.TOTAL_INCREASING,
         entity_category=EntityCategory.DIAGNOSTIC,
