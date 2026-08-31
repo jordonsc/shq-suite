@@ -542,7 +542,7 @@ static size_t statusLine(char *out, size_t cap) {
     // handleClient() stalls since boot; anything near the 5 s pong deadline explains an eviction.
     // `pongto`/`peerclose`/`txerr` split the disconnects by who caused them. Full records at /diag.
     "sock=%u loop_max=%u http_max=%u stalls=%u "
-    "pongto=%u peerclose=%u txerr=%u wifi_disc=%u reaps=%u skipped=%u "
+    "pongto=%u peerclose=%u txerr=%u wifi_disc=%u reaps=%u skipped=%u deferred=%u "
     // Station-side AP association (fw 1.8.0). The controller client list has been seen
     // disagreeing with the station; the station wins (wiki estate/shq-network.md).
     "bssid=%s roams=%u diag_seq=%u fw=\"%s\"",

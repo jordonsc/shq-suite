@@ -134,6 +134,13 @@ Claude Code has direct access to the HA REST API via the `./ha` helper script (u
   disagreeing with the station about association (wiki `estate/shq-network.md`), so the station
   wins. Used to test whether the long-running availability flaps followed one AP — **they do not**
   (ledger shq-suite-0040): one radio hosts both the worst and several of the cleanest devices.
+- **Don't reap a WS client that is still settling.** `WS_STALL_REAP_MS` (3 s) alone killed sockets
+  ~6 s old that had never received a frame — an HA coordinator mid-handshake looks identical to a
+  dead one at the socket layer — so HA reconnected into the same trap and the flap rate on two
+  controllers *doubled*. `WS_REAP_MIN_AGE_MS` (10 s) now protects a young client. The value must
+  stay **under** the 15 s ping interval: that is what keeps a born-stuck socket reaped before
+  `enableHeartbeat` can block on it, and it is why raising the stall grace to 10 s instead would
+  have been wrong (ledger shq-suite-0038).
 - **The write-guard must reap BEFORE `server.loop()`.** `enableHeartbeat`'s ping is emitted inside
   `server.loop()` and writes to the socket directly, bypassing `broadcastWritableTXT()` — so a
   blocked slot still present when the library runs costs the full ~10 s core write regardless of

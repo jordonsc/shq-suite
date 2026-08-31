@@ -109,7 +109,7 @@ String statusLine() {
            // the bus task races the unsynchronised clock filter (shq-suite-0039); judge the
            // millis glitch on clk_torn/clk_jump only.
            "sock=%u loop_max=%u http_max=%u stalls=%u "
-           "pongto=%u peerclose=%u txerr=%u reaps=%u skipped=%u "
+           "pongto=%u peerclose=%u txerr=%u reaps=%u skipped=%u deferred=%u "
            // Station-side AP association (fw 1.8.0). The UniFi controller client list has
            // been seen disagreeing with the station; the station wins (wiki shq-network.md).
            "bssid=%s roams=%u diag_seq=%u "
@@ -130,7 +130,8 @@ String statusLine() {
            (unsigned)diag::spareSockets(), (unsigned)diag::loopMaxMs(), (unsigned)diag::httpMaxMs(),
            (unsigned)diag::loopStalls(), (unsigned)diag::pongTimeouts(), (unsigned)diag::peerCloses(),
            (unsigned)diag::transportErrors(), (unsigned)diag::stallReaps(),
-           (unsigned)ws_api::skippedWrites(), diag::currentBssid(), (unsigned)diag::wifiRoams(),
+           (unsigned)ws_api::skippedWrites(), (unsigned)ws_api::deferredReaps(),
+           diag::currentBssid(), (unsigned)diag::wifiRoams(),
            (unsigned)diag::lastSeq(),
            WiFi.isConnected() ? WiFi.RSSI() : 0,
            WiFi.localIP().toString().c_str(), SOMFY_FW_VERSION " (" __DATE__ " " __TIME__ ")");

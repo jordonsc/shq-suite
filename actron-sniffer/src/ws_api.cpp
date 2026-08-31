@@ -342,6 +342,7 @@ void sendHealth() {
   // stall_reaps this separates "briefly busy, skipped one frame, recovered" from
   // "socket died" — the gradation an AP that black-holes delivery would paint.
   obj["skipped_writes"] = server.skippedWrites();
+  obj["deferred_reaps"] = server.deferredReaps();
   obj["hb_tx"] = hb_broadcasts_;
   obj["fw"] = __DATE__ " " __TIME__;
   String out;
@@ -811,6 +812,8 @@ uint32_t disconnectEvents() { return disconnect_events_; }
 uint32_t errorEvents() { return error_events_; }
 
 uint32_t skippedWrites() { return server.skippedWrites(); }
+
+uint32_t deferredReaps() { return server.deferredReaps(); }
 
 uint32_t heartbeatBroadcasts() { return hb_broadcasts_; }
 

@@ -339,6 +339,7 @@ void sendHealth() {
   // stall_reaps this separates "briefly busy, skipped one frame, recovered" from
   // "socket died" — the gradation an AP that black-holes delivery would paint.
   obj["skipped_writes"] = g_server->skippedWrites();
+  obj["deferred_reaps"] = g_server->deferredReaps();
   obj["hb_tx"] = g_hb_broadcasts;
   obj["fw"] = SOMFY_FW_VERSION " " __DATE__ " " __TIME__;
   String out;
@@ -489,6 +490,8 @@ uint32_t disconnectEvents() { return g_disc_events; }
 uint32_t errorEvents() { return g_err_events; }
 
 uint32_t skippedWrites() { return g_server ? g_server->skippedWrites() : 0; }
+
+uint32_t deferredReaps() { return g_server ? g_server->deferredReaps() : 0; }
 
 uint32_t heartbeatBroadcasts() { return g_hb_broadcasts; }
 

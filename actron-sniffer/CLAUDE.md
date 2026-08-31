@@ -216,6 +216,15 @@ object files by content hash, so an unchanged `app_desc.cpp` reports the old dat
 descriptor while `main.cpp`'s `fw=` string refreshes normally. Touch that file when you want the
 descriptor to agree; a note in it says so.
 
+**⇒ the 1.9.0-era build (2026-08-31) — minimum client age before reap.** The 3 s stall grace introduced in
+1.8.0 was too aggressive: it killed sockets only ~6 s old that had never received a frame
+(`ws_stall_reap ... life=6595ms rx=0`), i.e. a coordinator still settling rather than a dead peer,
+which just made HA reconnect into the same trap — the flap rate on the two affected controllers
+doubled. `WS_REAP_MIN_AGE_MS` (10 s) now makes a young client ineligible for reaping, counted as
+`deferred_reaps` (`deferred=` in /stats, plus an HA sensor). **The value must stay under the 15 s
+ping interval** — that is what keeps a socket stuck from birth reaped before `enableHeartbeat` can
+block on it, and why simply raising the stall grace to 10 s would have been the wrong fix.
+
 ## Self-diagnostics (`src/diag.{h,cpp}`, 2026-08-23)
 
 Twin of `somfy-sdn/src/diag.{h,cpp}` (ported there in somfy fw 1.6.0) — **keep the two in step**,

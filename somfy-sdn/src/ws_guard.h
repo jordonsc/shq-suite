@@ -44,6 +44,20 @@
 // buffer on a LAN (where a healthy peer drains in microseconds).
 constexpr uint32_t WS_STALL_REAP_MS = 3000;
 
+// A client younger than this is never reaped, however unwritable it looks (fw 1.9.0).
+//
+// The 3 s grace above turned out to kill sockets only ~6 s old that had never received a frame
+// (`ws_stall_reap ... life=6595ms rx=0`), i.e. an HA coordinator still settling into a new
+// connection rather than a dead one — and HA then reconnects into the same trap, which is a
+// churn loop of our own making (ledger shq-suite-0038).
+//
+// 10 s is chosen to sit UNDER the library's 15 s ping interval (diag::WS_PING_INTERVAL_MS), which
+// is what makes this safe: a socket that is stuck from birth is still reaped at 10 s, before
+// `enableHeartbeat` can ever write to it, so none of the ~10 s core-write exposure comes back.
+// Deferring the reap costs nothing meanwhile — broadcastWritableTXT()/sendWritableTXT() already
+// skip an unwritable slot, so the loop never blocks on it either way.
+constexpr uint32_t WS_REAP_MIN_AGE_MS = 10000;
+
 class GuardedWebSocketsServer : public WebSocketsServer {
  public:
   using WebSocketsServer::WebSocketsServer;
@@ -68,6 +82,9 @@ class GuardedWebSocketsServer : public WebSocketsServer {
   // Lifetime counters — surfaced in /stats and the health push so the fix is measurable.
   uint32_t skippedWrites() const { return skipped_; }
   uint32_t reapedClients() const { return reaped_; }
+  // Reaps declined because the client was still inside WS_REAP_MIN_AGE_MS. A climbing value
+  // means young sockets ARE going unwritable — i.e. this gate is doing real work.
+  uint32_t deferredReaps() const { return deferred_; }
 
   // How long this slot has been unwritable, 0 if writable/idle. Evidence for a reap record.
   uint32_t unwritableForMs(uint8_t num, uint32_t now_ms) const;
@@ -77,6 +94,9 @@ class GuardedWebSocketsServer : public WebSocketsServer {
 
   // mono::now() when the slot first refused a write; 0 = writable or unoccupied.
   uint32_t unwritable_since_[WEBSOCKETS_SERVER_CLIENT_MAX] = {0};
+  // mono::now() when the slot was first seen connected; 0 = unoccupied.
+  uint32_t connected_since_[WEBSOCKETS_SERVER_CLIENT_MAX] = {0};
   uint32_t skipped_ = 0;
   uint32_t reaped_ = 0;
+  uint32_t deferred_ = 0;
 };

@@ -101,6 +101,18 @@ DIAG_SENSORS: tuple[SomfyDiagSensorDescription, ...] = (
         value_fn=lambda h: h.get("pong_timeouts"),
     ),
     SomfyDiagSensorDescription(
+        key="deferred_reaps", name="Deferred reaps",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        # Reaps the firmware declined because the client was still settling into its
+        # connection. The 3 s stall grace was killing sockets ~6 s old that had never
+        # received a frame, which just made HA reconnect into the same trap; a minimum
+        # client age now protects them. Climbing here means that gate is doing real
+        # work. It stays under the 15 s ping interval, so a socket stuck from birth is
+        # still dropped before the library can block on it (ledger shq-suite-0038).
+        value_fn=lambda h: h.get("deferred_reaps"),
+    ),
+    SomfyDiagSensorDescription(
         key="skipped_writes", name="Skipped writes",
         state_class=SensorStateClass.TOTAL_INCREASING,
         entity_category=EntityCategory.DIAGNOSTIC,

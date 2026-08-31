@@ -72,10 +72,23 @@ uint8_t GuardedWebSocketsServer::reapStalled(uint32_t now_ms, uint32_t grace_ms)
     WSclient_t* c = &_clients[i];
     if (c->status != WSC_CONNECTED) {
       unwritable_since_[i] = 0;
+      connected_since_[i] = 0;
       continue;
     }
+    // First sighting of this slot as connected — start its age clock.
+    if (connected_since_[i] == 0) connected_since_[i] = (now_ms == 0) ? 1u : now_ms;
+
     if (socketWritable(c)) {
       unwritable_since_[i] = 0;
+      continue;
+    }
+
+    // Too young to judge (fw 1.9.0). A coordinator still settling into a new connection looks
+    // identical to a dead one from here, and killing it just makes it reconnect. Safe because
+    // WS_REAP_MIN_AGE_MS is under the library's ping interval, so a socket stuck from birth is
+    // still dropped before enableHeartbeat can write to it. Writes to it are skipped regardless.
+    if ((uint32_t)(now_ms - connected_since_[i]) < WS_REAP_MIN_AGE_MS) {
+      deferred_++;
       continue;
     }
     if (unwritable_since_[i] == 0) {
@@ -86,6 +99,7 @@ uint8_t GuardedWebSocketsServer::reapStalled(uint32_t now_ms, uint32_t grace_ms)
     if (stuck_ms < grace_ms) continue;
 
     unwritable_since_[i] = 0;
+    connected_since_[i] = 0;
     reaped++;
     reaped_++;
     diag::noteWsStallReap(i, stuck_ms, connectedClients());

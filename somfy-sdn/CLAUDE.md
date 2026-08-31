@@ -410,6 +410,15 @@ become "is this a device fault or an AP fault?" and that was unanswerable — th
 reported its association. **Read the association from the STATION, never the UniFi controller
 client list** (wiki `estate/shq-network.md`: the controller has been observed disagreeing).
 
+**⇒ fw 1.9.0 (2026-08-31) — minimum client age before reap.** The 3 s stall grace introduced in
+1.8.0 was too aggressive: it killed sockets only ~6 s old that had never received a frame
+(`ws_stall_reap ... life=6595ms rx=0`), i.e. a coordinator still settling rather than a dead peer,
+which just made HA reconnect into the same trap — the flap rate on the two affected controllers
+doubled. `WS_REAP_MIN_AGE_MS` (10 s) now makes a young client ineligible for reaping, counted as
+`deferred_reaps` (`deferred=` in /stats, plus an HA sensor). **The value must stay under the 15 s
+ping interval** — that is what keeps a socket stuck from birth reaped before `enableHeartbeat` can
+block on it, and why simply raising the stall grace to 10 s would have been the wrong fix.
+
 **⇒ SECOND MECHANISM, FIXED IN fw 1.7.0 (2026-08-27).** The 1.6.1 timeout bound worked — 8 of 12
 controllers fell to a 806-1629 ms worst stall with zero pong timeouts — but `somfy_sdn_06`
 (living room back, 70 unavailable events post-flash) and `_04` (living room left, 31) kept a

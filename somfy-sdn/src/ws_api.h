@@ -40,6 +40,10 @@ uint32_t errorEvents();
 // Writes the write-guard declined because the socket would have blocked (fw 1.8.0).
 uint32_t skippedWrites();
 
+// Reaps declined because the client was still settling (fw 1.9.0). Climbing = the min-age gate
+// is doing real work; a young socket went unwritable and we correctly did NOT kill it.
+uint32_t deferredReaps();
+
 uint32_t heartbeatBroadcasts();
 uint32_t heartbeatAgeMs();
 
