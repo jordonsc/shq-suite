@@ -153,4 +153,66 @@ Claude Code has direct access to the HA REST API via the `./ha` helper script (u
   library. And never call the WS server from another FreeRTOS task: it has no internal locking,
   and a blocking write from a bus/bridge task stalls that task's real work. Use the dirty-flag
   handoff both firmwares now share (`ws_api::notifyStateChanged` → drained by `ws_api::loop()`).
+- **NEVER flash or reboot the actron MITM bridge with the A/C running — turn every zone off
+  first.** Confirmed, not theoretical: the bridge sits between a **physically cut** RS485 bus and
+  `handleUpdate` suspends the relay for the whole download, so the NEO↔indoor-board control bus is
+  dead for **~20-45 s**. With its controller gone the indoor unit does not hold and does not fail
+  safe — **it keeps blasting air until the controller returns**, and HA cannot intervene because
+  its only path to the unit is the device being flashed. Applies equally to `POST /update`,
+  `POST /reboot`, the HA Reboot button and the WS `reboot` command. Check every
+  `climate.actron_ac_*` is `off` first. The somfy twin has no such cost — it is an ordinary bus
+  participant, so its motors just stop being polled (ledger shq-suite-0042).
+- **A clock defence that can wait indefinitely turns a glitch into an outage.** `millis()` on
+  these C6 boards steps *backwards* as well as forwards: Bed 2's dropped by exactly **6 x 2^32
+  microseconds (25,769 s)** and kept running from there — the low 32 bits of the 64-bit
+  microsecond counter preserved, only the high word wrong. `mono::Filter`'s monotonic clamp
+  (`if (delta < 0) return last_;`) then pinned `mono::now()` at a constant for precisely as long
+  as the step was large: **nine hours** in which no deadline in the firmware fired at all — no
+  state push, no heartbeat, no RS485 poll — and HA flapped `unavailable` every 40 s. It
+  self-recovered when the hardware clock climbed back to the pinned value. Fixed in fw 1.10.0
+  (**twins, keep in step**): a step that is a near-exact multiple of 2^32 us is provably a
+  high-word fault and is rejected on the first read in either direction, and the clamp now
+  re-baselines after `REBASE_AFTER_REJECTS` consecutive rejections rather than holding for ever.
+  The unsigned-elapsed rule below protects a poisoned deadline VARIABLE, not a poisoned CLOCK —
+  that gap is what the bounded clamp closes (ledger shq-suite-0041).
+- **`clk_back` is a real signal, read as a RATE — the ledger used to say otherwise.**
+  shq-suite-0039 called it a meaningless artifact of the lock-free clock filter racing the bus
+  task ("~72/s on a healthy device") and told future sessions to ignore it. A fleet sweep put the
+  true healthy floor at **192-853 over four days (~0.002/s)**, and the device 0039 measured was
+  itself pinned at the time. Thousands per second means the clock is pinned *right now*. That
+  guidance cost this investigation real time — 0039 is superseded by shq-suite-0041.
+- **Devices now report their own faults, and a boolean was not enough.** Both firmwares carry
+  `src/fault.{h,cpp}` (**twins**): a severity-ordered bitmask of named conditions, each with a
+  one-line detail, surfaced as `fault=`/`fault_detail=` in `/stats`, in the WS health push, and in
+  HA as `sensor.<device>_fault` (state = slug, `ok` when clear; detail in attributes) plus a
+  derived `binary_sensor.<device>_problem` for automations. Before this, the only fault entity was
+  per-motor — it reports the SDN motor's status word and knows nothing about the controller
+  hosting it, which is why a nine-hour controller wedge showed every signal green.
+- **Rebooting a wedged device destroys the evidence — re-associate first, reboot last.**
+  `POST /reboot` (HTTP, out-of-band) and a `reboot` WS command (what the HA button drives) exist
+  on both firmwares, but nothing reboots on a clock fault alone. Bed 2's wedge was root-caused
+  *because* nobody rebooted it: the diagnostic ring is RAM-only, and the recovery itself was the
+  measurement that identified the step size. The self-heal that does exist (fw 1.11.0, below)
+  drops and rejoins the WiFi association, which keeps the ring, and reboots only if that fails.
+- **The clock filter cannot heal the layer beneath it: a backward clock step blacks out the
+  IDF's own timers, and the WiFi driver then leaks the device to death with the link UP**
+  (ledger shq-suite-0044). `millis()` is `esp_timer_get_time()/1000`, and every esp_timer alarm
+  in ESP-IDF is an absolute target on that same counter. When Bed 2's counter stepped back by
+  35 x 2^32 us on 2026-09-02, `mono`'s re-baseline kept every deadline in OUR firmware firing —
+  and the WiFi driver underneath, whose alarms were now 41.75 h in the future, leaked ~3.3 B/s
+  for 18 h until the receive path starved. The station stayed associated and kept sending a
+  gratuitous ARP every 60 s while answering nothing (no ARP reply, no ICMP, no TCP, no mDNS):
+  the router said healthy, HA said unreachable, both true. Neither reboot backstop fired,
+  because both key on the STA link being DOWN. A router-side reconnect cured it in one second
+  with no reboot (heap 8 k -> 240 k), and the leak did NOT resume: a re-association re-arms the
+  driver's timers against the current counter. Confirmed independently on the Gym controller
+  (31.6 min step, same leak rate, un-leaked the instant the counter climbed back). Both
+  firmwares now carry `src/netwatch.{h,cpp}` (**twins**, host-tested): re-associate on an
+  adopted backward step >= 60 s, on the gateway going unanswered for 3 min while nothing inbound
+  arrives over WS either, or on heap < 60 kB for 10 min; reboot only if a re-association did not
+  help (somfy) or never (actron — the A/C rule). Inbound WS traffic vetoes the "unreachable"
+  trigger, so an HA outage or a gateway that drops ICMP cannot trip it. Recognise the signature
+  by GARP-only traffic from the MAC, `nw_fail` climbing in `/stats`, and the
+  `sensor.<device>_gateway_probe_failures` HA sensor; the manual cure is a UniFi client
+  reconnect, not a power-cycle. Why the counter steps in the first place is still unknown.
 - **ESP32-C6 `millis()` glitches**: on the TinyC6 boards `millis()` occasionally returns a value **far in the future** (proved by error-ring entries stamped beyond a device's own uptime). Any deadline variable that captures one stops firing until the real clock catches up — that is what wedged the somfy/actron WS state heartbeat and produced months of 40 s-cadence HA `unavailable` flapping (ledger shq-suite-0034). Both firmwares now use `mono::now()` (`src/mono.{h,cpp}`, keep the two copies in step) and **unsigned** elapsed-time comparisons: `(uint32_t)(now - last) >= interval`, never `(int32_t)(...)`. Any new timing code on these boards should follow the same two rules.
