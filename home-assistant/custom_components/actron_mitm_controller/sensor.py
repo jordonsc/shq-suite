@@ -143,6 +143,33 @@ SENSORS: tuple[ActronDiagSensorDescription, ...] = (
         value_fn=lambda h: h.get("bssid"),
     ),
     ActronDiagSensorDescription(
+        key="clock_backward_reads", name="Clock backward reads",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        # READ THIS AS A RATE. On this firmware the healthy value is a true zero (bridgeTask
+        # never touches the filtered clock), so ANY sustained climb is significant; thousands
+        # per second means the monotonic clock is pinned right now and every deadline in the
+        # firmware has stopped firing. That is what a nine-hour outage looked like on the somfy
+        # twin (ledger shq-suite-0041). History on this entity makes the rate visible.
+        value_fn=lambda h: h.get("clk_back"),
+    ),
+    ActronDiagSensorDescription(
+        key="clock_word_steps", name="Clock high-word faults",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        # Clock steps that were an exact multiple of 2^32 microseconds — provably a corrupt
+        # high word in the 64-bit microsecond counter, rejected on the first read.
+        value_fn=lambda h: h.get("clk_word"),
+    ),
+    ActronDiagSensorDescription(
+        key="clock_rebases", name="Clock re-baselines",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        # Times the monotonic clamp gave up and adopted the clock the device actually has.
+        # Each one is an outage that DIDN'T happen.
+        value_fn=lambda h: h.get("clk_rebase"),
+    ),
+    ActronDiagSensorDescription(
         key="wifi_roams", name="AP roams",
         state_class=SensorStateClass.TOTAL_INCREASING,
         entity_category=EntityCategory.DIAGNOSTIC,
@@ -249,6 +276,7 @@ async def async_setup_entry(
         ActronDiagSensor(coordinator, entry, desc) for desc in SENSORS
     ]
     entities.append(ActronLastDisconnectSensor(coordinator, entry))
+    entities.append(ActronFaultSensor(coordinator, entry))
     async_add_entities(entities)
 
 
@@ -304,6 +332,46 @@ class ActronDiagSensor(_DiagBase):
         if not health:
             return None
         return self.entity_description.value_fn(health)
+
+
+class ActronFaultSensor(_DiagBase):
+    """The bridge's own worst active fault, as a short slug ("ok" when clear).
+
+    Deliberately a TEXT sensor rather than a boolean: a boolean cannot say WHICH fault, and
+    "clock stalled" and "no RS485 frames" want very different responses. The slug is the state;
+    the human sentence and the full active set are attributes. Twin of the somfy_sdn sensor —
+    both firmwares share the fault registry (ledger shq-suite-0041).
+    """
+
+    _attr_name = "Fault"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_icon = "mdi:alert-circle-outline"
+
+    def __init__(self, coordinator: ActronMitmCoordinator, entry: ConfigEntry):
+        super().__init__(coordinator, entry)
+        self._attr_unique_id = f"{entry.entry_id}_fault"
+
+    @property
+    def native_value(self) -> Optional[str]:
+        health = self.coordinator.health
+        if not health:
+            return None
+        # A MISSING key means firmware too old to report faults at all — that must read as
+        # `unknown`, never as "ok". Mapping absence to "ok" would have this sensor cheerfully
+        # declare a healthy device on exactly the firmware that cannot tell us otherwise, which
+        # is the false all-clear the whole fault registry exists to abolish.
+        return health.get("fault")
+
+    @property
+    def extra_state_attributes(self) -> Optional[dict[str, Any]]:
+        health = self.coordinator.health
+        if not health:
+            return None
+        return {
+            "detail": health.get("fault_detail") or "",
+            # Bitmask of every active code, not just the worst.
+            "mask": health.get("fault_mask"),
+        }
 
 
 class ActronLastDisconnectSensor(_DiagBase):

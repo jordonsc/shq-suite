@@ -1,6 +1,6 @@
 """Button entities for Somfy SDN.
 
-Controller: Rediscover motors. Per-motor (config category, so they live on the device page, not
+Controller: Rediscover motors, Reconnect WiFi, Reboot. Per-motor (config category, so they live on the device page, not
 dashboards): Set top/bottom limit, Identify, Reset positions, Jog up/down (by the Number step).
 """
 
@@ -21,7 +21,9 @@ async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
     coordinator: SomfySdnCoordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([RediscoverButton(coordinator), ReconnectWifiButton(coordinator)])
+    async_add_entities(
+        [RediscoverButton(coordinator), ReconnectWifiButton(coordinator), RebootButton(coordinator)]
+    )
     add_motor_entities(
         coordinator,
         entry,
@@ -69,6 +71,31 @@ class ReconnectWifiButton(SomfySdnControllerEntity, ButtonEntity):
 
     async def async_press(self) -> None:
         await self.coordinator.async_send_command("reconnect_wifi")
+
+
+class RebootButton(SomfySdnControllerEntity, ButtonEntity):
+    """Restart the controller.
+
+    Deliberately manual, not automatic. A reboot clears any clock fault instantly, and it was
+    tempting to make the firmware self-heal that way — but a reboot also destroys the RAM-only
+    diagnostic ring, which is the only record of what went wrong. Bed 2's nine-hour wedge was
+    diagnosed precisely because nobody rebooted it (ledger shq-suite-0041). The firmware now
+    recovers from a clock fault on its own; this is for the cases it cannot.
+
+    WiFi credentials and motor configuration live in NVS, so nothing is lost. The next boot's
+    `note=` in /stats records that the restart was deliberate rather than a crash.
+    """
+
+    _attr_name = "Reboot"
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_icon = "mdi:restart"
+
+    def __init__(self, coordinator: SomfySdnCoordinator) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{self._cid}:reboot"
+
+    async def async_press(self) -> None:
+        await self.coordinator.async_send_command("reboot")
 
 
 class _MotorButton(SomfySdnMotorEntity, ButtonEntity):

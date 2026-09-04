@@ -131,6 +131,36 @@ DIAG_SENSORS: tuple[SomfyDiagSensorDescription, ...] = (
         value_fn=lambda h: h.get("bssid"),
     ),
     SomfyDiagSensorDescription(
+        key="clock_backward_reads", name="Clock backward reads",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        # READ THIS AS A RATE. A healthy controller gathers a few hundred over four days;
+        # thousands per second means the monotonic clock is pinned RIGHT NOW and every
+        # deadline in the firmware has stopped firing. That is the fingerprint of the
+        # nine-hour Bed 2 outage, and it was sitting in plain sight the whole time —
+        # a prior investigation wrote it off as a race artifact (ledger shq-suite-0039,
+        # since corrected by shq-suite-0041). History on this entity makes the rate visible.
+        value_fn=lambda h: h.get("clk_back"),
+    ),
+    SomfyDiagSensorDescription(
+        key="clock_word_steps", name="Clock high-word faults",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        # Clock steps that were an exact multiple of 2^32 microseconds — provably a corrupt
+        # high word in the 64-bit microsecond counter, rejected on the first read. Non-zero
+        # means the hardware clock misbehaved and the firmware absorbed it.
+        value_fn=lambda h: h.get("clk_word"),
+    ),
+    SomfyDiagSensorDescription(
+        key="clock_rebases", name="Clock re-baselines",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        # Times the monotonic clamp gave up and adopted the clock the device actually has,
+        # because it had stayed moved. Each one is an outage that DIDN'T happen: the old
+        # firmware would have frozen here for as long as the step was large.
+        value_fn=lambda h: h.get("clk_rebase"),
+    ),
+    SomfyDiagSensorDescription(
         key="wifi_roams", name="AP roams",
         state_class=SensorStateClass.TOTAL_INCREASING,
         entity_category=EntityCategory.DIAGNOSTIC,
@@ -207,6 +237,23 @@ DIAG_SENSORS: tuple[SomfyDiagSensorDescription, ...] = (
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda h: h.get("rssi"),
     ),
+    # Network-stack watchdog (fw 1.11.0, ledger shq-suite-0044). Probe failures climbing while
+    # the link is up is the "associated but unreachable" signature that killed Bed 2; recoveries
+    # counts the re-associations the firmware performed on its own to get out of it.
+    SomfyDiagSensorDescription(
+        key="gateway_probe_failures", name="Gateway probe failures",
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:lan-disconnect",
+        value_fn=lambda h: h.get("nw_fail"),
+    ),
+    SomfyDiagSensorDescription(
+        key="network_recoveries", name="Network recoveries",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:wifi-refresh",
+        value_fn=lambda h: h.get("nw_recover"),
+    ),
     SomfyDiagSensorDescription(
         key="uptime", name="Uptime",
         native_unit_of_measurement=UnitOfTime.SECONDS,
@@ -228,6 +275,7 @@ async def async_setup_entry(
         LastDisconnectSensor(coordinator),
     ]
     entities += [SomfyDiagSensor(coordinator, desc) for desc in DIAG_SENSORS]
+    entities.append(FaultSensor(coordinator))
     async_add_entities(entities)
 
 
@@ -308,6 +356,48 @@ class SomfyDiagSensor(_HealthFedSensor):
         if not health:
             return None
         return self.entity_description.value_fn(health)
+
+
+class FaultSensor(_HealthFedSensor):
+    """The controller's own worst active fault, as a short slug ("ok" when clear).
+
+    Deliberately a TEXT sensor rather than a boolean. When Bed 2's clock wedged for nine hours
+    every signal the estate had was clear: the only fault entity was `binary_sensor.<motor>_fault`,
+    which reports the SDN motor's status word and knows nothing about the controller hosting it.
+    A boolean also cannot say WHICH fault, and "clock stalled" and "heap low" want very different
+    responses. The slug is the state; the human sentence and the full active set are attributes.
+    """
+
+    _attr_name = "Fault"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_icon = "mdi:alert-circle-outline"
+
+    def __init__(self, coordinator: SomfySdnCoordinator) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{self._cid}:fault"
+
+    @property
+    def native_value(self) -> Optional[str]:
+        health = self.coordinator.health
+        if not health:
+            return None
+        # A MISSING key means firmware too old to report faults at all — that must read as
+        # `unknown`, never as "ok". Mapping absence to "ok" would have this sensor cheerfully
+        # declare a healthy device on exactly the firmware that cannot tell us otherwise, which
+        # is the false all-clear the whole fault registry exists to abolish.
+        return health.get("fault")
+
+    @property
+    def extra_state_attributes(self) -> Optional[dict[str, Any]]:
+        health = self.coordinator.health
+        if not health:
+            return None
+        return {
+            "detail": health.get("fault_detail") or "",
+            # Bitmask of every active code, not just the worst — a heap notice hidden behind a
+            # dead clock is still worth having in history.
+            "mask": health.get("fault_mask"),
+        }
 
 
 class LastDisconnectSensor(_HealthFedSensor):
