@@ -49,6 +49,8 @@
 
 #include "bridge.h"
 #include "diag.h"
+#include "fault.h"
+#include "version.h"
 #include "mono.h"
 #include "state.h"
 #include "wifi_prov.h"
@@ -532,11 +534,13 @@ static size_t statusLine(char *out, size_t cap) {
     // ws_conn diverging from ws_disc (sockets abandoned without a DISCONNECTED event).
     "heap=%u minheap=%u maxblk=%u uptime=%lus "
     "ws=%u ws_conn=%u ws_disc=%u ws_err=%u "
-    // Heartbeat health + clock-glitch counters (ledger shq-suite-0034): hb_age should stay under
-    // HEARTBEAT_INTERVAL_MS; a large value means the state push has stalled and HA is about to
-    // start its unavailable/available flap. clk_torn/clk_jump count the bad millis() reads that
-    // used to cause exactly that.
-    "hb_age=%u hb_tx=%u clk_torn=%u clk_back=%u clk_jump=%u clk_jumpms=%u "
+    // Heartbeat health + clock-fault counters (fw 1.10.0, ledger shq-suite-0041): hb_age should
+    // stay under HEARTBEAT_INTERVAL_MS; a large value means the state push has stalled and HA is
+    // about to start its unavailable/available flap. clk_word counts rejected high-word clock
+    // faults, clk_rebase counts clamps abandoned because the clock had genuinely moved, and
+    // clk_rebase_ms is the signed size of the newest such step.
+    "hb_age=%u hb_tx=%u clk_back=%u clk_word=%u clk_rebase=%u clk_rebase_ms=%ld "
+    "clk_jump=%u clk_jumpms=%u "
     // Self-diagnostics summary (ledger shq-suite-0038). `sock` is spare lwIP sockets — 0 means the
     // pool HTTP and WS share is exhausted. `loop_max`/`http_max` are the worst main-loop and
     // handleClient() stalls since boot; anything near the 5 s pong deadline explains an eviction.
@@ -545,7 +549,12 @@ static size_t statusLine(char *out, size_t cap) {
     "pongto=%u peerclose=%u txerr=%u wifi_disc=%u reaps=%u skipped=%u deferred=%u "
     // Station-side AP association (fw 1.8.0). The controller client list has been seen
     // disagreeing with the station; the station wins (wiki estate/shq-network.md).
-    "bssid=%s roams=%u diag_seq=%u fw=\"%s\"",
+    // Device-level fault (fw 1.10.0). "ok" when clear; otherwise the worst active code and its
+    // one-line detail. This is what HA's fault sensor mirrors.
+    // Network-stack watchdog (fw 1.11.0, shq-suite-0044): consecutive unanswered gateway
+    // probes, probes sent, re-associations performed, and the newest reason.
+    "bssid=%s roams=%u diag_seq=%u nw_fail=%u nw_probes=%u nw_recover=%u nw_reason=%s "
+    "fault=%s fault_detail=\"%s\" fw=\"%s\"",
     g_seq, g_baud, g_parity, g_gap_us, g_capture ? "on" : "off",
     (unsigned long long)g_a.total_bytes, g_a.total_frames, g_a.modified_frames, g_a.rx_errors,
     (unsigned long long)g_b.total_bytes, g_b.total_frames, g_b.modified_frames, g_b.rx_errors,
@@ -561,15 +570,20 @@ static size_t statusLine(char *out, size_t cap) {
     (unsigned)ws_api::connectedClients(), ws_api::connectEvents(), ws_api::disconnectEvents(),
     ws_api::errorEvents(),
     (unsigned)ws_api::heartbeatAgeMs(), (unsigned)ws_api::heartbeatBroadcasts(),
-    (unsigned)mono::tornReads(), (unsigned)mono::backwardReads(),
+    (unsigned)mono::backwardReads(), (unsigned)mono::wordSteps(),
+    (unsigned)mono::rebases(), (long)mono::lastRebaseMs(),
     (unsigned)mono::forwardJumps(), (unsigned)mono::lastJumpMs(),
     (unsigned)diag::spareSockets(), (unsigned)diag::loopMaxMs(), (unsigned)diag::httpMaxMs(),
     (unsigned)diag::loopStalls(), (unsigned)diag::pongTimeouts(), (unsigned)diag::peerCloses(),
     (unsigned)diag::transportErrors(), (unsigned)diag::wifiDisconnects(),
     (unsigned)diag::stallReaps(), (unsigned)ws_api::skippedWrites(),
+    (unsigned)ws_api::deferredReaps(),
     diag::currentBssid(), (unsigned)diag::wifiRoams(),
     (unsigned)diag::lastSeq(),
-    __DATE__ " " __TIME__);
+    (unsigned)wifi_prov::netProbeFailures(), (unsigned)wifi_prov::netProbes(),
+    (unsigned)wifi_prov::netRecoveries(), wifi_prov::netLastReason(),
+    fault::registry().worstSlug(), fault::registry().worstDetail(),
+    ACTRON_FW_VERSION " " __DATE__ " " __TIME__);
 }
 
 // ---- pulse-width baud estimator (UART1 / board side only) -----------------
@@ -779,6 +793,20 @@ static void handleClear() {
   g_b.total_bytes = g_b.total_frames = g_b.modified_frames = g_b.rx_errors = 0;
   memset(g_ring, 0, sizeof(g_ring));
   server.send(200, "text/plain", "# cleared\n");
+}
+
+// Deliberate, operator-driven restart (fw 1.10.0). The WS command is the one HA drives; this
+// exists because the WS server is exactly what dies in the failure modes worth rebooting for —
+// during Bed 2's nine-hour clock wedge on the somfy twin (shq-suite-0041) WS was dead throughout
+// while HTTP answered every request instantly. Out-of-band by design.
+static void handleReboot() {
+  const String reason = server.hasArg("reason") ? server.arg("reason") : String("http");
+  server.send(200, "text/plain", "# rebooting: " + reason + "\n");
+  server.client().flush();
+  Serial.printf("# reboot requested (%s)\n", reason.c_str());
+  Serial.flush();
+  delay(100);  // let the response leave before the stack goes down
+  ESP.restart();
 }
 
 static void handleArm() {
@@ -1391,6 +1419,7 @@ static void startAppServer() {
   server.on("/measure", HTTP_GET, handleMeasure);
   server.on("/set", HTTP_POST, handleSet);
   server.on("/clear", HTTP_POST, handleClear);
+  server.on("/reboot", HTTP_POST, handleReboot);
   server.on("/update", HTTP_POST, handleUpdate);
   server.on("/wifireset", HTTP_POST, handleWifiReset);
   server.on("/armwrite", HTTP_POST, handleArm);
@@ -1464,6 +1493,95 @@ void setup() {
   xTaskCreate(bridgeTask, "bridge", 8192, nullptr, 5, &g_bridge_task);
 }
 
+// ---- fault evaluation ----------------------------------------------------
+
+// Free heap below this and a WS reconnect starts failing. This firmware idles near 172 kB, well
+// clear of the floor.
+static constexpr uint32_t FAULT_HEAP_LOW_BYTES = 60000;
+static constexpr uint32_t FAULT_HEAP_CLEAR_BYTES = 80000;
+
+// Both RS485 endpoints silent this long means the bridge is relaying nothing — the NEO polls
+// continuously, so silence is never normal. Generous, because a false positive here would flag
+// a working air conditioner as faulty.
+static constexpr uint32_t FAULT_BUS_SILENT_MS = 60000;
+
+// Clock liveness, counted in LOOP ITERATIONS rather than milliseconds — timing the clock against
+// itself would be circular, and the clock is the thing under suspicion (ledger shq-suite-0041).
+// mono's re-baseline should make this unreachable; it is the backstop that proves it.
+static constexpr uint32_t CLOCK_STALL_LOOPS = 20000;
+static uint32_t g_clock_last_ms = 0;
+static uint32_t g_clock_same_loops = 0;
+
+// The clock check runs every pass (an integer compare); everything else is polled on a loop
+// COUNT, not a timer, so the evaluator keeps working when the clock is the thing that broke —
+// and so the hot path never pays for a heap query per iteration.
+static constexpr uint32_t FAULT_POLL_LOOPS = 512;
+static uint32_t g_fault_poll = 0;
+static constexpr uint32_t FAULT_HEAP_EVERY_N_POLLS = 8;
+static uint32_t g_heap_poll = 0;
+static uint32_t g_bus_frames_seen = 0;
+static uint32_t g_bus_frames_ms = 0;
+
+static void updateFaults(uint32_t now_ms) {
+  char detail[fault::DETAIL_MAX];
+
+  if (now_ms == g_clock_last_ms) {
+    if (g_clock_same_loops < CLOCK_STALL_LOOPS) g_clock_same_loops++;
+  } else {
+    g_clock_last_ms = now_ms;
+    g_clock_same_loops = 0;
+    fault::clear(fault::Code::ClockStalled);
+  }
+  if (g_clock_same_loops >= CLOCK_STALL_LOOPS) {
+    snprintf(detail, sizeof(detail), "pinned at %lu s", (unsigned long)(now_ms / 1000));
+    fault::raise(fault::Code::ClockStalled, detail);
+  }
+
+  if (++g_fault_poll < FAULT_POLL_LOOPS) return;
+  g_fault_poll = 0;
+
+  // Latched, not live: both are historical facts about a clock that misbehaved and was handled.
+  // They stay up until a reboot or POST /clear, because "it happened while you weren't looking"
+  // is exactly the thing that went unreported for nine hours on the somfy twin.
+  if (mono::rebases() > 0) {
+    snprintf(detail, sizeof(detail), "%lu x, last %ld ms", (unsigned long)mono::rebases(),
+             (long)mono::lastRebaseMs());
+    fault::raise(fault::Code::ClockRebase, detail);
+  }
+  if (mono::wordSteps() > 0) {
+    snprintf(detail, sizeof(detail), "%lu x, last %u high-word units",
+             (unsigned long)mono::wordSteps(), (unsigned)mono::lastWordUnits());
+    fault::raise(fault::Code::ClockWordStep, detail);
+  }
+
+  const uint32_t frames = g_a.total_frames + g_b.total_frames;
+  if (frames != g_bus_frames_seen) {
+    g_bus_frames_seen = frames;
+    g_bus_frames_ms = now_ms;
+    fault::clear(fault::Code::BusOffline);
+  } else if (g_bus_frames_ms != 0 && (uint32_t)(now_ms - g_bus_frames_ms) >= FAULT_BUS_SILENT_MS) {
+    snprintf(detail, sizeof(detail), "no RS485 frames for %lu s",
+             (unsigned long)((uint32_t)(now_ms - g_bus_frames_ms) / 1000));
+    fault::raise(fault::Code::BusOffline, detail);
+  }
+
+  // Heap is sub-sampled again on top of the 512-loop poll. `ESP.getFreeHeap()` takes a HEAP LOCK,
+  // which is why diag::tick() already rate-limits its own read to 1 Hz; the main loop runs at
+  // ~1 kHz, so polling heap every 512 iterations would take that lock at ~2 Hz — twice diag's
+  // deliberate limit, on hardware whose RS485 relay is timing-critical. One read per 8 polls is
+  // ~0.25 Hz, comfortably below it, and heap simply does not move fast enough to care.
+  if (++g_heap_poll >= FAULT_HEAP_EVERY_N_POLLS) {
+    g_heap_poll = 0;
+    const uint32_t heap = ESP.getFreeHeap();
+    if (heap < FAULT_HEAP_LOW_BYTES) {
+      snprintf(detail, sizeof(detail), "%lu bytes free", (unsigned long)heap);
+      fault::raise(fault::Code::HeapLow, detail);
+    } else if (heap > FAULT_HEAP_CLEAR_BYTES) {
+      fault::clear(fault::Code::HeapLow);
+    }
+  }
+}
+
 void loop() {
   // Phase timing (ledger shq-suite-0038). A WS client evicted for a late pong is indistinguishable
   // from a dead one unless you know whether THIS loop was stalled at the time — and knowing which
@@ -1486,6 +1604,7 @@ void loop() {
     http_ms = t_ws - t_http;
     ws_ms = t_end - t_ws;
   }
+  updateFaults(t_start);
   diag::noteLoop((uint32_t)(mono::now() - t_start), ota_ms, http_ms, ws_ms);
   // pumpCapture() / the A/C bridge run on their own FreeRTOS task — see bridgeTask() — so the
   // bridge keeps relaying in both CONNECTED and PORTAL modes.

@@ -9,6 +9,7 @@
 #include <cstring>
 
 #include "mono.h"
+#include "wifi_prov.h"
 
 namespace diag {
 
@@ -65,15 +66,17 @@ bool hb_stall_latched_ = false;
 uint32_t last_clock_glitches_ = 0;
 bool wifi_up_ = true;
 
-// DELIBERATELY EXCLUDES backwardReads() (ledger shq-suite-0039). `mono::Filter` is documented as
-// not internally synchronised, and somfy-sdn calls mono::now() from tight deadline-poll loops in
-// its bus task concurrently with the Arduino loop — which produced 25.4 MILLION "backward" reads on
-// Bed 4 over four days (~72/s) with a perfectly healthy clock. Including that here would fire a
-// ClockGlitch record every single tick and flood the ring with noise. torn and jump are the two
-// counters that actually fingerprint the shq-suite-0034 far-future-millis glitch; back is a race
-// artifact. (On actron this is inert — bridgeTask never calls mono::now(), so back stays 0.)
+// DELIBERATELY EXCLUDES backwardReads(), but not for the reason this comment used to give.
+// The old rationale (ledger shq-suite-0039) was that backward reads are a race artifact running at
+// ~72/s on somfy; that was measured on a device whose clock was pinned at the time, and the true
+// healthy floor is a few hundred over FOUR DAYS. Backward reads are excluded here because they are
+// the RAW symptom, and the filter now reports what it actually did about them: wordSteps() is a
+// rejected high-word fault and rebases() is a clamp abandoned because the clock really had moved.
+// Those two plus forwardJumps() are the events worth a ring record; the raw count is still carried
+// in /stats as clk_back, where its RATE is the cheapest fingerprint of a clock pinned right now
+// (ledger shq-suite-0041).
 uint32_t clockGlitchTotal() {
-  return mono::tornReads() + mono::forwardJumps();
+  return mono::wordSteps() + mono::rebases() + mono::forwardJumps();
 }
 
 // Ask lwIP for sockets until it says no. The count we get back is the headroom left in a pool
@@ -190,8 +193,8 @@ void tick(uint32_t hb_age_ms) {
   if (glitches != last_clock_glitches_) {
     Record& r = push(Event::ClockGlitch);
     r.value = glitches;
-    r.lifetime_ms = mono::tornReads();
-    r.pong_age_ms = mono::forwardJumps();
+    r.lifetime_ms = mono::wordSteps();
+    r.pong_age_ms = mono::rebases();
     r.rx_msgs = (uint16_t)(mono::backwardReads() > 0xFFFF ? 0xFFFF : mono::backwardReads());
     last_clock_glitches_ = glitches;
   }
@@ -397,6 +400,7 @@ const char* eventName(Event e) {
     case Event::HeartbeatStall: return "heartbeat_stall";
     case Event::WsStallReap: return "ws_stall_reap";
     case Event::ApChange: return "ap_change";
+    case Event::NetRecover: return "net_recover";
   }
   return "unknown";
 }
@@ -465,12 +469,25 @@ void healthToJson(JsonObject obj) {
   obj["loop_stalls"] = loop_stalls_;
   obj["loop_iters"] = loop_iters_;
   obj["loop_busy_ms"] = loop_busy_ms_;
-  obj["clk_torn"] = mono::tornReads();
-  // Reported for completeness but NOT alarmed on — see clockGlitchTotal(): on a firmware whose
-  // bus task hammers mono::now(), this counts lost races, not clock faults (shq-suite-0039).
+  // Read clk_back as a RATE, not a total: a healthy controller accumulates a few hundred over
+  // four days, and thousands per second means the clock is pinned RIGHT NOW (shq-suite-0041).
   obj["clk_back"] = mono::backwardReads();
+  obj["clk_word"] = mono::wordSteps();
+  obj["clk_rebase"] = mono::rebases();
+  obj["clk_rebase_ms"] = mono::lastRebaseMs();
   obj["clk_jump"] = mono::forwardJumps();
+  // Network-stack watchdog (fw 1.11.0, shq-suite-0044): consecutive unanswered gateway probes,
+  // lifetime re-associations it has performed, and why it last acted.
+  obj["nw_fail"] = wifi_prov::netProbeFailures();
+  obj["nw_recover"] = wifi_prov::netRecoveries();
+  obj["nw_reason"] = wifi_prov::netLastReason();
   obj["diag_seq"] = next_seq_ - 1;
+}
+
+void noteNetRecover(const char* reason, uint32_t recoveries) {
+  Record& r = push(Event::NetRecover);
+  r.value = recoveries;
+  snprintf(r.ip, sizeof(r.ip), "%s", reason ? reason : "?");
 }
 
 // snprintf returns what it WOULD have written, so accumulating its return value directly walks

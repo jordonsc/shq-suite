@@ -19,6 +19,7 @@
 #include "bus.h"
 #include "devices.h"
 #include "diag.h"
+#include "fault.h"
 #include "mono.h"
 #include "http_api.h"
 #include "version.h"
@@ -285,6 +286,96 @@ void setup() {
   }
 }
 
+
+// ---- fault evaluation ----------------------------------------------------
+
+// Free heap below this and a WS reconnect (TLS-free, but still a socket plus JSON buffers) starts
+// failing. Well above the ~97 kB minimum this fleet has actually touched.
+static constexpr uint32_t FAULT_HEAP_LOW_BYTES = 60000;
+static constexpr uint32_t FAULT_HEAP_CLEAR_BYTES = 80000;
+
+// Clock liveness, counted in LOOP ITERATIONS rather than milliseconds — timing the clock against
+// itself would be circular, and the clock is the thing under suspicion (ledger shq-suite-0041).
+// mono's re-baseline should make this unreachable; it is the backstop that proves it, and the
+// only signal that would have named Bed 2's nine-hour wedge while it was happening. The loop runs
+// at kHz, so a genuine millisecond tick arrives within a few dozen iterations; twenty thousand
+// without one cannot happen on a working clock.
+static constexpr uint32_t CLOCK_STALL_LOOPS = 20000;
+static uint32_t g_clock_last_ms = 0;
+static uint32_t g_clock_same_loops = 0;
+
+// The clock check runs every pass (an integer compare); everything else is polled on a loop
+// COUNT, not a timer, so the fault evaluator keeps working when the clock is the thing that
+// broke — and so the hot path never pays for a heap query or a table walk per iteration.
+static constexpr uint32_t FAULT_POLL_LOOPS = 512;
+static uint32_t g_fault_poll = 0;
+static constexpr uint32_t FAULT_HEAP_EVERY_N_POLLS = 8;
+static uint32_t g_heap_poll = 0;
+
+static void updateFaults(uint32_t now_ms) {
+  char detail[fault::DETAIL_MAX];
+
+  if (now_ms == g_clock_last_ms) {
+    if (g_clock_same_loops < CLOCK_STALL_LOOPS) g_clock_same_loops++;
+  } else {
+    g_clock_last_ms = now_ms;
+    g_clock_same_loops = 0;
+    fault::clear(fault::Code::ClockStalled);
+  }
+  if (g_clock_same_loops >= CLOCK_STALL_LOOPS) {
+    snprintf(detail, sizeof(detail), "pinned at %lu s", (unsigned long)(now_ms / 1000));
+    fault::raise(fault::Code::ClockStalled, detail);
+  }
+
+  if (++g_fault_poll < FAULT_POLL_LOOPS) return;
+  g_fault_poll = 0;
+
+  // Latched, not live: both are historical facts about a clock that misbehaved and was handled.
+  // They stay up until a reboot or POST /clear, because "it happened while you weren't looking"
+  // is exactly the thing that went unreported for nine hours.
+  if (mono::rebases() > 0) {
+    snprintf(detail, sizeof(detail), "%lu x, last %ld ms", (unsigned long)mono::rebases(),
+             (long)mono::lastRebaseMs());
+    fault::raise(fault::Code::ClockRebase, detail);
+  }
+  if (mono::wordSteps() > 0) {
+    snprintf(detail, sizeof(detail), "%lu x, last %u high-word units",
+             (unsigned long)mono::wordSteps(), (unsigned)mono::lastWordUnits());
+    fault::raise(fault::Code::ClockWordStep, detail);
+  }
+
+  // A controller with motors configured and none answering is not doing its job, whatever the
+  // network thinks of it. Motors go offline on their own sweep timer, so this needs no debounce.
+  devices::DeviceTable& t = bus::table();
+  size_t online = 0;
+  for (size_t i = 0; i < t.count(); i++) {
+    devices::Device* d = t.at(i);
+    if (d != nullptr && d->online) online++;
+  }
+  if (t.count() > 0 && online == 0) {
+    snprintf(detail, sizeof(detail), "0/%u motors answering", (unsigned)t.count());
+    fault::raise(fault::Code::BusOffline, detail);
+  } else {
+    fault::clear(fault::Code::BusOffline);
+  }
+
+  // Heap is sub-sampled again on top of the 512-loop poll. `ESP.getFreeHeap()` takes a HEAP LOCK,
+  // which is why diag::tick() already rate-limits its own read to 1 Hz; the main loop runs at
+  // ~1 kHz, so polling heap every 512 iterations would take that lock at ~2 Hz — twice diag's
+  // deliberate limit, on hardware whose RS485 relay is timing-critical. One read per 8 polls is
+  // ~0.25 Hz, comfortably below it, and heap simply does not move fast enough to care.
+  if (++g_heap_poll >= FAULT_HEAP_EVERY_N_POLLS) {
+    g_heap_poll = 0;
+    const uint32_t heap = ESP.getFreeHeap();
+    if (heap < FAULT_HEAP_LOW_BYTES) {
+      snprintf(detail, sizeof(detail), "%lu bytes free", (unsigned long)heap);
+      fault::raise(fault::Code::HeapLow, detail);
+    } else if (heap > FAULT_HEAP_CLEAR_BYTES) {
+      fault::clear(fault::Code::HeapLow);
+    }
+  }
+}
+
 void loop() {
   // Phase timing (ledger shq-suite-0038). A WS client evicted for a late pong is indistinguishable
   // from a dead one unless you know whether THIS loop was stalled at the time — and knowing which
@@ -307,6 +398,7 @@ void loop() {
     http_ms = t_ws - t_http;
     ws_ms = t_end - t_ws;
   }
+  updateFaults(t_start);
   diag::noteLoop((uint32_t)(mono::now() - t_start), ota_ms, http_ms, ws_ms);
   // The SDN bus runs on its own FreeRTOS task (bus::begin) — see bus.cpp.
 }

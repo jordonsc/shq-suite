@@ -7,20 +7,21 @@
 //
 // Strong `extern "C"` symbol in section .rodata_desc → the linker resolves esp_app_desc from
 // here and never pulls the prebuilt arduino-lib-builder copy from libesp_app_format.a. This
-// firmware has no semver macro, so version carries the build date.
-//
-// NOTE: this file must be touched whenever you want the descriptor's date to refresh.
-// PlatformIO caches object files by content hash, so an unchanged app_desc.cpp keeps its
-// OLD __DATE__/__TIME__ even when the rest of the image rebuilds — which makes the
-// descriptor disagree with the `fw=` string in /stats (that one comes from main.cpp and
-// does refresh). Generation marker, bump on each flash: ws_guard reorder + BSSID (1.8.0-era).
+// The descriptor's `version` now carries ACTRON_FW_VERSION (fw 1.10.0), matching the somfy twin.
+// This also closes a caching trap that used to need a manual workaround: PlatformIO caches object
+// files by content hash, so while `version` was `__DATE__` an unchanged app_desc.cpp kept its OLD
+// build date even when the rest of the image rebuilt, leaving the descriptor disagreeing with the
+// `fw=` string in /stats. Including version.h means a semver bump now recompiles this file, which
+// refreshes the date as a side effect — bump the version and the descriptor follows.
 
 #include <esp_app_desc.h>
+
+#include "version.h"
 
 extern "C" const __attribute__((section(".rodata_desc"))) __attribute__((used))
 esp_app_desc_t esp_app_desc = {
     .magic_word = ESP_APP_DESC_MAGIC_WORD,
-    .version = __DATE__,
+    .version = ACTRON_FW_VERSION,
     .project_name = "actron-mitm",
     .time = __TIME__,
     .date = __DATE__,

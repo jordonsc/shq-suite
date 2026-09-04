@@ -10,6 +10,7 @@
 #include "bus.h"
 #include "devices.h"
 #include "diag.h"
+#include "fault.h"
 #include "mono.h"
 #include "sdn.h"
 #include "ws_guard.h"
@@ -273,6 +274,15 @@ void handleCommand(uint8_t client, JsonDocument& doc) {
     sendAck(client, id);
     return;
   }
+  if (strcmp(command, "reboot") == 0) {
+    // Ack first so HA sees the command land — the reply has to clear the socket before the stack
+    // goes down. wifi_prov::noteReboot() persists the reason, so the next boot's /stats `note=`
+    // says this was deliberate rather than a crash.
+    sendAck(client, id);
+    delay(100);
+    wifi_prov::noteReboot("ws-command");
+    return;
+  }
   if (strcmp(command, "reconnect_wifi") == 0) {
     // Ack first; wifi_prov drops + re-scans from loop() once this reply has flushed. The link
     // bounce drops this WS connection — the HA coordinator reconnects (heartbeat-reaped) and the
@@ -341,6 +351,11 @@ void sendHealth() {
   obj["skipped_writes"] = g_server->skippedWrites();
   obj["deferred_reaps"] = g_server->deferredReaps();
   obj["hb_tx"] = g_hb_broadcasts;
+  // Device-level fault (fw 1.10.0, ledger shq-suite-0041). "ok" when clear. This is the signal
+  // that was missing when Bed 2's clock wedged for nine hours with every indicator green.
+  obj["fault"] = fault::registry().worstSlug();
+  obj["fault_detail"] = fault::registry().worstDetail();
+  obj["fault_mask"] = fault::registry().mask();
   obj["fw"] = SOMFY_FW_VERSION " " __DATE__ " " __TIME__;
   String out;
   serializeJson(doc, out);
@@ -351,6 +366,7 @@ void onEvent(uint8_t client, WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
     case WStype_CONNECTED: {
       g_conn_events++;
+      wifi_prov::noteInbound();  // a completed handshake is inbound traffic (netwatch)
       const IPAddress ip = g_server->remoteIP(client);
       diag::noteWsConnect(client, ip.toString().c_str(), g_server->connectedClients());
       sendStateTo(client);
@@ -370,12 +386,15 @@ void onEvent(uint8_t client, WStype_t type, uint8_t* payload, size_t length) {
       // Proof the peer answered our reaper's ping. Its absence is what gets a client evicted, so
       // the age of the last one is the primary evidence in a disconnect classification.
       diag::noteWsPong(client);
+      wifi_prov::noteInbound();
       break;
     case WStype_PING:
       diag::noteWsRx(client);
+      wifi_prov::noteInbound();
       break;
     case WStype_TEXT: {
       diag::noteWsRx(client);
+      wifi_prov::noteInbound();
       JsonDocument doc;
       DeserializationError e = deserializeJson(doc, payload, length);
       if (e) { sendError(client, nullptr, "invalid JSON"); return; }
@@ -465,6 +484,7 @@ void loop() {
   // continuously for WEDGE_REBOOT_MS, the server can no longer accept the HA coordinator — reboot
   // to self-heal. Any drop below the cap resets the timer, so only a genuine stuck-full state trips.
   if (g_server->connectedClients() >= WEBSOCKETS_SERVER_CLIENT_MAX) {
+    fault::raise(fault::Code::WsCapacity, "all client slots occupied");
     if (g_at_capacity_since_ms == 0) {
       g_at_capacity_since_ms = t;
     } else if ((uint32_t)(t - g_at_capacity_since_ms) >= WEDGE_REBOOT_MS) {
@@ -475,6 +495,7 @@ void loop() {
       wifi_prov::noteReboot("ws-wedge");
     }
   } else {
+    fault::clear(fault::Code::WsCapacity);
     g_at_capacity_since_ms = 0;
   }
 }

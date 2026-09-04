@@ -56,7 +56,7 @@ firmware streams NEO-response bytes through `bridge::StreamingBridge`, substitut
 register values inline and re-stamping the Modbus CRC on the fly so the indoor board sees a
 valid frame. This is the path for **per-zone setpoint writes** that 0x67/pulse can't reach.
 The streaming-CRC injector and the state decoder are unit-tested on the host
-(`pio test -e native`, 38 cases — 21 bridge + 10 state + 7 mono). Bridge and 0x67 emulator are
+(`pio test -e native`, 66 cases — 21 bridge + 10 state + 11 mono + 8 fault + 16 netwatch). Bridge and 0x67 emulator are
 **mutually exclusive** (both would drive UART1 TX) — switching to non-OFF bridge
 auto-disarms `/armwrite`.
 
@@ -230,9 +230,14 @@ block on it, and why simply raising the stall grace to 10 s would have been the 
 Twin of `somfy-sdn/src/diag.{h,cpp}` (ported there in somfy fw 1.6.0) — **keep the two in step**,
 same standing rule as `mono.{h,cpp}`.
 
-Both twins carry the `clk_back` fix (`clockGlitchTotal()` counts torn + jump only, never
-`mono::backwardReads()` — ledger shq-suite-0039); it is inert here (`bridgeTask` never calls
-`mono::now()`, so `clk_back` stays 0) and load-bearing on somfy, where the bus task drives it to
+Both twins exclude `clk_back` from `clockGlitchTotal()` (which now counts `clk_word` + `clk_rebase`
++ `clk_jump`). **The original reason was wrong:** shq-suite-0039 called `clk_back` a meaningless
+race artifact running at ~72/s on somfy; a 2026-09-01 fleet sweep put the true healthy floor at
+192–853 over four days, and the device 0039 measured was pinned at the time. Superseded by
+shq-suite-0041. It stays out of the ring because it is the raw symptom and would fire a record per
+tick during a fault, but **read it as a rate** — it is the cheapest fingerprint of a pinned clock.
+On this firmware it sits at a true zero (`bridgeTask` never calls `mono::now()`), which makes any
+non-zero reading here more significant than on somfy, where the bus task drives it to
 ~72/s. Source and flashed binary are in step as of 2026-08-24 00:39 (the shq-suite-0038 fix
 build — dirty-flag port + `WEBSOCKETS_TCP_TIMEOUT=500` + diag wrap guard).
 
@@ -447,7 +452,8 @@ ESP32-C6 needs the **pioarduino** platform fork (pinned in `platformio.ini`; bum
 | Endpoint | Purpose |
 |----------|---------|
 | `GET /` | help + status |
-| `GET /stats` | one-line status; starts `# app=actron-mitm …`. Carries `heap/minheap/maxblk/uptime`, `ws/ws_conn/ws_disc/ws_err`, and (2026-08-19) `hb_age`/`hb_tx` + `clk_torn`/`clk_back`/`clk_jump`/`clk_jumpms`, and (2026-08-23) `sock`/`loop_max`/`http_max`/`stalls`/`pongto`/`peerclose`/`txerr`/`wifi_disc`/`diag_seq` |
+| `GET /stats` | one-line status; starts `# app=actron-mitm …`. Carries `heap/minheap/maxblk/uptime`, `ws/ws_conn/ws_disc/ws_err`, and (2026-08-19) `hb_age`/`hb_tx` + `clk_torn`/`clk_back`/`clk_jump`/`clk_jumpms`, and (2026-08-23) `sock`/`loop_max`/`http_max`/`stalls`/`pongto`/`peerclose`/`txerr`/`wifi_disc`/`diag_seq`; **1.10.0** replaces `clk_torn` with `clk_word`/`clk_rebase`/`clk_rebase_ms`, adds `deferred=` and `fault=`/`fault_detail=`, and `fw=` now carries the semver; **1.11.0** adds `nw_fail`/`nw_probes`/`nw_recover`/`nw_reason` (network-stack watchdog, see `src/netwatch.{h,cpp}`) |
+| `POST /reboot` | deliberate restart (`?reason=`). **Costs A/C control for ~8-30 s:** this bridge sits between a physically cut RS485 bus, so while the ESP32 is down the NEO<->indoor-board link is severed, not passed through. Prefer zones off — the same precaution every OTA flash of this device takes (ledger shq-suite-0034). Out-of-band by design: WS is exactly what dies in the failure modes worth rebooting for — on the somfy twin's nine-hour clock wedge WS was dead throughout while HTTP answered instantly (ledger shq-suite-0041) |
 | `GET /diag` | **self-diagnostics** — health line + the event ring, newest last. Reachable when the WS layer is precisely what has stopped working |
 | `GET /diag.json` | same, machine-readable (`{"health":{…},"events":[…]}`) |
 | `GET /stats.json` | machine-readable identity + status (`app`/`model`/`mac`/`ip`/`fw`/`rssi`/`bridge`) — uniform with somfy-sdn so any TinyC6 on the LAN is positively identifiable |
@@ -536,6 +542,23 @@ The HTTP API stays usable for RE work — it doesn't affect bridge state or the 
 
 ## Remote reflash (OTA)
 
+> ### 🚫 NEVER FLASH OR REBOOT THIS DEVICE WITH THE A/C RUNNING. Turn every zone off first.
+>
+> **Confirmed behaviour, not a precaution:** this bridge sits between a **physically cut** RS485
+> bus, and `handleUpdate` suspends the bridge task for the whole download and drains both UART
+> FIFOs — so the NEO<->indoor-board control bus is dead from the `/update` call until the device is
+> back, **~20-45 s**, not merely the reboot. With the controller gone the indoor unit does not
+> hold and does not fail safe: **it keeps blasting air until the controller returns.** In heating
+> that means an uncontrolled heat dump into the house, and nothing in HA can stop it because HA's
+> only path to the unit is the device being flashed.
+>
+> This applies to `POST /update`, `POST /reboot`, the HA Reboot button, and the WS `reboot`
+> command equally — anything that takes the ESP32 down. Check `climate.actron_ac_*` for any zone
+> not `off` and any `hvac_action` not `off` BEFORE touching it. Ledger shq-suite-0042.
+>
+> The somfy twin has no equivalent cost: it is an ordinary bus participant, so its motors simply
+> stop being polled while it is away. The rule is specific to the MITM design.
+
 Device is in the wall (off USB). ArduinoOTA (espota) is compiled in but **can't be driven from
 the WSL dev box** — WSL's NAT means the device can't connect back to it. So we use **HTTP-pull
 OTA**: a tiny file server on **atlas** (`jordonsc@REDACTED-IP`, same LAN) hosts the firmware and
@@ -577,8 +600,13 @@ push directly: `pio run -e um_tinyc6_ota -t upload`.
 | `src/state.h` / `src/state.cpp` | Pure C++ NEO frame decoder — parses page-1/page-2 func-03 responses into a `ControllerState` struct (mode/fan/setpoints/zones/temps) per FINDINGS §7. Used by ws_api to publish state and tick transitions. Host-testable. |
 | `src/ws_api.h` / `src/ws_api.cpp` | WebSockets server on port 8767 — JSON command/state schema, transition table with per-field `*_transitioning` values, write orchestration mapping each command to the LOCAL-CONTROL-RECIPES recipes. Bridge stays in INJECT permanently; pulse rules auto-expire, persistent rules (zone setpoints) are cleared on board adoption or `GRACE_PERIOD_MS` timeout. **WS liveness (2026-07-13):** `begin()` calls `enableHeartbeat(15000,5000,2)` to evict half-open zombie clients (a WiFi blip leaving a client's TCP half-open, no FIN). **This was NOT the actual cure for the recurring ~30 s `unavailable` flaps** — root cause (found 2026-07-19) is `bridgeTask` loop-starvation, fixed by the yield budget in `main.cpp` (see the "Yield budget" note up top); the heartbeat can't help when the WS loop that *sends* it is the starved thing. Kept as belt-and-braces for genuine half-open clients. Plus a **wedge-watchdog**: `loop()` reboots if all `WEBSOCKETS_SERVER_CLIENT_MAX` (5) slots stay occupied continuously for 5 min (backstop to the client-side leak fixed in `actron_mitm_controller` 1.1.1; any drop below the cap resets the timer, so it can't boot-loop). Both ported from `somfy-sdn/src/ws_api.cpp` (fw 1.1.5 + 1.3.0). See ledger shq-suite-0019. **Heartbeat-wedge fix (2026-08-19, ledger shq-suite-0034):** the periodic push is now gated on an *unsigned* elapsed test and `now_ms()` returns `mono::now()` — see the Regression #2 note up top for why the signed form wedged for hours. `hb_age`/`hb_tx` in `/stats` say whether the push is alive. |
 | `src/diag.h` / `src/diag.cpp` | **Self-diagnostics** (ledger shq-suite-0038; twin ported to somfy-sdn fw 1.6.0) — WS disconnect classification with the machine's condition attached, loop/HTTP phase-stall timing, an lwIP spare-socket probe, and a 48-entry event ring served at `/diag`, `/diag.json`, and pushed over WS (live + replayed as a backlog on connect). Twin of `somfy-sdn/src/diag.{h,cpp}` — keep them in step; note the source-ahead-of-binary warning in that section. |
-| `src/mono.h` / `src/mono.cpp` | Pure C++ glitch-filtered monotonic clock (twin of `somfy-sdn/src/mono.{h,cpp}` — keep them in step). `mono::now()` backs `ws_api`'s `now_ms()`, so every transition deadline and the heartbeat stamp are immune to a single far-future `millis()` read. Host-tested. |
-| `test/test_mono/test_mono.cpp` | Unity host-side tests for the clock filter. 7 cases: normal progression, a far-future glitch in either sample, backwards reads, a genuine long stall being accepted, torn tolerance, 49.7-day wrap. |
+| `src/mono.h` / `src/mono.cpp` | Pure C++ fault-tolerant monotonic clock (twin of `somfy-sdn/src/mono.{h,cpp}` — keep them in step). `mono::now()` backs `ws_api`'s `now_ms()`. Rejects high-word clock faults (an exact multiple of 2^32 us, either direction) and **re-baselines instead of clamping for ever** — the unbounded clamp is what turned a 25,769 s backward step into a nine-hour outage on the somfy twin (ledger shq-suite-0041). Host-tested. |
+| `src/fault.h` / `src/fault.cpp` | Pure C++ device-level fault registry (twin of `somfy-sdn/src/fault.{h,cpp}`). Severity-ordered bitmask + one-line detail, surfaced in `/stats` (`fault=`/`fault_detail=`), the WS health push, and HA's `sensor.actron_ac_fault` + `binary_sensor.actron_ac_problem`. The evaluator lives in `main.cpp` (`updateFaults`). |
+| `src/netwatch.h` / `src/netwatch.cpp` | Pure C++ network-stack watchdog policy (fw 1.11.0, ledger shq-suite-0044; twin of `somfy-sdn/src/netwatch.{h,cpp}` — keep in step). Re-associates the WiFi link on an adopted backward clock step >= 60 s, on the gateway going unanswered for 3 min with nothing inbound over WS, or on heap < 60 kB for 10 min. **The reboot tier is OFF on this device** (`netwatch::Policy(false)` in `wifi_prov.cpp`): the relay must never restart with the A/C running, so a persistent fault repeats the re-association instead, which only touches WiFi. Glue (gateway ICMP probe via `esp_ping`, the `reassociate()` action, `noteInbound()` from `ws_api`) lives in `wifi_prov.cpp`. Why: the somfy twin's Bed 2 controller died with the STA link UP — associated, sending a gratuitous ARP a minute, answering nothing — after a backward clock step blacked out the IDF's own timers and the WiFi driver leaked for 18 h; a re-association cured it instantly and the leak did not resume. **Source only — NOT yet flashed** (the in-wall bridge is still on its pre-1.10.0 build; flashing needs every zone off). |
+| `src/version.h` | `ACTRON_FW_VERSION`, introduced at **1.10.0** to match the somfy twin's generation. This firmware previously reported only its build date, which made "did the OTA take?" a question about timestamps. `app_desc.cpp` now carries the semver too, which also closes the PlatformIO content-hash trap that used to freeze the descriptor's `__DATE__`. |
+| `test/test_mono/test_mono.cpp` | Unity host-side tests for the clock filter. 11 cases: normal progression, the high-word detector at its boundaries, a backward and a forward high-word step rejected on first read, a PERSISTENT high-word step re-baselining, single vs sustained backward reads, isolated backward reads never re-baselining, a genuine long stall accepted, 49.7-day wrap. |
+| `test/test_fault/test_fault.cpp` | Unity host-side tests for the fault registry. 8 cases, the load-bearing one being severity ordering: a low-heap notice must never mask a dead clock. |
+| `test/test_netwatch/test_netwatch.cpp` | Unity host-side tests for the network-stack watchdog policy. 16 cases: a large backward step re-associates and a small one does not; unreachable re-associates then reboots, and a probe success cancels the reboot; inbound WS traffic vetoes failed probes and an HA outage alone never acts; heap-low with hysteresis; the reboot tier disabled repeats re-associations on the cooldown. |
 | `test/test_bridge/test_bridge.cpp` | Unity host-side tests for the bridge logic. 21 cases covering passthrough, injection, CRC re-stamping, multi-rule, boundary registers, mid-frame gap reset, pulse expiry, replay templates. Run with `pio test -e native`. |
 | `test/test_state/test_state.cpp` | Unity host-side tests for the NEO state decoder. 10 cases covering frame validation (CRC / addr / func / bytecount), page-1 + page-2 field decode, zone enable mask change, active-array setpoint helper, mode/fan name roundtrip. Run with `pio test -e native`. |
 | `WIRING.md` | step-by-step T568B pass-through tap wiring guide (tap-mode, single transceiver). The cut-bus MITM tap layout is documented in the FINDINGS / root project CLAUDE.md until it earns its own diagram. |

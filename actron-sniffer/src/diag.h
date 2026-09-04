@@ -90,6 +90,9 @@ enum class Event : uint8_t {
                      // `value` = how long it had been unwritable (shq-suite-0038)
   ApChange,          // the station associated to a different BSSID; `value` = lifetime roam
                      // count, `ip` = the NEW bssid, previous one in the serial log
+  NetRecover,        // the network-stack watchdog acted (fw 1.11.0, shq-suite-0044); `ip` =
+                     // the reason ("clock-step", "unreachable", "heap-low"), `value` =
+                     // re-associations so far.
 };
 
 // Why a socket died. Inferred, and deliberately conservative: `Unknown` is preferred to a
@@ -154,6 +157,11 @@ void noteWsRx(uint8_t client_id);        // any inbound frame => the peer is ali
 void noteWsTx();                         // a state push went to every client
 
 void noteWifi(bool up, int rssi);
+
+// The network-stack watchdog is about to re-associate for `reason`; `recoveries` is its
+// lifetime re-association count. Recorded BEFORE the action so the heap/rssi stamp shows the
+// state that triggered it.
+void noteNetRecover(const char* reason, uint32_t recoveries);
 
 // ---- ring access -------------------------------------------------------
 

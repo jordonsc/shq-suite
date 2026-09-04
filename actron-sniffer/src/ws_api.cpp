@@ -7,6 +7,9 @@
 #include <cstring>
 
 #include "diag.h"
+#include "wifi_prov.h"
+#include "fault.h"
+#include "version.h"
 #include "mono.h"
 #include "ws_guard.h"
 
@@ -344,7 +347,12 @@ void sendHealth() {
   obj["skipped_writes"] = server.skippedWrites();
   obj["deferred_reaps"] = server.deferredReaps();
   obj["hb_tx"] = hb_broadcasts_;
-  obj["fw"] = __DATE__ " " __TIME__;
+  // Device-level fault (fw 1.10.0, ledger shq-suite-0041). "ok" when clear. This is the signal
+  // that was missing when the somfy twin's clock wedged for nine hours with every indicator green.
+  obj["fault"] = fault::registry().worstSlug();
+  obj["fault_detail"] = fault::registry().worstDetail();
+  obj["fault_mask"] = fault::registry().mask();
+  obj["fw"] = ACTRON_FW_VERSION " " __DATE__ " " __TIME__;
   String out;
   serializeJson(doc, out);
   server.broadcastWritableTXT(out);
@@ -507,6 +515,23 @@ void handleCommand(uint8_t client_id, JsonDocument& cmd) {
     return;
   }
 
+  if (strcmp(command, "reboot") == 0) {
+    // Ack first so HA sees the command land — the reply has to clear the socket before the stack
+    // goes down.
+    //
+    // NOTE THE COST, which is real and specific to this firmware: this bridge sits between a
+    // PHYSICALLY CUT RS485 bus, so while the ESP32 is down the NEO<->indoor-board link is SEVERED,
+    // not passed through. A reboot is ~8-30 s during which the A/C has no control bus at all.
+    // Prefer to reboot with the zones off. (The somfy twin has no such cost — it is an ordinary
+    // bus participant and the motors simply stop being polled.)
+    sendAck(client_id, cmd["id"]);
+    Serial.println("# reboot requested (ws-command)");
+    Serial.flush();
+    delay(100);
+    ESP.restart();
+    return;
+  }
+
   JsonObject obj = cmd.as<JsonObject>();
   const char* error_msg = "unknown command";
   bool ok = false;
@@ -623,6 +648,7 @@ void onEvent(uint8_t client_id, WStype_t type, uint8_t* payload, size_t length) 
   switch (type) {
     case WStype_CONNECTED: {
       connect_events_++;
+      wifi_prov::noteInbound();  // a completed handshake is inbound traffic (netwatch)
       const IPAddress ip = server.remoteIP(client_id);
       diag::noteWsConnect(client_id, ip.toString().c_str(), server.connectedClients());
       sendStateToClient(client_id, current_state_);
@@ -642,12 +668,15 @@ void onEvent(uint8_t client_id, WStype_t type, uint8_t* payload, size_t length) 
       // Proof the peer answered our reaper's ping. Its absence is what gets a client evicted, so
       // the age of the last one is the primary evidence in a disconnect classification.
       diag::noteWsPong(client_id);
+      wifi_prov::noteInbound();
       break;
     case WStype_PING:
       diag::noteWsRx(client_id);
+      wifi_prov::noteInbound();
       break;
     case WStype_TEXT: {
       diag::noteWsRx(client_id);
+      wifi_prov::noteInbound();
       JsonDocument doc;
       DeserializationError err = deserializeJson(doc, payload, length);
       if (err) {
@@ -782,6 +811,7 @@ void loop() {
   // continuously for WEDGE_REBOOT_MS, the server can no longer accept the HA coordinator — reboot
   // to self-heal. Any drop below the cap resets the timer, so only a genuine stuck-full state trips.
   if (server.connectedClients() >= WEBSOCKETS_SERVER_CLIENT_MAX) {
+    fault::raise(fault::Code::WsCapacity, "all client slots occupied");
     if (at_capacity_since_ms_ == 0) {
       at_capacity_since_ms_ = t;
     } else if ((uint32_t)(t - at_capacity_since_ms_) >= WEDGE_REBOOT_MS) {
@@ -792,6 +822,7 @@ void loop() {
       ESP.restart();
     }
   } else {
+    fault::clear(fault::Code::WsCapacity);
     at_capacity_since_ms_ = 0;
   }
 }

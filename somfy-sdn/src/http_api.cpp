@@ -14,6 +14,7 @@
 #include "bus.h"
 #include "devices.h"
 #include "diag.h"
+#include "fault.h"
 #include "mono.h"
 #include "sdn.h"
 #include "version.h"
@@ -95,24 +96,33 @@ String statusLine() {
            // library seeing a DISCONNECTED. reset/note say why THIS boot happened.
            "heap=%u minheap=%u maxblk=%u uptime=%lus "
            "ws=%u ws_conn=%u ws_disc=%u ws_err=%u "
-           // Heartbeat health + clock-glitch counters (fw 1.5.1, ledger shq-suite-0034).
+           // Heartbeat health + clock-fault counters (fw 1.10.0, ledger shq-suite-0041).
            // hb_age should stay under ~10 s; anything larger means the state push has stalled
-           // and HA is about to start its 40 s unavailable/available flap. clk_torn/clk_jump
-           // count the bad millis() reads that used to cause exactly that.
-           "hb_age=%u hb_tx=%u clk_torn=%u clk_back=%u clk_jump=%u clk_jumpms=%u "
+           // and HA is about to start its 40 s unavailable/available flap. clk_word counts
+           // rejected high-word clock faults, clk_rebase counts clamps we abandoned because the
+           // clock had genuinely moved, clk_rebase_ms is the signed size of the newest such step.
+           "hb_age=%u hb_tx=%u clk_back=%u clk_word=%u clk_rebase=%u clk_rebase_ms=%ld "
+           "clk_jump=%u clk_jumpms=%u "
            "wifi_disc=%u wifi_reason=%u reset=%s note=%s "
            // Self-diagnostics summary (ledger shq-suite-0038). `sock` is spare lwIP sockets — 0
            // means the pool HTTP and WS share is exhausted. `loop_max`/`http_max` are the worst
            // main-loop and HTTP-pump stalls since boot; anything near the 5 s pong deadline
            // explains an eviction. `pongto`/`peerclose`/`txerr` split the disconnects by who
-           // caused them. Full records at /diag. NOTE clk_back above is noise on this firmware —
-           // the bus task races the unsynchronised clock filter (shq-suite-0039); judge the
-           // millis glitch on clk_torn/clk_jump only.
+           // caused them. Full records at /diag. READ clk_back AS A RATE: a healthy controller
+           // gathers a few hundred over four days, and thousands per second is a clock pinned
+           // right now — that is what a nine-hour Bed 2 outage looked like (shq-suite-0041).
            "sock=%u loop_max=%u http_max=%u stalls=%u "
            "pongto=%u peerclose=%u txerr=%u reaps=%u skipped=%u deferred=%u "
            // Station-side AP association (fw 1.8.0). The UniFi controller client list has
            // been seen disagreeing with the station; the station wins (wiki shq-network.md).
            "bssid=%s roams=%u diag_seq=%u "
+           // Network-stack watchdog (fw 1.11.0, shq-suite-0044): consecutive unanswered gateway
+           // probes, probes sent, re-associations performed, and the newest reason. nw_fail
+           // climbing with the link up is the associated-but-unreachable signature.
+           "nw_fail=%u nw_probes=%u nw_recover=%u nw_reason=%s "
+           // Device-level fault (fw 1.10.0). "ok" when clear; otherwise the worst active code
+           // and its one-line detail. This is what HA's fault sensor mirrors.
+           "fault=%s fault_detail=\"%s\" "
            "rssi=%d ip=%s fw=\"%s\"",
            APP_ID, modeStr(), (unsigned)t.count(), (unsigned)online,
            st.tx_frames, st.rx_frames, st.polls,
@@ -123,7 +133,8 @@ String statusLine() {
            (unsigned)ws_api::connectedClients(), (unsigned)ws_api::connectEvents(),
            (unsigned)ws_api::disconnectEvents(), (unsigned)ws_api::errorEvents(),
            (unsigned)ws_api::heartbeatAgeMs(), (unsigned)ws_api::heartbeatBroadcasts(),
-           (unsigned)mono::tornReads(), (unsigned)mono::backwardReads(),
+           (unsigned)mono::backwardReads(), (unsigned)mono::wordSteps(),
+           (unsigned)mono::rebases(), (long)mono::lastRebaseMs(),
            (unsigned)mono::forwardJumps(), (unsigned)mono::lastJumpMs(),
            (unsigned)wifi_prov::staDisconnectCount(), (unsigned)wifi_prov::lastDisconnectReason(),
            resetReasonStr(), wifi_prov::bootNote(),
@@ -133,6 +144,9 @@ String statusLine() {
            (unsigned)ws_api::skippedWrites(), (unsigned)ws_api::deferredReaps(),
            diag::currentBssid(), (unsigned)diag::wifiRoams(),
            (unsigned)diag::lastSeq(),
+           (unsigned)wifi_prov::netProbeFailures(), (unsigned)wifi_prov::netProbes(),
+           (unsigned)wifi_prov::netRecoveries(), wifi_prov::netLastReason(),
+           fault::registry().worstSlug(), fault::registry().worstDetail(),
            WiFi.isConnected() ? WiFi.RSSI() : 0,
            WiFi.localIP().toString().c_str(), SOMFY_FW_VERSION " (" __DATE__ " " __TIME__ ")");
   return String(buf);
@@ -282,6 +296,7 @@ void handleHelp() {
   b += "POST /reconnect                  re-scan + reassociate to the strongest AP\n";
   b += "POST /update?url=<bin>            HTTP-pull OTA\n";
   b += "POST /clear                      reset ring buffers + counters\n";
+  b += "POST /reboot?reason=<text>        deliberate restart (reason lands in next boot note=)\n";
   b += "\n# mutating endpoints are POST; curl -X POST (query args still parse)\n";
   g_server->send(200, "text/plain", b);
 }
@@ -322,10 +337,22 @@ void handleStatsJson() {
   doc["hb_age_ms"] = ws_api::heartbeatAgeMs();
   doc["hb_tx"] = ws_api::heartbeatBroadcasts();
   JsonObject clk = doc["clk"].to<JsonObject>();
-  clk["torn"] = mono::tornReads();
   clk["back"] = mono::backwardReads();
+  clk["word_steps"] = mono::wordSteps();
+  clk["last_word_units"] = mono::lastWordUnits();
+  clk["rebases"] = mono::rebases();
+  clk["last_rebase_ms"] = mono::lastRebaseMs();
   clk["jumps"] = mono::forwardJumps();
   clk["last_jump_ms"] = mono::lastJumpMs();
+  JsonObject flt = doc["fault"].to<JsonObject>();
+  flt["code"] = fault::registry().worstSlug();
+  flt["detail"] = fault::registry().worstDetail();
+  flt["mask"] = fault::registry().mask();
+  JsonObject nw = doc["netwatch"].to<JsonObject>();
+  nw["probe_failures"] = wifi_prov::netProbeFailures();
+  nw["probes"] = wifi_prov::netProbes();
+  nw["recoveries"] = wifi_prov::netRecoveries();
+  nw["last_reason"] = wifi_prov::netLastReason();
   doc["wifi_disc"] = wifi_prov::staDisconnectCount();
   doc["wifi_reason"] = wifi_prov::lastDisconnectReason();
   doc["tx"] = st.tx_frames;
@@ -591,6 +618,18 @@ void handleClear() {
   g_server->send(200, "text/plain", "# cleared\n");
 }
 
+// Deliberate, operator-driven restart (fw 1.10.0). The WS command is the one HA drives; this
+// exists because the WS server is exactly what dies in the failure modes worth rebooting for —
+// during Bed 2's nine-hour clock wedge (shq-suite-0041) WS was dead the whole time while HTTP
+// answered every request instantly. Out-of-band by design.
+void handleReboot() {
+  const String reason = g_server->hasArg("reason") ? g_server->arg("reason") : String("http");
+  g_server->send(200, "text/plain", "# rebooting: " + reason + "\n");
+  g_server->client().flush();
+  delay(100);  // let the response leave before the stack goes down
+  wifi_prov::noteReboot(reason.c_str());
+}
+
 void handleUpdate() {
   if (!g_server->hasArg("url")) {
     g_server->send(400, "text/plain", "# need ?url=http://host:port/firmware.bin\n");
@@ -655,6 +694,7 @@ void begin(uint16_t port) {
   g_server->on("/reconnect", HTTP_POST, handleReconnect);
   g_server->on("/update", HTTP_POST, handleUpdate);
   g_server->on("/clear", HTTP_POST, handleClear);
+  g_server->on("/reboot", HTTP_POST, handleReboot);
   g_server->begin();
 }
 

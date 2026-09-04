@@ -37,4 +37,16 @@ void factoryWipe();
 // Deferred to loop() so a calling HTTP ack flushes before the link drops.
 void requestReconnectBestAp();
 
+// Network-stack watchdog (fw 1.11.0, ledger shq-suite-0044; policy in netwatch.h, twin of the
+// somfy-sdn one). Probes the gateway every minute and re-associates on a large backward clock
+// step, sustained unreachability with the link up, or sustained low heap. NO reboot tier on this
+// device (the relay must never restart with the A/C running, shq-suite-0042). Call noteInbound()
+// on every inbound WS frame or pong: recent inbound traffic vetoes the "unreachable" trigger, so
+// an HA outage or a gateway that drops ICMP can never trip it on its own.
+void noteInbound();
+uint32_t netProbeFailures();   // consecutive gateway probes unanswered (0 when healthy)
+uint32_t netRecoveries();      // watchdog-driven re-associations since boot
+uint32_t netProbes();          // gateway probes sent since boot
+const char* netLastReason();   // reason of the newest watchdog action, "none" until one fires
+
 }  // namespace wifi_prov

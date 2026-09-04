@@ -8,9 +8,30 @@
 #include <WiFi.h>
 #include <esp_mac.h>
 
+#include "lwip/ip_addr.h"
+#include "ping/ping_sock.h"
+
+#include "diag.h"
+#include "mono.h"
+#include "netwatch.h"
+
 namespace wifi_prov {
 
 namespace {
+
+// Network-stack watchdog glue (fw 1.11.0, ledger shq-suite-0044; the policy itself is the pure
+// netwatch::Policy — twin of somfy-sdn/src/wifi_prov.cpp, keep in step). One ICMP echo to the
+// DHCP gateway every NET_PROBE_INTERVAL_MS via the IDF's esp_ping (a short-lived task per probe;
+// the session frees itself in on_ping_end). The probe is deliberately the GATEWAY and not HA: an
+// HA outage must never look like a dead stack. A probe whose callbacks never arrive is counted
+// as failed after NET_PROBE_GIVEUP_MS. THE REBOOT TIER IS OFF ON THIS DEVICE (Policy(false)):
+// the bridge sits on a physically cut RS485 bus and must never reboot with the A/C running
+// (shq-suite-0042), so a persistent fault repeats the re-association instead — which only
+// touches WiFi and leaves the relay untouched.
+constexpr uint32_t NET_PROBE_INTERVAL_MS = 60 * 1000;
+constexpr uint32_t NET_PROBE_TIMEOUT_MS = 2000;
+constexpr uint32_t NET_PROBE_GIVEUP_MS = 10 * 1000;
+constexpr uint32_t NET_TICK_MS = 1000;
 
 // NOTE: unlike the somfy port, there is NO GPIO0 button here — GPIO0 is the NEO-side UART0 RX
 // (PIN_B_RX in main.cpp). Reconfiguring it as a button input kills NEO reception (B.frames=0,
@@ -31,6 +52,62 @@ DNSServer* g_dns = nullptr;
 
 // Set by requestReconnectBestAp() and serviced from loop() so a calling HTTP ack flushes first.
 bool g_reconnect_requested = false;
+
+// Network-stack watchdog state (fw 1.11.0). The ping callbacks run on the ping task; they only
+// write g_probe_result, which the 1 Hz tick in loop() consumes.
+netwatch::Policy g_netwatch(false);  // no reboot tier on the actron bridge — see above
+volatile uint8_t g_probe_result = 0;       // 0 = nothing new, 1 = answered, 2 = unanswered
+bool g_probe_inflight = false;
+uint32_t g_probe_started_ms = 0;
+uint32_t g_last_probe_ms = 0;
+uint32_t g_probes_sent = 0;
+uint32_t g_last_net_tick_ms = 0;
+uint32_t g_inbound_ms = 0;                 // mono::now() of the last inbound WS frame/pong
+bool g_inbound_seen = false;
+
+void onPingSuccess(esp_ping_handle_t, void*) { g_probe_result = 1; }
+void onPingTimeout(esp_ping_handle_t, void*) {
+  if (g_probe_result == 0) g_probe_result = 2;
+}
+void onPingEnd(esp_ping_handle_t h, void*) {
+  if (g_probe_result == 0) g_probe_result = 2;
+  esp_ping_delete_session(h);
+}
+
+// Fire one echo request at the gateway. Failure to even create the session is reported as an
+// unanswered probe: it means the stack could not find the memory for a socket and a task, which
+// is precisely the condition the watchdog exists for.
+void startGatewayProbe() {
+  g_probes_sent++;
+  g_probe_result = 0;
+  g_probe_inflight = true;
+  g_probe_started_ms = mono::now();
+  const IPAddress gw = WiFi.gatewayIP();
+  if ((uint32_t)gw == 0) {
+    g_probe_result = 2;
+    return;
+  }
+  esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
+  ip_addr_set_ip4_u32(&cfg.target_addr, (uint32_t)gw);
+  cfg.count = 1;
+  cfg.interval_ms = 1000;
+  cfg.timeout_ms = NET_PROBE_TIMEOUT_MS;
+  cfg.data_size = 32;
+  esp_ping_callbacks_t cbs = {};
+  cbs.cb_args = nullptr;
+  cbs.on_ping_success = onPingSuccess;
+  cbs.on_ping_timeout = onPingTimeout;
+  cbs.on_ping_end = onPingEnd;
+  esp_ping_handle_t h = nullptr;
+  if (esp_ping_new_session(&cfg, &cbs, &h) != ESP_OK || h == nullptr) {
+    g_probe_result = 2;
+    return;
+  }
+  if (esp_ping_start(h) != ESP_OK) {
+    esp_ping_delete_session(h);
+    g_probe_result = 2;
+  }
+}
 
 void computeHostname() {
   // Suffix from the last 2 octets of the WiFi STA MAC (the unique, NIC-specific bytes — the same
@@ -229,19 +306,77 @@ void startPortal() {
   g_portal->begin();
 }
 
-void serviceReconnect() {
-  if (!g_reconnect_requested) return;
-  g_reconnect_requested = false;
+// Drop the association and rejoin. Shared by the manual reconnect and the network-stack
+// watchdog: this is the exact operation that brought the Bed 2 somfy controller back from the
+// dead on 2026-09-04 (a router-side kick) — the WiFi driver tears down and re-arms its timers
+// against the current clock and frees what it had queued. tryConnect blocks the main loop for a
+// few seconds; the bridge task keeps relaying. WiFi only — the RS485 relay is untouched.
+void reassociate(const char* why) {
   if (g_status != Status::CONNECTED) return;
   String ssid, pass;
   if (!readCreds(ssid, pass)) return;
-  Serial.printf("# WiFi: manual reconnect (was rssi=%d) — re-scanning\n", (int)WiFi.RSSI());
+  Serial.printf("# WiFi: reassociating (%s; was rssi=%d heap=%u) — re-scanning\n", why,
+                (int)WiFi.RSSI(), (unsigned)ESP.getFreeHeap());
   delay(250);
   WiFi.disconnect();
   delay(100);
   tryConnect(ssid, pass);
-  Serial.printf("# WiFi: reconnected ip=%s rssi=%d\n", WiFi.localIP().toString().c_str(),
-                (int)WiFi.RSSI());
+  Serial.printf("# WiFi: reconnected ip=%s rssi=%d heap=%u\n",
+                WiFi.localIP().toString().c_str(), (int)WiFi.RSSI(),
+                (unsigned)ESP.getFreeHeap());
+}
+
+void serviceReconnect() {
+  if (!g_reconnect_requested) return;
+  g_reconnect_requested = false;
+  reassociate("manual");
+}
+
+// The 1 Hz network-stack watchdog tick: launch/collect the gateway probe, feed the policy, act.
+void serviceNetwatch() {
+  if (g_status != Status::CONNECTED) return;
+  const uint32_t now = mono::now();
+  if ((uint32_t)(now - g_last_net_tick_ms) < NET_TICK_MS) return;
+  g_last_net_tick_ms = now;
+
+  netwatch::Probe probe = netwatch::Probe::None;
+  if (g_probe_inflight) {
+    const uint8_t r = g_probe_result;
+    if (r != 0) {
+      probe = (r == 1) ? netwatch::Probe::Ok : netwatch::Probe::Fail;
+      g_probe_inflight = false;
+    } else if ((uint32_t)(now - g_probe_started_ms) >= NET_PROBE_GIVEUP_MS) {
+      probe = netwatch::Probe::Fail;  // callbacks never came: the ping task could not run
+      g_probe_inflight = false;
+    }
+  }
+  const bool link_up = WiFi.isConnected();
+  if (link_up && !g_probe_inflight &&
+      (g_last_probe_ms == 0 || (uint32_t)(now - g_last_probe_ms) >= NET_PROBE_INTERVAL_MS)) {
+    g_last_probe_ms = now;
+    startGatewayProbe();
+  }
+
+  netwatch::Input in;
+  in.now_ms = now;
+  in.link_up = link_up;
+  in.probe = probe;
+  in.rebases = mono::rebases();
+  in.last_rebase_ms = mono::lastRebaseMs();
+  in.heap = ESP.getFreeHeap();
+  in.inbound_age_ms = g_inbound_seen ? (uint32_t)(now - g_inbound_ms) : 0xFFFFFFFFu;
+
+  const netwatch::Verdict v = g_netwatch.step(in);
+  if (v.action == netwatch::Action::Reassociate) {
+    Serial.printf("# netwatch: %s — reassociating (fails=%u heap=%u)\n", v.reason,
+                  (unsigned)g_netwatch.consecutiveFailures(), (unsigned)in.heap);
+    diag::noteNetRecover(v.reason, g_netwatch.recoveries());
+    reassociate(v.reason);
+    g_probe_inflight = false;
+    g_probe_result = 0;
+    g_last_probe_ms = 0;
+  }
+  // Action::Reboot cannot be issued: the policy was built with allow_reboot=false.
 }
 
 }  // namespace
@@ -263,6 +398,7 @@ Status begin() {
 
 void loop() {
   serviceReconnect();
+  serviceNetwatch();
   if (g_status == Status::PORTAL) {
     if (g_dns) g_dns->processNextRequest();
     if (g_portal) g_portal->handleClient();
@@ -270,6 +406,15 @@ void loop() {
 }
 
 void requestReconnectBestAp() { g_reconnect_requested = true; }
+
+void noteInbound() {
+  g_inbound_ms = mono::now();
+  g_inbound_seen = true;
+}
+uint32_t netProbeFailures() { return g_netwatch.consecutiveFailures(); }
+uint32_t netRecoveries() { return g_netwatch.recoveries(); }
+uint32_t netProbes() { return g_probes_sent; }
+const char* netLastReason() { return g_netwatch.lastReason(); }
 
 Status status() { return g_status; }
 bool isConnected() { return g_status == Status::CONNECTED && WiFi.isConnected(); }

@@ -54,6 +54,19 @@ const char* bootNote();
 uint32_t staDisconnectCount();
 uint8_t lastDisconnectReason();
 
+// Network-stack watchdog (fw 1.11.0, ledger shq-suite-0044; policy in netwatch.h). The link
+// watchdog above only sees a DOWN link; Bed 2 died with the link UP — associated, transmitting,
+// answering nothing. This one probes the gateway every NET_PROBE_INTERVAL_MS, re-associates on a
+// large backward clock step / sustained unreachability / sustained low heap, and reboots only if
+// a re-association did not help. Call noteInbound() on every inbound WS frame or pong: recent
+// inbound traffic is proof the stack can receive and vetoes the "unreachable" trigger, which is
+// what stops an HA outage (or a gateway that drops ICMP) from ever tripping it.
+void noteInbound();
+uint32_t netProbeFailures();   // consecutive gateway probes unanswered (0 when healthy)
+uint32_t netRecoveries();      // watchdog-driven re-associations since boot
+uint32_t netProbes();          // gateway probes sent since boot
+const char* netLastReason();   // reason of the newest watchdog action, "none" until one fires
+
 // Load the configured motor addresses ("AA:BB:CC,...") from NVS and register them with the
 // bus device table (CONFIGURED source). Called by main after bus::begin().
 void loadConfiguredMotors();
