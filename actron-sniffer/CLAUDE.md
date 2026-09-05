@@ -18,6 +18,12 @@ mask on the bus** (it's Modbus RTU 9600/8N1; values big-endian). The complete re
 [`FINDINGS.md`](FINDINGS.md) §7. Reachable at `http://REDACTED-IP/` (pinned) /
 `redacted.local`. WiFi creds baked in (SHQ). `FRAME_MAX=512` (whole frames), OTA works.
 
+**Fleet state (2026-09-05 06:25 UTC):** the in-wall bridge runs **fw 1.14.2** (HA `actron_mitm_controller`
+1.9.0), flashed over the air after the whole somfy fleet (12 units) had taken 1.14.2 under the canary rule
+and with every `climate.actron_ac_*` off — the first 1.12+ build to run on the bridge hardware; it came up
+HE20 with `tx_en=15`, fault `ok`, HA reconnected within 90 s. The A/C rule still applies to every future
+flash or reboot of this device.
+
 **✅ Local write control achieved via two independent paths (FINDINGS §9).**
 
 **Path A — 0x67 tap (2026-05-30):** emulate a secondary controller at 0x67 (answer its page-1
@@ -56,7 +62,7 @@ firmware streams NEO-response bytes through `bridge::StreamingBridge`, substitut
 register values inline and re-stamping the Modbus CRC on the fly so the indoor board sees a
 valid frame. This is the path for **per-zone setpoint writes** that 0x67/pulse can't reach.
 The streaming-CRC injector and the state decoder are unit-tested on the host
-(`pio test -e native`, 66 cases — 21 bridge + 10 state + 11 mono + 8 fault + 16 netwatch). Bridge and 0x67 emulator are
+(`pio test -e native`, 87 cases — 21 bridge + 10 state + 11 mono + 8 fault + 16 netwatch + 8 txstats + 5 wifi_proto + 8 ws_liveness). Bridge and 0x67 emulator are
 **mutually exclusive** (both would drive UART1 TX) — switching to non-OFF bridge
 auto-disarms `/armwrite`.
 
@@ -85,7 +91,9 @@ pump without yielding — `BRIDGE_YIELD_BUDGET_MS` (20 ms, preferred, taken betw
 idle-yield already inserts — so relay integrity is preserved even if a forced yield lands
 mid-frame (verified live: A/B frames keep flowing, `rxerr=0`). This makes the 07-13
 `enableHeartbeat` (below) a belt-and-braces extra, not the actual cure — it addressed the wrong
-layer (a starved WS loop can't service heartbeats anyway).
+layer (a starved WS loop can't service heartbeats anyway). **`enableHeartbeat` is gone as of
+fw 1.14.0** — its pong reaper evicted a live HA 10 s into an uplink fade on the somfy twin; the
+keepalive is now ours (`ws_guard.cpp` + `ws_liveness.h`, see "WS liveness" below).
 
 **⚠️ Regression #2 (2026-08-03, OPEN — ledger shq-suite-0019).** The yield-budget fix held only
 07-20 → 07-24; from 2026-07-25 (~5.3 days after the 07-19 reboot) the HA `unavailable` flaps
@@ -148,8 +156,8 @@ multiples: 10 s / 20 s / 60 s), late pongs made `enableHeartbeat`'s reaper evict
 client, and each reconnect fed the loop (five slots seen dying in the same second). The fix, on
 both twins (actron build "Aug 24 2026 00:39:51", somfy fw 1.6.1):
 * **`-D WEBSOCKETS_TCP_TIMEOUT=500`** (`platformio.ini`) — bounds the worst per-client stall 10×,
-  keeping even a pathological loop pass under the 5 s pong deadline. This is the load-bearing
-  stall fix; somfy already had the dirty-flag architecture and still hit a 50 s stall without it.
+  keeping even a pathological loop pass under what was then the 5 s pong deadline (45 s since
+  fw 1.14.0). This is the load-bearing stall fix; somfy already had the dirty-flag architecture and still hit a 50 s stall without it.
 * **Dirty-flag broadcast port** (somfy's pattern): `ws_api::publishStateIfChanged` (called from
   the priority-5 bridge task) is gone; `notifyStateChanged` copies a `ControllerState` snapshot
   under a `portMUX` spinlock and sets a flag, and `ws_api::loop()` (main loop) drains, diffs and
@@ -186,8 +194,9 @@ Fix: **`src/ws_guard.{h,cpp}`** (twin of somfy's), a `GuardedWebSocketsServer` s
 library's `_clients[]` is `protected`, so this needs no library patch. It polls each socket with a
 **zero-timeout `select()`** before writing, skips any that would block (`broadcastWritableTXT()`
 replaces `broadcastTXT()` at every site), and drops a socket that stays unwritable for
-`WS_STALL_REAP_MS` (10 s — under HA's 30 s availability timeout so the reconnect lands in time,
-well over any transient full send buffer). The reap closes the socket directly rather than sending a
+`WS_STALL_REAP_MS` (10 s at the time — under HA's 30 s availability timeout so the reconnect
+lands in time, well over any transient full send buffer; 3 s in fw 1.8.0, **30 s since fw 1.14.0**
+as `ws_liveness::STALL_REAP_MS` — see below). The reap closes the socket directly rather than sending a
 WS close frame, because that frame would be a write to the very socket that is refusing writes. New
 `ws_stall_reap` diag event + `stall_reaps` counter make the fix measurable: every reap is a ~10 s
 stall that did not happen.
@@ -221,9 +230,32 @@ descriptor to agree; a note in it says so.
 (`ws_stall_reap ... life=6595ms rx=0`), i.e. a coordinator still settling rather than a dead peer,
 which just made HA reconnect into the same trap — the flap rate on the two affected controllers
 doubled. `WS_REAP_MIN_AGE_MS` (10 s) now makes a young client ineligible for reaping, counted as
-`deferred_reaps` (`deferred=` in /stats, plus an HA sensor). **The value must stay under the 15 s
-ping interval** — that is what keeps a socket stuck from birth reaped before `enableHeartbeat` can
-block on it, and why simply raising the stall grace to 10 s would have been the wrong fix.
+`deferred_reaps` (`deferred=` in /stats, plus an HA sensor). At the time the value had to stay
+under the 15 s ping interval — the library's unguarded ping — which is why raising the stall grace
+instead would have been wrong; fw 1.14.0 removed that constraint altogether.
+
+**⇒ fw 1.14.0 (2026-09-05, ledger shq-suite-0046) — WS liveness: the library's pong reaper is
+gone.** The somfy twin's pcap showed the fatal chain: on two boards uplink frames of ~700 B+ are
+lost in bursts while small frames pass; one lost segment head-of-line-blocks lwIP's send queue
+(retransmit ladder 1.2 / 3.6 / 8.4 / 18 / 37.2 / 75.6 s cumulative, SACK ignored), so our pong
+to HA and HA's pong to us are both stuck while HA's pings still *arrive* — and
+`enableHeartbeat(15000,5000,2)` evicted the client 10 s after the first missed pong, after only
+three retransmissions. **A pong measures the uplink, not the peer.** Now `src/ws_liveness.{h,cpp}`
+(pure, host-tested, twin) holds the policy and `ws_guard` applies it: evict only on silence in
+BOTH directions for `LIVENESS_MS` (45 s — above HA's 40 s so HA closes first, above the 5th
+retransmission), extended while `tcpsnap` shows the pcb retransmitting up to `LIVENESS_HARD_MS`
+(120 s), plus the unwritable reap at `STALL_REAP_MS` (30 s, above the 4th retransmission — the
+old 3 s existed only for the library's unguarded ping write, which no longer exists: our
+`sendPings()` goes through the guard. The library's replies to a peer PING/CLOSE inside `loop()`
+are still unguarded, so an unwritable slot can cost ~10 s per HA ping until reaped — bounded). Evictions are observed, not inferred: `ws_evict` record +
+`pong_timeout` / `stall_reap` reasons from fact. Frame sizes too: **no hot-path frame over
+`FRAME_BUDGET_BYTES` (600)** — the diag backlog is a record per `diag` frame from a per-client
+cursor (the old 2.6 kB `diag_backlog` crossed lwIP's `TCP_SNDLOWAT` = 2873 B on its own, so the
+fresh socket read unwritable from birth), the health push is `health` / `health_ws` /
+`health_net` a second apart (HA merges; `/diag.json` still returns everything in one), telemetry
+is held off a retransmitting pcb (`deferred_telemetry`), and `big_frames` in `health_ws` must
+read 0. New `health_ws` keys: `liveness_evicts`, `liveness_extended`, `deferred_telemetry`,
+`pings`, `ping_skips`, `big_frames`. Full derivation: `somfy-sdn/CLAUDE.md` → "WS liveness".
 
 ## Self-diagnostics (`src/diag.{h,cpp}`, 2026-08-23)
 
@@ -254,10 +286,11 @@ answer, and the raw evidence rides along so a verdict can be re-judged from hist
 reflash:
 | Reason | Inferred when |
 |--------|---------------|
-| `pong_timeout` | last pong ≥ 20 s old (ping 15 s + pong 5 s) ⇒ **our own reaper** evicted it |
-| `peer_close` | a pong landed within the last ping cycle, or inbound traffic within 10 s ⇒ not us |
+| `pong_timeout` | **observed** (1.14.0): the liveness policy evicted it — nothing inbound for 45 s (120 s while retransmitting). Before 1.14.0 this was *inferred* from a pong ≥ 20 s old |
+| `stall_reap` | **observed** (1.14.0): the write-guard dropped it for staying unwritable 30 s |
+| `peer_close` | not evicted by us, and a pong landed within the last ping cycle or inbound traffic within 10 s ⇒ the far end closed it |
 | `transport_error` | a `WStype_ERROR` arrived for that slot in the preceding 2 s |
-| `unclassified` | quiet socket, pong not yet overdue — nothing to pin it on |
+| `unclassified` | quiet socket, not evicted by us — nothing to pin it on |
 
 The WS library gives no callback for a received close frame, so `peer_close` is inferred rather
 than observed; HA's own `ha_clean`/`ha_closed` bus event is the confirming half.
@@ -345,8 +378,8 @@ a native app id and `/update` refuses a foreign one:
 - `handleUpdate` runs `httpUpdate` with `rebootOnUpdate(false)`, then checks the written
   boot partition's `esp_app_desc.project_name`; if it isn't `"actron-mitm"` it reverts the
   boot partition and does **not** reboot. The guard's twin was validated live on the somfy
-  Jordon Study canary (an actron image was correctly rejected). **Not yet flashed to the
-  in-wall Actron** — its guard/id only take effect after the next OTA. See
+  Jordon Study canary (an actron image was correctly rejected). Live on the in-wall bridge since
+  fw 1.11.0 (2026-09-01); the 1.14.2 pull on 2026-09-05 went through it. See
   `somfy-sdn/CLAUDE.md` → "Device identity & OTA app-guard" and ledger shq-suite-0012.
 
 ## Hardware
@@ -427,6 +460,16 @@ octets) serving a WiFi-setup form. Provisioned creds survive OTA. Hostname/AP = 
   bridging even while the controller sits unprovisioned in the portal. The app HTTP/WS servers
   only start once STA-connected (`startAppServer()`); in portal mode `wifi_prov` owns port 80.
 - **Re-provision / move networks:** `POST /wifireset` wipes creds and reboots into the portal.
+- **WiFi protocol A/B knob (fw 1.13.0, `src/wifi_proto.h`, ledger shq-suite-0046):** `wifi_proto`
+  in NVS (namespace `actron`), `bgnax` (default — no `esp_wifi_set_protocol()` call at all, so
+  the default path is unchanged) / `bgn` / `bg`, applied in `tryConnect()` after `WiFi.mode()` and
+  before `WiFi.begin()`; changed via `POST /wifiproto`, WS `set_wifi_proto`, console `proto <v>`
+  or the HA select, **each followed by a REBOOT since fw 1.14.0** (the bitmap is honoured only
+  on a fresh WiFi init — the 1.13.0 re-associate did not apply it on the somfy canary), so it
+  carries the same A/C cost as `/reboot`: zones off first. Written for the somfy twin's
+  long-frame uplink-loss A/B; this device is the control. `POST /phycal?erase=1` (full RF
+  calibration on the next boot) exists too but REBOOTS — zones off first. Detail, including the
+  core-code reasoning for where the bitmap must be set: `somfy-sdn/CLAUDE.md` → "WiFi protocol A/B".
 - **⚠️ NO GPIO0 button here** (the somfy port has one): **GPIO0 is the NEO-side UART0 RX**
   (`PIN_B_RX`). `pinMode(GPIO0, …)` kills NEO reception (`B.frames=0`, no A/C state to decode, HA
   shows wrong status). This bit us during the port (2026-06-26, ledger shq-suite-0013) — never
@@ -452,11 +495,14 @@ ESP32-C6 needs the **pioarduino** platform fork (pinned in `platformio.ini`; bum
 | Endpoint | Purpose |
 |----------|---------|
 | `GET /` | help + status |
-| `GET /stats` | one-line status; starts `# app=actron-mitm …`. Carries `heap/minheap/maxblk/uptime`, `ws/ws_conn/ws_disc/ws_err`, and (2026-08-19) `hb_age`/`hb_tx` + `clk_torn`/`clk_back`/`clk_jump`/`clk_jumpms`, and (2026-08-23) `sock`/`loop_max`/`http_max`/`stalls`/`pongto`/`peerclose`/`txerr`/`wifi_disc`/`diag_seq`; **1.10.0** replaces `clk_torn` with `clk_word`/`clk_rebase`/`clk_rebase_ms`, adds `deferred=` and `fault=`/`fault_detail=`, and `fw=` now carries the semver; **1.11.0** adds `nw_fail`/`nw_probes`/`nw_recover`/`nw_reason` (network-stack watchdog, see `src/netwatch.{h,cpp}`) |
+| `GET /stats` | one-line status; starts `# app=actron-mitm …`. Carries `heap/minheap/maxblk/uptime`, `ws/ws_conn/ws_disc/ws_err`, and (2026-08-19) `hb_age`/`hb_tx` + `clk_torn`/`clk_back`/`clk_jump`/`clk_jumpms`, and (2026-08-23) `sock`/`loop_max`/`http_max`/`stalls`/`pongto`/`peerclose`/`txerr`/`wifi_disc`/`diag_seq`; **1.10.0** replaces `clk_torn` with `clk_word`/`clk_rebase`/`clk_rebase_ms`, adds `deferred=` and `fault=`/`fault_detail=`, and `fw=` now carries the semver; **1.11.0** adds `nw_fail`/`nw_probes`/`nw_recover`/`nw_reason` (network-stack watchdog, see `src/netwatch.{h,cpp}`); **1.12.0** adds `tx_ok`/`tx_retry`/`tx_tbretry`/`tx_to`/`tx_coll`/`tx_nomem`/`tx_fail`/`tx_en`/`phy`/`ch` (MAC transmit telemetry, `src/txstats.{h,cpp}`); **1.13.0** adds `proto=` (the WiFi protocol A/B knob, `src/wifi_proto.h` — read against `phy=`) |
 | `POST /reboot` | deliberate restart (`?reason=`). **Costs A/C control for ~8-30 s:** this bridge sits between a physically cut RS485 bus, so while the ESP32 is down the NEO<->indoor-board link is severed, not passed through. Prefer zones off — the same precaution every OTA flash of this device takes (ledger shq-suite-0034). Out-of-band by design: WS is exactly what dies in the failure modes worth rebooting for — on the somfy twin's nine-hour clock wedge WS was dead throughout while HTTP answered instantly (ledger shq-suite-0041) |
+| `GET /wifiproto` | **(1.13.0)** configured WiFi protocol set, one slug: `bgnax` \| `bgn` \| `bg` |
+| `POST /wifiproto?set=bgnax\|bgn\|bg` | **(1.13.0) WiFi protocol A/B knob**, twin of somfy's. Persists to NVS, replies with the new slug, then **(1.14.0) REBOOTS** — the bitmap is honoured only on a fresh WiFi init, so this now has the **same A/C cost as `/reboot` — zones off first**. `bgnax` = the untouched default. Rationale + how to read it: `somfy-sdn/CLAUDE.md` → "WiFi protocol A/B" |
+| `POST /phycal?erase=1` | **(1.13.0, HTTP only)** erase the stored PHY calibration (`esp_phy_erase_cal_data_in_nvs()`) and **REBOOT** into a full RF calibration. **Same A/C cost as `/reboot` — zones off first** |
 | `GET /diag` | **self-diagnostics** — health line + the event ring, newest last. Reachable when the WS layer is precisely what has stopped working |
 | `GET /diag.json` | same, machine-readable (`{"health":{…},"events":[…]}`) |
-| `GET /stats.json` | machine-readable identity + status (`app`/`model`/`mac`/`ip`/`fw`/`rssi`/`bridge`) — uniform with somfy-sdn so any TinyC6 on the LAN is positively identifiable |
+| `GET /stats.json` | machine-readable identity + status (`app`/`model`/`mac`/`ip`/`fw`/`rssi`/`bridge`; **1.12.0** adds `phy`/`channel`/`wifi_tx{…}`; **1.13.0** adds `proto` and drops the raw `wifi_tx.seq_max_rtt_us`) — uniform with somfy-sdn so any TinyC6 on the LAN is positively identifiable |
 | `GET /log?since=<seq>&n=<max>` | frames; `since` returns only newer ones (incremental polling) |
 | `POST /set?baud=&parity=N\|E\|O&gap=<us>` | change capture settings live |
 | `GET /measure` | estimate baud from raw line pulse widths (~5s; needs bus activity) |
@@ -504,6 +550,9 @@ Incoming commands (all with optional `id` for ack matching):
 - `set_master_setpoint` — `value` in °C (10..35, 0.1 step)
 - `set_zone_enabled` — `zone` 0..7, `value` bool
 - `set_zone_setpoint` — `zone` 0..7, `value` in °C
+- `set_wifi_proto` — `proto` in `bgnax`/`bgn`/`bg` (fw 1.13.0 WiFi protocol A/B knob, twin of
+  somfy's: persists to NVS, acks, then **reboots** (fw 1.14.0 — same A/C cost as `reboot`, zones
+  off first); HA's "WiFi protocol" select drives it, the health push's `proto` reports it)
 
 The server keeps the bridge in INJECT mode permanently. Writes use the recipes from
 `LOCAL-CONTROL-RECIPES.md`. Pulse-style writes (mode/fan/master setpoint/zone enable)
@@ -600,6 +649,11 @@ push directly: `pio run -e um_tinyc6_ota -t upload`.
 | `src/state.h` / `src/state.cpp` | Pure C++ NEO frame decoder — parses page-1/page-2 func-03 responses into a `ControllerState` struct (mode/fan/setpoints/zones/temps) per FINDINGS §7. Used by ws_api to publish state and tick transitions. Host-testable. |
 | `src/ws_api.h` / `src/ws_api.cpp` | WebSockets server on port 8767 — JSON command/state schema, transition table with per-field `*_transitioning` values, write orchestration mapping each command to the LOCAL-CONTROL-RECIPES recipes. Bridge stays in INJECT permanently; pulse rules auto-expire, persistent rules (zone setpoints) are cleared on board adoption or `GRACE_PERIOD_MS` timeout. **WS liveness (2026-07-13):** `begin()` calls `enableHeartbeat(15000,5000,2)` to evict half-open zombie clients (a WiFi blip leaving a client's TCP half-open, no FIN). **This was NOT the actual cure for the recurring ~30 s `unavailable` flaps** — root cause (found 2026-07-19) is `bridgeTask` loop-starvation, fixed by the yield budget in `main.cpp` (see the "Yield budget" note up top); the heartbeat can't help when the WS loop that *sends* it is the starved thing. Kept as belt-and-braces for genuine half-open clients. Plus a **wedge-watchdog**: `loop()` reboots if all `WEBSOCKETS_SERVER_CLIENT_MAX` (5) slots stay occupied continuously for 5 min (backstop to the client-side leak fixed in `actron_mitm_controller` 1.1.1; any drop below the cap resets the timer, so it can't boot-loop). Both ported from `somfy-sdn/src/ws_api.cpp` (fw 1.1.5 + 1.3.0). See ledger shq-suite-0019. **Heartbeat-wedge fix (2026-08-19, ledger shq-suite-0034):** the periodic push is now gated on an *unsigned* elapsed test and `now_ms()` returns `mono::now()` — see the Regression #2 note up top for why the signed form wedged for hours. `hb_age`/`hb_tx` in `/stats` say whether the push is alive. |
 | `src/diag.h` / `src/diag.cpp` | **Self-diagnostics** (ledger shq-suite-0038; twin ported to somfy-sdn fw 1.6.0) — WS disconnect classification with the machine's condition attached, loop/HTTP phase-stall timing, an lwIP spare-socket probe, and a 48-entry event ring served at `/diag`, `/diag.json`, and pushed over WS (live + replayed as a backlog on connect). Twin of `somfy-sdn/src/diag.{h,cpp}` — keep them in step; note the source-ahead-of-binary warning in that section. |
+| `src/ws_guard.h` / `src/ws_guard.cpp` | **Write-guard + keepalive + liveness glue** (twin, byte-identical with somfy's). `GuardedWebSocketsServer`: zero-timeout `select()` before every write, `broadcastWritableTXT()`/`sendWritableTXT()` for essential frames, `sendTelemetryTXT()`/`broadcastTelemetryTXT()` for telemetry (also held off a retransmitting pcb), `sendPings()` (our 15 s keepalive, guarded — the library's `enableHeartbeat` is no longer used), `judge()` (applies `ws_liveness::judge` per slot before `server.loop()`). |
+| `src/ws_liveness.h` / `src/ws_liveness.cpp` | **Pure C++, host-tested** (fw 1.14.0, twin). The client liveness policy and every keepalive constant, `static_assert`ed against lwIP's retransmit ladder and HA's 40 s window: `LIVENESS_MS` 45 s, `LIVENESS_HARD_MS` 120 s, `STALL_REAP_MS` 30 s, `MIN_AGE_MS` 10 s, `FRAME_BUDGET_BYTES` 600. Derivation in the header and in `somfy-sdn/CLAUDE.md` → "WS liveness". |
+| `src/txstats.h` / `src/txstats.cpp` | **WiFi MAC transmit telemetry** (fw 1.12.0, twin of `somfy-sdn/src/txstats.{h,cpp}` — keep in step). Enables the C6 driver's per-AC transmit statistics at runtime (`esp_wifi_enable_tx_statistics`, private-header getter `esp_wifi_get_tx_statistics`, cleared after every read) from the 1 Hz net tick in `wifi_prov.cpp`: acknowledged frames, EDCA/TB retries, ACK timeouts, collisions, buffer starvation, failure matrix, plus negotiated PHY mode/channel. **Read-only**, written for the somfy twin's long-frame uplink-loss investigation; this device is the control. Surfaces as `tx_*`/`phy`/`ch` in `/stats`, `wifi_tx{}` in `/stats.json`, `tx_*` in the health push and on every diag record (deltas since the previous record). Full field list in `somfy-sdn/CLAUDE.md` → "MAC transmit telemetry". **Source only — NOT flashed.** ⚠️ 1.12.0 boot-looped the somfy canary: the getter's `tx_fail` is an ARRAY of `TEST_TX_FAIL_MAX` structs (984 B copied), not one struct — 1.12.1 fixes it in both twins (ledger shq-suite-0047; detail in `somfy-sdn/CLAUDE.md` → "MAC transmit telemetry"). |
+| `src/tcpsnap.h` / `src/tcpsnap.cpp` | **lwIP pcb snapshot** (fw 1.12.0, twin). Reads a connection's `state`/`nrtx`/`rto`/`cwnd`/`snd_buf`/unacked bytes by walking `tcp_active_pcbs` under `LOCK_TCPIP_CORE()`; sampled at 1 Hz per WS client, captured live at a stall-reap, carried as `tcp_*` on `ws_disconnect`/`ws_stall_reap` records and in the health push. **1.13.0 fixes the peer match** (the core's dual-stack `NetworkServer` makes `getpeername()` return an IPv4-mapped IPv6 sockaddr, which 1.12.x rejected — no capture ever matched) and adds `tcp_miss` to the health push. |
+| `src/wifi_proto.h` | **WiFi protocol A/B knob** (fw 1.13.0, header-only, twin of `somfy-sdn/src/wifi_proto.h` — keep in step, host-tested). Slug ↔ `Proto` ↔ `esp_wifi_set_protocol()` bitmap; `bgnax` maps to "make no call". Glue (`readProto`/`applyProto`/`setWifiProto`/`erasePhyCalibration`) in `wifi_prov.cpp`; surfaces in `main.cpp` (`/wifiproto`, `/phycal`, console `proto`), `ws_api.cpp` (`set_wifi_proto`), `diag.cpp` (health `proto`).  ⚠️ 1.14.1: `bgnax` is written explicitly (B\|G\|N\|AX); the driver persists the last bitmap in its own NVS, so \"no call\" inherited a previous `bgn` (ledger shq-suite-0046). |
 | `src/mono.h` / `src/mono.cpp` | Pure C++ fault-tolerant monotonic clock (twin of `somfy-sdn/src/mono.{h,cpp}` — keep them in step). `mono::now()` backs `ws_api`'s `now_ms()`. Rejects high-word clock faults (an exact multiple of 2^32 us, either direction) and **re-baselines instead of clamping for ever** — the unbounded clamp is what turned a 25,769 s backward step into a nine-hour outage on the somfy twin (ledger shq-suite-0041). Host-tested. |
 | `src/fault.h` / `src/fault.cpp` | Pure C++ device-level fault registry (twin of `somfy-sdn/src/fault.{h,cpp}`). Severity-ordered bitmask + one-line detail, surfaced in `/stats` (`fault=`/`fault_detail=`), the WS health push, and HA's `sensor.actron_ac_fault` + `binary_sensor.actron_ac_problem`. The evaluator lives in `main.cpp` (`updateFaults`). |
 | `src/netwatch.h` / `src/netwatch.cpp` | Pure C++ network-stack watchdog policy (fw 1.11.0, ledger shq-suite-0044; twin of `somfy-sdn/src/netwatch.{h,cpp}` — keep in step). Re-associates the WiFi link on an adopted backward clock step >= 60 s, on the gateway going unanswered for 3 min with nothing inbound over WS, or on heap < 60 kB for 10 min. **The reboot tier is OFF on this device** (`netwatch::Policy(false)` in `wifi_prov.cpp`): the relay must never restart with the A/C running, so a persistent fault repeats the re-association instead, which only touches WiFi. Glue (gateway ICMP probe via `esp_ping`, the `reassociate()` action, `noteInbound()` from `ws_api`) lives in `wifi_prov.cpp`. Why: the somfy twin's Bed 2 controller died with the STA link UP — associated, sending a gratuitous ARP a minute, answering nothing — after a backward clock step blacked out the IDF's own timers and the WiFi driver leaked for 18 h; a re-association cured it instantly and the leak did not resume. **Source only — NOT yet flashed** (the in-wall bridge is still on its pre-1.10.0 build; flashing needs every zone off). |
@@ -607,6 +661,9 @@ push directly: `pio run -e um_tinyc6_ota -t upload`.
 | `test/test_mono/test_mono.cpp` | Unity host-side tests for the clock filter. 11 cases: normal progression, the high-word detector at its boundaries, a backward and a forward high-word step rejected on first read, a PERSISTENT high-word step re-baselining, single vs sustained backward reads, isolated backward reads never re-baselining, a genuine long stall accepted, 49.7-day wrap. |
 | `test/test_fault/test_fault.cpp` | Unity host-side tests for the fault registry. 8 cases, the load-bearing one being severity ordering: a low-heap notice must never mask a dead clock. |
 | `test/test_netwatch/test_netwatch.cpp` | Unity host-side tests for the network-stack watchdog policy. 16 cases: a large backward step re-associates and a small one does not; unreachable re-associates then reboots, and a probe success cancels the reboot; inbound WS traffic vetoes failed probes and an HA outage alone never acts; heap-low with hysteresis; the reboot tier disabled repeats re-associations on the cooldown. |
+| `test/test_txstats/test_txstats.cpp` | Unity host-side tests for the MAC transmit-statistics accumulator + pcb snapshot helpers. 8 cases: totals sum and maxima carry, the health/record windows are independent, a counter that went backwards (cleared under us) is taken whole rather than wrapped, tcp state names, and (1.13.0) the IPv4-mapped-IPv6 unmap that the peer match depends on. |
+| `test/test_ws_liveness/test_ws_liveness.cpp` | Unity host-side tests for the WS client liveness policy (1.14.0, twin). 8 cases: the retransmit ladder arithmetic, a 25 s retransmitting hole is survived, silence evicts at 45 s and not before, a retransmitting pcb extends to the 120 s hard cap, HA's inbound pings keep a stuck-pong socket alive, a young socket is never judged, unwritable reaps at 30 s even while retransmitting, and the ping/telemetry gates. |
+| `test/test_wifi_proto/test_wifi_proto.cpp` | Unity host-side tests for the WiFi protocol knob (1.13.0). 5 cases: the default is the explicit B|G|N|AX bitmap (1.14.1), the B-side bitmaps equal the IDF values and carry neither 11AX nor LR, every slug round-trips, garbage/empty/case-mismatched input is rejected without touching the output. |
 | `test/test_bridge/test_bridge.cpp` | Unity host-side tests for the bridge logic. 21 cases covering passthrough, injection, CRC re-stamping, multi-rule, boundary registers, mid-frame gap reset, pulse expiry, replay templates. Run with `pio test -e native`. |
 | `test/test_state/test_state.cpp` | Unity host-side tests for the NEO state decoder. 10 cases covering frame validation (CRC / addr / func / bytecount), page-1 + page-2 field decode, zone enable mask change, active-array setpoint helper, mode/fan name roundtrip. Run with `pio test -e native`. |
 | `WIRING.md` | step-by-step T568B pass-through tap wiring guide (tap-mode, single transceiver). The cut-bus MITM tap layout is documented in the FINDINGS / root project CLAUDE.md until it earns its own diagram. |

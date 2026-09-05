@@ -126,25 +126,57 @@ Claude Code has direct access to the HA REST API via the `./ha` helper script (u
   main-loop stalls (all clean multiples of 10 s — ledger shq-suite-0038). The fix is ours, not the
   library's: `src/ws_guard.{h,cpp}` (**twins, keep in step**) poll each socket with a ZERO-timeout
   `select()` before writing, skip any that would block, and drop one that stays unwritable for
-  `WS_STALL_REAP_MS`. Never call `broadcastTXT()` directly on these firmwares — use
-  `broadcastWritableTXT()`.
+  `WS_STALL_REAP_MS` (30 s since fw 1.14.0; `ws_liveness.h`). Never call `broadcastTXT()`
+  directly on these firmwares — use `broadcastWritableTXT()` (or `sendTelemetryTXT()` for
+  anything non-essential).
 - **The firmware reports which AP is serving it — trust that, not the UniFi controller.** Both
   firmwares publish `bssid=`/`roams=` in `/stats` + `/diag` and through the WS health push (HA
   sensors `access_point_bssid` / `ap_roams`). The UniFi controller's client list has been observed
   disagreeing with the station about association (wiki `estate/shq-network.md`), so the station
   wins. Used to test whether the long-running availability flaps followed one AP — **they do not**
   (ledger shq-suite-0040): one radio hosts both the worst and several of the cleanest devices.
-- **Don't reap a WS client that is still settling.** `WS_STALL_REAP_MS` (3 s) alone killed sockets
-  ~6 s old that had never received a frame — an HA coordinator mid-handshake looks identical to a
-  dead one at the socket layer — so HA reconnected into the same trap and the flap rate on two
-  controllers *doubled*. `WS_REAP_MIN_AGE_MS` (10 s) now protects a young client. The value must
-  stay **under** the 15 s ping interval: that is what keeps a born-stuck socket reaped before
-  `enableHeartbeat` can block on it, and it is why raising the stall grace to 10 s instead would
-  have been wrong (ledger shq-suite-0038).
-- **The write-guard must reap BEFORE `server.loop()`.** `enableHeartbeat`'s ping is emitted inside
-  `server.loop()` and writes to the socket directly, bypassing `broadcastWritableTXT()` — so a
-  blocked slot still present when the library runs costs the full ~10 s core write regardless of
-  the guard. Reap first, and keep `WS_STALL_REAP_MS` under the ping interval (3 s vs 15 s).
+  **But the controller's per-client MAC counters ARE worth reading — they are the radio's own
+  tallies and see the direction the station cannot.** The UniFi Network legacy API
+  (`/proxy/network/api/s/default/stat/sta`, `stat/report/5minutes.user`; an X-API-KEY minted in
+  the UniFi OS console → Control Plane → Integrations, never committed) reports the AP→station
+  retry rate, rates in both directions and 48 h of 5-minute history per MAC with no device
+  polling at all. It is what showed Living Back/Left impaired in BOTH directions at normal RSSI,
+  constantly (40-55 % downlink retries vs 0-2 % on Living Right, same room, same radio), turning
+  the "which board loses long frames" question into a mounting-position one (ledger
+  shq-suite-0048; recipe and field semantics in wiki `estate/shq-network.md`).
+- **A WS ping/pong cannot measure liveness on a retransmitting TCP flow — never re-enable the
+  library's `enableHeartbeat()` on these firmwares.** The pcap behind ledger shq-suite-0046
+  showed the whole chain: on two boards uplink WiFi frames of ~700 B+ are lost in 7-30 s bursts
+  while small frames pass; ONE lost segment head-of-line-blocks lwIP's send queue (it retransmits
+  from the head on a 1.2/2.4/4.8/9.6/19.2 s ladder and ignores HA's SACK), so our pong to HA and
+  HA's pong to us are both stuck behind the hole while HA's pings still ARRIVE and get ACKed. The
+  library's `enableHeartbeat(15000, 5000, 2)` re-pinged immediately after a missed pong and
+  evicted the client 10 s after the first miss — after three retransmissions of a segment lwIP
+  would have retried for minutes (42 sessions died at pong_age = 25.0 s exactly). Since fw
+  1.14.0 (**twins**) `src/ws_liveness.{h,cpp}` is the pure, host-tested policy and
+  `GuardedWebSocketsServer` the glue: evict only on silence in BOTH directions for
+  `LIVENESS_MS` (45 s — above HA's 40 s so HA closes first, above the 5th retransmission at
+  37.2 s), extended while the pcb is retransmitting (`tcpsnap` nrtx > 0 && unacked > 0) up to
+  `LIVENESS_HARD_MS` (120 s), plus the unwritable reap at `STALL_REAP_MS` (30 s, above the 4th
+  retransmission). Our own ping goes through the writability guard; the only unguarded library
+  writes left are its replies to a peer PING/CLOSE inside `loop()` (~10 s per HA ping on an
+  unwritable slot until the 30 s reap — bounded) — which is why the old "3 s reap grace / 10 s min age must stay under the 15 s
+  ping interval" rule (fw 1.8.0/1.9.0) no longer applies; `MIN_AGE_MS` is kept only as an
+  invariant. Every number is a `static_assert` against the ladder in `ws_liveness.h`.
+- **No WS frame over 600 B on the hot path (`ws_liveness::FRAME_BUDGET_BYTES`).** Loss rose
+  steeply with frame length on the affected boards: 0/313 at ~330 B, 8/65 at ~720 B, 2/4 at
+  >= 1300 B. The 2.6 kB `diag_backlog` frame sent on every connect (two full-MSS segments, and
+  the moment it exceeded lwIP's `TCP_SNDLOWAT` of 2873 B the fresh socket read unwritable from
+  birth) is what made the churn self-perpetuating; the 1.3 kB `health` push was the frame the
+  pcap caught being lost. fw 1.14.0 sends the backlog a record per `diag` frame from a
+  per-client cursor, the health push as `health` / `health_ws` / `health_net` a second apart
+  (HA merges them), holds all telemetry off a retransmitting pcb, and counts any oversize frame
+  as `big_frames` in `health_ws` — that must read 0. Measure with `serializeJson` before adding
+  keys to any push.
+- **`/wifiproto`, WS `set_wifi_proto` and the HA "WiFi protocol" select REBOOT the device.**
+  `esp_wifi_set_protocol()` is honoured only on a fresh WiFi init: with `bgn` persisted, the
+  fw 1.13.0 live re-association left the canary still negotiating HE20, while a reboot came up
+  HT20. On the actron bridge that is the same A/C cost as `/reboot` — zones off first.
 - **arduinoWebSockets blocks, and only the Arduino main loop may touch it.** The library's socket
   reads/writes are blocking spin loops bounded by `WEBSOCKETS_TCP_TIMEOUT` (library default
   5000 ms — one zombie client could stall the loop for 10-60 s per pass, which is what drove the
@@ -215,4 +247,35 @@ Claude Code has direct access to the HA REST API via the `./ha` helper script (u
   by GARP-only traffic from the MAC, `nw_fail` climbing in `/stats`, and the
   `sensor.<device>_gateway_probe_failures` HA sensor; the manual cure is a UniFi client
   reconnect, not a power-cycle. Why the counter steps in the first place is still unknown.
+- **The C6 WiFi driver's MAC transmit counters exist, but only behind a private header and a
+  runtime enable.** `esp_wifi_get_tx_statistics()` / `esp_wifi_clr_tx_statistics()` are exported
+  by the prebuilt `libnet80211.a` yet declared only in `esp_private/esp_wifi_he_private.h`, and
+  the sdkconfig switch that would turn collection on at init
+  (`CONFIG_ESP_WIFI_ENABLE_WIFI_TX_STATS`) is **unset** in the Arduino libs — so nothing counts
+  until `esp_wifi_enable_tx_statistics()` is called per access category after association, and
+  the enabled bitmap (`tx_en` in `/stats`) must read 15 before any `tx_*` figure means anything.
+  Both firmwares do this in `src/txstats.{h,cpp}` (**twins**, fw 1.12.0); the struct layouts
+  come from the same package as the library, so re-check them on any pioarduino platform bump.
+  Read-only instrumentation for the long-frame uplink-loss investigation — it changes no rate,
+  PHY mode, timeout or reconnect, on purpose, so it is a clean A/B baseline.
+  **And the getter's `tx_fail` argument is an ARRAY, not a struct** — the prebuilt driver copies
+  `TEST_TX_FAIL_MAX` (6) × 164 B = 984 B into it, one block per failure state, which neither the
+  prototype nor the header comment says. fw 1.12.0 passed one 164 B stack local and put the Bed 2
+  canary in a reboot loop on the first `loop()` pass (return address overwritten; ledger
+  shq-suite-0047). 1.12.1 passes a static `f[TEST_TX_FAIL_MAX]` and `static_assert`s both struct
+  sizes; keep those tripwires on any platform bump.
+- **On this core every TCP listener is an AF_INET6 dual-stack socket, so `getpeername()` on an
+  accepted socket never returns `AF_INET`.** `NetworkServer::begin()` opens `socket(AF_INET6)`
+  bound to `in6addr_any` under `CONFIG_LWIP_IPV6` (on in the prebuilt C6 libs), and lwIP then
+  reports an IPv4 peer as an IPv4-MAPPED IPv6 sockaddr (`::ffff:a.b.c.d`) — the pcb itself stays
+  v4-typed. The core's `NetworkClient::remoteIP()` unmaps it; fw 1.12.x's `tcpsnap` checked
+  `ss_family == AF_INET`, silently matched nothing, and shipped a whole generation with no
+  `tcp_*` telemetry. Fixed in 1.13.0 (`tcpsnap::mappedV4`, **twins**), with `tcp_miss` in the
+  health push so an instrument that finds nothing now says so. Any new code that keys on a peer
+  address on these boards must handle the mapped form.
+- **The WiFi driver remembers every `esp_wifi_set_*` setting across reboots and OTA** (its own NVS
+  namespace, `CONFIG_ESP_WIFI_NVS_ENABLED=y`). A knob that "makes no call for the default" therefore
+  does not restore the default — it inherits whatever was written last. That is how Living Back and the
+  Bed 2 canary stayed on HT20 through two "bgnax" reboots (ledger shq-suite-0046); fw 1.14.1 writes the
+  bitmap explicitly for every value. Any future runtime WiFi knob must do the same.
 - **ESP32-C6 `millis()` glitches**: on the TinyC6 boards `millis()` occasionally returns a value **far in the future** (proved by error-ring entries stamped beyond a device's own uptime). Any deadline variable that captures one stops firing until the real clock catches up — that is what wedged the somfy/actron WS state heartbeat and produced months of 40 s-cadence HA `unavailable` flapping (ledger shq-suite-0034). Both firmwares now use `mono::now()` (`src/mono.{h,cpp}`, keep the two copies in step) and **unsigned** elapsed-time comparisons: `(uint32_t)(now - last) >= interval`, never `(int32_t)(...)`. Any new timing code on these boards should follow the same two rules.
