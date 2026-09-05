@@ -7,6 +7,8 @@
 #include <WebServer.h>
 #include <WiFi.h>
 #include <esp_mac.h>
+#include <esp_phy_init.h>
+#include <esp_wifi.h>
 
 #include "lwip/ip_addr.h"
 #include "ping/ping_sock.h"
@@ -14,6 +16,7 @@
 #include "diag.h"
 #include "mono.h"
 #include "netwatch.h"
+#include "txstats.h"
 
 namespace wifi_prov {
 
@@ -52,6 +55,51 @@ DNSServer* g_dns = nullptr;
 
 // Set by requestReconnectBestAp() and serviced from loop() so a calling HTTP ack flushes first.
 bool g_reconnect_requested = false;
+
+// WiFi protocol A/B knob (fw 1.13.0, wifi_proto.h). Cached from NVS in begin(); applied by
+// applyProto() right before every WiFi.begin(). The Arduino core does not re-apply a protocol
+// bitmap of its own here: WiFiGenericClass::mode() only rewrites it when toggling long-range
+// mode (WiFiGeneric.cpp `_wifi_disable_lr`), and the driver's post-init default is B|G|N|AX
+// (esp_wifi.h). esp_wifi_set_protocol() needs esp_wifi_init() to have run, which WiFi.mode()
+// guarantees, and the value survives disconnect/connect — it would only be lost on
+// WiFi.mode(WIFI_OFF), which this firmware never calls.
+wifi_proto::Proto g_proto = wifi_proto::Proto::BGNAX;
+static_assert(wifi_proto::bitmap(wifi_proto::Proto::BGN) ==
+                  (WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N),
+              "wifi_proto bitmap drifted from the IDF macros");
+static_assert(wifi_proto::bitmap(wifi_proto::Proto::BG) == (WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G),
+              "wifi_proto bitmap drifted from the IDF macros");
+static_assert(wifi_proto::bitmap(wifi_proto::Proto::BGNAX) ==
+                  (WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_11AX),
+              "bgnax bitmap must match the IDF macros");
+
+void readProto() {
+  Preferences p;
+  if (!p.begin(NVS_NS, true)) return;
+  String v = p.getString(wifi_proto::NVS_KEY, "");
+  p.end();
+  wifi_proto::Proto parsed = wifi_proto::Proto::BGNAX;
+  if (v.length() > 0 && !wifi_proto::parse(v.c_str(), &parsed)) {
+    Serial.printf("# WiFi: ignoring unknown wifi_proto \"%s\" in NVS — using bgnax\n", v.c_str());
+  }
+  g_proto = parsed;
+}
+
+// Called after WiFi.mode(WIFI_STA) and before WiFi.begin(). Every setting, the default included,
+// is written explicitly (see below); the value the driver had persisted is never trusted.
+void applyProto() {
+  // Always write the bitmap, even for the default: the IDF driver persists the last value in its
+  // own NVS namespace (CONFIG_ESP_WIFI_NVS_ENABLED), so a unit that was ever switched to bgn would
+  // otherwise stay HT20 for ever after "bgnax" (found on Living Back, ledger shq-suite-0046).
+  const uint8_t bm = wifi_proto::bitmap(g_proto);
+  const esp_err_t err = esp_wifi_set_protocol(WIFI_IF_STA, bm);
+  if (err != ESP_OK) {
+    Serial.printf("# WiFi: esp_wifi_set_protocol(%s=0x%02x) failed: %s\n", wifi_proto::name(g_proto),
+                  (unsigned)bm, esp_err_to_name(err));
+  } else {
+    Serial.printf("# WiFi: protocol %s (0x%02x)\n", wifi_proto::name(g_proto), (unsigned)bm);
+  }
+}
 
 // Network-stack watchdog state (fw 1.11.0). The ping callbacks run on the ping task; they only
 // write g_probe_result, which the 1 Hz tick in loop() consumes.
@@ -135,6 +183,7 @@ bool tryConnect(const String& ssid, const String& pass) {
   // sticks to a cached/distant BSSID across reboots). All-channel scan + sort-by-signal.
   WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
   WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
+  applyProto();  // fw 1.13.0: after mode() (esp_wifi_init done), before begin()
   for (uint8_t attempt = 0; attempt <= STA_RETRIES; attempt++) {
     Serial.printf("# WiFi connecting to \"%s\" (attempt %d)", ssid.c_str(), attempt + 1);
     WiFi.begin(ssid.c_str(), pass.c_str());
@@ -357,6 +406,10 @@ void serviceNetwatch() {
     startGatewayProbe();
   }
 
+  // MAC-layer transmit counters (fw 1.12.0, txstats.h): enabled on first link-up, read and
+  // cleared once a second. Read-only telemetry, sharing this tick so nothing new is polled.
+  txstats::tick(now, link_up);
+
   netwatch::Input in;
   in.now_ms = now;
   in.link_up = link_up;
@@ -383,6 +436,7 @@ void serviceNetwatch() {
 
 Status begin() {
   computeHostname();
+  readProto();  // fw 1.13.0 WiFi protocol A/B knob; tryConnect applies it
 
   String ssid, pass;
   if (readCreds(ssid, pass) && tryConnect(ssid, pass)) {
@@ -415,6 +469,26 @@ uint32_t netProbeFailures() { return g_netwatch.consecutiveFailures(); }
 uint32_t netRecoveries() { return g_netwatch.recoveries(); }
 uint32_t netProbes() { return g_probes_sent; }
 const char* netLastReason() { return g_netwatch.lastReason(); }
+
+wifi_proto::Proto wifiProto() { return g_proto; }
+
+bool setWifiProto(wifi_proto::Proto proto) {
+  Preferences p;
+  if (!p.begin(NVS_NS, false)) return false;
+  const size_t n = p.putString(wifi_proto::NVS_KEY, wifi_proto::name(proto));
+  p.end();
+  if (n == 0) return false;
+  g_proto = proto;
+  Serial.printf("# WiFi: wifi_proto=%s saved (rebooting to apply)\n",
+                wifi_proto::name(proto));
+  return true;
+}
+
+bool erasePhyCalibration() {
+  const esp_err_t err = esp_phy_erase_cal_data_in_nvs();
+  Serial.printf("# PHY: erase calibration data in NVS -> %s\n", esp_err_to_name(err));
+  return err == ESP_OK;
+}
 
 Status status() { return g_status; }
 bool isConnected() { return g_status == Status::CONNECTED && WiFi.isConnected(); }

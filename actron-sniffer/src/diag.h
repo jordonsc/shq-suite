@@ -32,14 +32,18 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "tcpsnap.h"
+#include "ws_liveness.h"
+
 namespace diag {
 
 // Ring depth. Each Record is ~64 B, so 48 entries ≈ 3 kB of RAM held permanently. Sized to hold
 // well over an hour of a healthy device's events, or ~15 min of a badly flapping one.
 constexpr size_t RING_CAPACITY = 48;
 
-// Main-loop period above which we record a LoopStall. The WS library's pong deadline is 5 s
-// (WS_PONG_TIMEOUT_MS), so a stall approaching that is already dangerous; 1 s catches the run-up.
+// Main-loop period above which we record a LoopStall. Since fw 1.14.0 no keepalive deadline is
+// shorter than ws_liveness::LIVENESS_MS (45 s), so a stall can no longer cost a session on its
+// own; 1 s still catches the run-up to anything that would.
 constexpr uint32_t LOOP_STALL_MS = 1000;
 
 // Health telemetry push cadence over WS.
@@ -58,16 +62,11 @@ constexpr uint32_t HEAP_LOW_CLEAR_BYTES = 120000;
 constexpr uint8_t SOCKET_PROBE_MAX = 3;
 constexpr uint8_t SOCKET_LOW_SPARE = 1;
 
-// The WS library's ping/pong reaper settings, owned here because the disconnect classifier has to
-// reason about the same deadlines that trigger an eviction. ws_api passes these straight to
-// `server.enableHeartbeat()`, so the two can never drift apart.
-constexpr uint32_t WS_PING_INTERVAL_MS = 15000;
-constexpr uint32_t WS_PONG_TIMEOUT_MS = 5000;
-constexpr uint8_t WS_PONG_MISSES = 2;
-
-// A socket whose last pong is older than this was, on the balance of evidence, evicted by our own
-// reaper rather than closed by the peer.
-constexpr uint32_t PONG_OVERDUE_MS = WS_PING_INTERVAL_MS + WS_PONG_TIMEOUT_MS;
+// Keepalive deadlines live in ws_liveness.h (fw 1.14.0): the guard that enforces them and this
+// classifier read the same constants, so they can never drift apart. The library's own pong
+// reaper (`enableHeartbeat`) is no longer used — an eviction is now something the guard TELLS
+// diag about (noteWsEvict / noteWsStallReap), not something inferred from a pong age.
+constexpr uint32_t WS_PING_INTERVAL_MS = ws_liveness::PING_INTERVAL_MS;
 
 // Inbound traffic this recent at disconnect means the peer was demonstrably alive and talking, so
 // the close came from its end.
@@ -93,6 +92,9 @@ enum class Event : uint8_t {
   NetRecover,        // the network-stack watchdog acted (fw 1.11.0, shq-suite-0044); `ip` =
                      // the reason ("clock-step", "unreachable", "heap-low"), `value` =
                      // re-associations so far.
+  WsEvict,           // the liveness policy dropped a silent client (fw 1.14.0, ws_liveness.h):
+                     // nothing inbound for LIVENESS_MS (hard cap while retransmitting);
+                     // `value` = silence ms, `reason` = PongTimeout, tcp = the live pcb
 };
 
 // Why a socket died. Inferred, and deliberately conservative: `Unknown` is preferred to a
@@ -100,10 +102,12 @@ enum class Event : uint8_t {
 // re-judged later without a reflash.
 enum class Reason : uint8_t {
   None = 0,
-  PongTimeout,       // no pong within the library's ping/pong window => the SERVER evicted it
+  PongTimeout,       // OBSERVED (fw 1.14.0): our liveness policy evicted it — nothing inbound
+                     // (pong, ping or text) for ws_liveness::LIVENESS_MS, hard cap 120 s
   PeerClose,         // traffic was flowing right up to the end => the CLIENT hung up
   TransportError,    // a WStype_ERROR arrived for this slot immediately beforehand
-  Unknown,           // quiet socket, pong not yet overdue — nothing to pin it on
+  Unknown,           // quiet socket, not evicted by us — nothing to pin it on
+  StallReap,         // OBSERVED: the write-guard dropped it for staying unwritable
 };
 
 struct Record {
@@ -125,6 +129,16 @@ struct Record {
   uint8_t spare_sockets;   // lwIP headroom at capture, 0..SOCKET_PROBE_MAX
   int8_t rssi;
   char ip[16];             // WsConnect/WsDisconnect: peer address
+  // MAC-layer transmit picture of the run-up (fw 1.12.0, txstats.h): deltas since the PREVIOUS
+  // record, saturating at 65535. A disconnect with tx_retry/tx_to climbing against a flat tx_ok
+  // is the uplink failing on the air; all zero is the MAC not even being asked.
+  uint16_t tx_ok;          // frames acknowledged
+  uint16_t tx_retry;       // EDCA + TB retransmissions
+  uint16_t tx_to;          // ACK/BA timeouts
+  uint16_t tx_fail;        // failure-state matrix entries
+  // WsDisconnect / WsStallReap: lwIP's own view of the connection (tcpsnap.h). At a reap it is
+  // captured live before the socket is closed; at a disconnect it is the last 1 Hz sample.
+  tcpsnap::Snap tcp;
 };
 
 // ---- lifecycle ---------------------------------------------------------
@@ -152,9 +166,27 @@ void noteWsPong(uint8_t client_id);      // pong received => the peer is alive
 // A slot was dropped by the write-guard because its socket stayed unwritable. This is the
 // stall that never happened: writing to it would have blocked the main loop ~10 s inside the
 // Arduino core's write retry loop (see ws_guard.h).
-void noteWsStallReap(uint8_t client_id, uint32_t unwritable_ms, uint8_t clients);
+void noteWsStallReap(uint8_t client_id, uint32_t unwritable_ms, uint8_t clients,
+                     const tcpsnap::Snap* tcp);
+// The liveness policy dropped a slot for silence (fw 1.14.0): `why` is the rule that fired
+// ("silent" / "silent-hard"), `silence_ms` the evidence, `tcp` the live pcb. Marks the slot so
+// the WsDisconnect that follows is classified as OBSERVED PongTimeout rather than inferred.
+void noteWsEvict(uint8_t client_id, const char* why, uint32_t silence_ms, uint8_t clients,
+                 const tcpsnap::Snap* tcp);
 void noteWsRx(uint8_t client_id);        // any inbound frame => the peer is alive and talking
 void noteWsTx();                         // a state push went to every client
+
+// The 1 Hz lwIP pcb sample for a connected slot (from ws_api::loop). Kept per slot so a
+// disconnect record — which fires after the library has already closed the socket — can still
+// carry the last picture TCP had of it.
+void noteTcp(uint8_t client_id, const tcpsnap::Snap& snap);
+
+// Read-side of the per-slot bookkeeping, for the liveness policy in ws_guard (fw 1.14.0).
+// slotAges() fills the age of the last pong and of the last inbound frame of any kind; returns
+// false (outputs untouched) for a slot diag does not know. lastTcp() is the last 1 Hz sample,
+// nullptr for an unknown slot.
+bool slotAges(uint8_t client_id, uint32_t now_ms, uint32_t* pong_age_ms, uint32_t* rx_age_ms);
+const tcpsnap::Snap* lastTcp(uint8_t client_id);
 
 void noteWifi(bool up, int rssi);
 
@@ -181,7 +213,13 @@ const Record* bySeq(uint32_t seq);
 // Render one record into an existing JSON object (as emitted in a `diag` message).
 void toJson(const Record& r, JsonObject obj);
 
-// Fill `obj` with the current health snapshot (as emitted in a `health` message).
+// The health snapshot, in three parts so no WS frame exceeds ws_liveness::FRAME_BUDGET_BYTES
+// (fw 1.14.0): core vitals (`health`), socket/liveness counters + lwIP's view (`health_ws`),
+// netwatch + MAC transmit telemetry (`health_net`). healthToJson() is all three in one object
+// for /diag.json only — at ~1.3 kB it must never go over WS again (shq-suite-0046).
+void healthCoreToJson(JsonObject obj);
+void healthWsToJson(JsonObject obj);
+void healthNetToJson(JsonObject obj);
 void healthToJson(JsonObject obj);
 
 // Human-readable dump for GET /diag: a health line followed by the ring, newest last.

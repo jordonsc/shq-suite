@@ -9,6 +9,16 @@
 // broadcast happens from loop() on the Arduino main loop, so the WebSockets server is only ever
 // driven from one context.
 
+// FRAME SIZE RULE (fw 1.14.0, ledger shq-suite-0046). No frame this module sends on the hot path
+// may exceed ws_liveness::FRAME_BUDGET_BYTES (600). On two boards uplink WiFi frame loss rises
+// steeply with length — measured on the wire: 0 of 313 ~330 B frames lost, 8 of 65 ~720 B, 2 of
+// 4 >= 1300 B — and one lost segment head-of-line-blocks the whole TCP queue for the length of
+// lwIP's retransmit ladder. So: the diag backlog is a record per frame (never one frame), the
+// health push is three frames a second apart (`health` / `health_ws` / `health_net`), telemetry
+// is held back while the pcb is retransmitting, and the guard counts any oversize frame as
+// `big_frames` in `health_ws` — that counter must read 0. Measure with serializeJson before
+// adding keys to any push. The keepalive is ours, not the library's: see ws_liveness.h.
+
 #pragma once
 
 #include <cstdint>

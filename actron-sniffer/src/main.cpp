@@ -53,6 +53,8 @@
 #include "version.h"
 #include "mono.h"
 #include "state.h"
+#include "txstats.h"
+#include "wifi_proto.h"
 #include "wifi_prov.h"
 #include "ws_api.h"
 
@@ -543,7 +545,7 @@ static size_t statusLine(char *out, size_t cap) {
     "clk_jump=%u clk_jumpms=%u "
     // Self-diagnostics summary (ledger shq-suite-0038). `sock` is spare lwIP sockets — 0 means the
     // pool HTTP and WS share is exhausted. `loop_max`/`http_max` are the worst main-loop and
-    // handleClient() stalls since boot; anything near the 5 s pong deadline explains an eviction.
+    // handleClient() stalls since boot; a multi-second stall is a fault in its own right.
     // `pongto`/`peerclose`/`txerr` split the disconnects by who caused them. Full records at /diag.
     "sock=%u loop_max=%u http_max=%u stalls=%u "
     "pongto=%u peerclose=%u txerr=%u wifi_disc=%u reaps=%u skipped=%u deferred=%u "
@@ -554,7 +556,14 @@ static size_t statusLine(char *out, size_t cap) {
     // Network-stack watchdog (fw 1.11.0, shq-suite-0044): consecutive unanswered gateway
     // probes, probes sent, re-associations performed, and the newest reason.
     "bssid=%s roams=%u diag_seq=%u nw_fail=%u nw_probes=%u nw_recover=%u nw_reason=%s "
-    "fault=%s fault_detail=\"%s\" fw=\"%s\"",
+    "fault=%s fault_detail=\"%s\" "
+    // MAC-layer transmit counters (fw 1.12.0, txstats.h — read-only baseline for the
+    // long-frame uplink-loss investigation on the somfy twin). tx_retry/tx_to climbing
+    // against tx_ok is the air interface failing; tx_en=0 means the driver never enabled them.
+    "tx_ok=%u tx_retry=%u tx_tbretry=%u tx_to=%u tx_coll=%u tx_nomem=%u tx_fail=%u "
+    // proto= is the configured protocol set (fw 1.13.0 A/B knob, twin of somfy); phy= is what
+    // was actually negotiated.
+    "tx_en=%u phy=\"%s\" ch=%u proto=%s fw=\"%s\"",
     g_seq, g_baud, g_parity, g_gap_us, g_capture ? "on" : "off",
     (unsigned long long)g_a.total_bytes, g_a.total_frames, g_a.modified_frames, g_a.rx_errors,
     (unsigned long long)g_b.total_bytes, g_b.total_frames, g_b.modified_frames, g_b.rx_errors,
@@ -583,6 +592,12 @@ static size_t statusLine(char *out, size_t cap) {
     (unsigned)wifi_prov::netProbeFailures(), (unsigned)wifi_prov::netProbes(),
     (unsigned)wifi_prov::netRecoveries(), wifi_prov::netLastReason(),
     fault::registry().worstSlug(), fault::registry().worstDetail(),
+    (unsigned)txstats::acc().total().tx_succ, (unsigned)txstats::acc().total().retry_edca,
+    (unsigned)txstats::acc().total().retry_tb, (unsigned)txstats::acc().total().timeout,
+    (unsigned)txstats::acc().total().collision, (unsigned)txstats::acc().total().tx_no_mem,
+    (unsigned)txstats::acc().total().fail_count, (unsigned)txstats::enabledAcis(),
+    txstats::phyString(), (unsigned)txstats::channel(),
+    wifi_proto::name(wifi_prov::wifiProto()),
     ACTRON_FW_VERSION " " __DATE__ " " __TIME__);
 }
 
@@ -650,7 +665,7 @@ static String measureBaud() {
 
 // ---- HTTP handlers --------------------------------------------------------
 static void handleRoot() {
-  char st[1024];
+  char st[1280];
   statusLine(st, sizeof(st));
   String b = "Actron RS485 sniffer + MITM bridge\n";
   b += String(st) + "\n\n";
@@ -659,6 +674,9 @@ static void handleRoot() {
   b += "GET  /measure            estimate baud from UART1 line pulses (~5s)\n";
   b += "POST /set?baud=&parity=N|E|O&gap=<us>\n";
   b += "POST /clear              reset ring + counters\n";
+  b += "GET  /wifiproto          configured WiFi protocol set (bgnax|bgn|bg)\n";
+  b += "POST /wifiproto?set=bgnax|bgn|bg  persist + REBOOT to apply (A/B knob; zones off first!)\n";
+  b += "POST /phycal?erase=1     erase PHY calibration in NVS + REBOOT (zones off first!)\n";
   b += "POST /armwrite?ovr=reg:val,...  ARM 0x67 emulator (tap mode, requires bridge=off)\n";
   b += "POST /disarm             stop mutations: 0x67 emulator off, INJECT->PASSTHRU\n";
   b += "POST /txprobe            TX self-test on UART1 (requires bridge=off)\n";
@@ -679,7 +697,7 @@ static void handleRoot() {
 }
 
 static void handleStats() {
-  char st[1024];
+  char st[1280];
   statusLine(st, sizeof(st));
   server.send(200, "text/plain", String(st) + "\n");
 }
@@ -688,13 +706,24 @@ static void handleStats() {
 // positively identifies any TinyC6 board on the LAN (app/mac), rather than inferring from which
 // text /stats fields happen to be present.
 static void handleStatsJson() {
-  char buf[320];
+  const txstats::Counters& x = txstats::acc().total();
+  char buf[704];
   snprintf(buf, sizeof(buf),
     "{\"app\":\"%s\",\"model\":\"TinyC6\",\"fw\":\"%s\",\"hostname\":\"%s\","
-    "\"ip\":\"%s\",\"mac\":\"%s\",\"rssi\":%d,\"bridge\":\"%s\"}",
+    "\"ip\":\"%s\",\"mac\":\"%s\",\"rssi\":%d,\"bridge\":\"%s\","
+    // MAC-layer transmit counters, lifetime (fw 1.12.0). See txstats.h.
+    "\"phy\":\"%s\",\"channel\":%u,\"proto\":\"%s\",\"wifi_tx\":{\"ok\":%u,\"retry_edca\":%u,\"retry_tb\":%u,"
+    "\"tb_times\":%u,\"rx_ack\":%u,\"rx_ba\":%u,\"timeout\":%u,\"collision\":%u,\"no_mem\":%u,"
+    "\"fail\":%u,\"fail_timeout\":%u,\"enabled_acis\":%u,\"samples\":%u}}",
     APP_ID, __DATE__ " " __TIME__, wifi_prov::hostname(),
     WiFi.localIP().toString().c_str(), WiFi.macAddress().c_str(),
-    WiFi.isConnected() ? WiFi.RSSI() : 0, bridgeModeStr(g_bridge_mode));
+    WiFi.isConnected() ? WiFi.RSSI() : 0, bridgeModeStr(g_bridge_mode),
+    txstats::phyString(), (unsigned)txstats::channel(), wifi_proto::name(wifi_prov::wifiProto()),
+    (unsigned)x.tx_succ,
+    (unsigned)x.retry_edca, (unsigned)x.retry_tb, (unsigned)x.tb_times, (unsigned)x.rx_ack,
+    (unsigned)x.rx_ba, (unsigned)x.timeout, (unsigned)x.collision, (unsigned)x.tx_no_mem,
+    (unsigned)x.fail_count, (unsigned)x.fail_timeout,
+    (unsigned)txstats::enabledAcis(), (unsigned)txstats::samples());
   server.send(200, "application/json", buf);
 }
 
@@ -702,9 +731,10 @@ static void handleStatsJson() {
 // The same records HA receives over the socket, readable without a WS client — and reachable when
 // the WS layer is precisely the thing that has stopped working.
 static void handleDiag() {
-  // ~6 kB transient rather than a permanent static: this endpoint is read by a human occasionally,
-  // and the fault under investigation is memory pressure.
-  constexpr size_t CAP = 6144;
+  // Transient rather than a permanent static: this endpoint is read by a human occasionally,
+  // and the fault under investigation is memory pressure. 12 kB since 1.12.0 — each record line
+  // grew a MAC-retry tail and, for socket events, an lwIP pcb tail.
+  constexpr size_t CAP = 12288;
   char* buf = (char*)malloc(CAP);
   if (buf == nullptr) {
     server.send(503, "text/plain", "# diag: out of memory\n");
@@ -745,7 +775,7 @@ static void handleLog() {
 
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/plain", "");
-  char st[1024];
+  char st[1280];
   statusLine(st, sizeof(st));
   server.sendContent(String(st) + "\n");
 
@@ -780,7 +810,7 @@ static void handleSet() {
     if (v > 0) g_gap_us = v;
   }
   startBuses();
-  char st[1024];
+  char st[1280];
   statusLine(st, sizeof(st));
   server.send(200, "text/plain", String(st) + "\n");
 }
@@ -806,6 +836,51 @@ static void handleReboot() {
   Serial.printf("# reboot requested (%s)\n", reason.c_str());
   Serial.flush();
   delay(100);  // let the response leave before the stack goes down
+  ESP.restart();
+}
+
+
+// ---- WiFi protocol A/B knob + PHY recalibration (fw 1.13.0, twin of somfy-sdn/http_api.cpp) ---
+// Both REBOOT (fw 1.14.0): esp_wifi_set_protocol() is honoured only on a fresh WiFi init (the
+// 1.13.0 re-associate left the somfy canary on HE20 with `bgn` persisted), so the knob now
+// carries the same A/C cost as /reboot — the cut RS485 bus is severed for the restart
+// (shq-suite-0042). Turn every zone off first, for /wifiproto as much as for /phycal.
+static void handleWifiProtoGet() {
+  server.send(200, "text/plain", String(wifi_proto::name(wifi_prov::wifiProto())) + "\n");
+}
+
+static void handleWifiProtoSet() {
+  wifi_proto::Proto proto;
+  if (!server.hasArg("set") || !wifi_proto::parse(server.arg("set").c_str(), &proto)) {
+    server.send(400, "text/plain", "# need ?set=bgnax|bgn|bg\n");
+    return;
+  }
+  if (!wifi_prov::setWifiProto(proto)) {
+    server.send(500, "text/plain", "# nvs write failed\n");
+    return;
+  }
+  server.send(200, "text/plain", String(wifi_proto::name(proto)) + " (rebooting to apply)\n");
+  server.client().flush();
+  Serial.println("# reboot requested (wifiproto)");
+  Serial.flush();
+  delay(100);
+  ESP.restart();
+}
+
+static void handlePhyCal() {
+  if (!server.hasArg("erase") || server.arg("erase") != "1") {
+    server.send(400, "text/plain", "# need ?erase=1 (erases PHY calibration data in NVS and REBOOTS)\n");
+    return;
+  }
+  if (!wifi_prov::erasePhyCalibration()) {
+    server.send(500, "text/plain", "# esp_phy_erase_cal_data_in_nvs failed — not rebooting\n");
+    return;
+  }
+  server.send(200, "text/plain", "# PHY calibration erased; rebooting — next boot performs a full RF calibration\n");
+  server.client().flush();
+  Serial.println("# reboot requested (phycal)");
+  Serial.flush();
+  delay(100);
   ESP.restart();
 }
 
@@ -1322,6 +1397,8 @@ static void handleBlink() {
   server.send(200, "text/plain", r);
 }
 
+static constexpr int OTA_CLIENT_TIMEOUT_MS = 30000;
+
 static void handleUpdate() {
   if (!server.hasArg("url")) {
     server.send(400, "text/plain", "# need ?url=http://host:port/firmware.bin\n");
@@ -1349,8 +1426,13 @@ static void handleUpdate() {
   WiFiClient client;
   // Verify the written image's app identity before booting it (OTA app-guard) — refuse a
   // foreign image (e.g. the somfy-sdn firmware) instead of bricking this in-wall controller.
-  httpUpdate.rebootOnUpdate(false);
-  t_httpUpdate_return r = httpUpdate.update(client, url);
+  // 30 s client timeout, not the library's 8 s default (fw 1.14.2, ledger shq-suite-0046): on a
+  // marginal uplink the 525 B GET itself can be lost, and lwIP's initial retransmit ladder is
+  // 3/6/12 s — Living Left's pulls died at 8 s with the request landing at 8.7 s.
+  HTTPUpdate updater(OTA_CLIENT_TIMEOUT_MS);
+  client.setTimeout(OTA_CLIENT_TIMEOUT_MS / 1000);
+  updater.rebootOnUpdate(false);
+  t_httpUpdate_return r = updater.update(client, url);
 
   if (r == HTTP_UPDATE_OK) {
     const esp_partition_t *next = esp_ota_get_boot_partition();
@@ -1366,7 +1448,7 @@ static void handleUpdate() {
                     d.project_name, APP_ID);
     }
   } else {
-    Serial.printf("# OTA failed (%d): %s\n", (int)r, httpUpdate.getLastErrorString().c_str());
+    Serial.printf("# OTA failed (%d): %s\n", (int)r, updater.getLastErrorString().c_str());
   }
   // Either a rejected or failed OTA leaves us running — restore normal operation.
   setBridgeMode(bridge::StreamingBridge::INJECT);
@@ -1382,11 +1464,29 @@ static void pumpConsole() {
     if (c == '\r') continue;
     if (c == '\n') {
       buf[len] = '\0';
-      char st[1024];
+      char st[1280];
       switch (buf[0]) {
         case 'm': Serial.print(measureBaud()); break;
         case 's': statusLine(st, sizeof(st)); Serial.println(st); break;
-        default:  Serial.println("# use the HTTP API; 's' status, 'm' measure"); break;
+        case 'p': {
+          // "proto [bgnax|bgn|bg]" — fw 1.13.0 WiFi protocol A/B knob, same as POST /wifiproto.
+          const char* arg = (strncmp(buf, "proto ", 6) == 0) ? buf + 6 : nullptr;
+          wifi_proto::Proto proto;
+          if (arg == nullptr || *arg == '\0') {
+            Serial.printf("# wifi_proto=%s\n", wifi_proto::name(wifi_prov::wifiProto()));
+          } else if (!wifi_proto::parse(arg, &proto)) {
+            Serial.println("# proto must be bgnax|bgn|bg");
+          } else if (!wifi_prov::setWifiProto(proto)) {
+            Serial.println("# nvs write failed");
+          } else {
+            Serial.printf("# wifi_proto=%s — rebooting to apply (zones off first!)\n", wifi_proto::name(proto));
+            Serial.flush();
+            delay(100);
+            ESP.restart();
+          }
+          break;
+        }
+        default:  Serial.println("# use the HTTP API; 's' status, 'm' measure, 'proto [set]'"); break;
       }
       len = 0;
     } else if (len < sizeof(buf) - 1) {
@@ -1422,6 +1522,9 @@ static void startAppServer() {
   server.on("/reboot", HTTP_POST, handleReboot);
   server.on("/update", HTTP_POST, handleUpdate);
   server.on("/wifireset", HTTP_POST, handleWifiReset);
+  server.on("/wifiproto", HTTP_GET, handleWifiProtoGet);
+  server.on("/wifiproto", HTTP_POST, handleWifiProtoSet);
+  server.on("/phycal", HTTP_POST, handlePhyCal);
   server.on("/armwrite", HTTP_POST, handleArm);
   server.on("/disarm", HTTP_POST, handleDisarm);
   server.on("/txprobe", HTTP_POST, handleTxProbe);
@@ -1483,7 +1586,7 @@ void setup() {
   // after all the servers have allocated, socket headroom with them already bound).
   diag::begin();
 
-  char st[1024];
+  char st[1280];
   statusLine(st, sizeof(st));
   Serial.println(st);
 

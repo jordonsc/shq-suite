@@ -13,4 +13,4 @@
 // timestamps. The number is deliberately kept in step with somfy-sdn: the two are design twins
 // sharing mono/fault/diag/ws_guard verbatim, and a shared generation number is what makes
 // "are the twins in step?" answerable at a glance.
-#define ACTRON_FW_VERSION "1.11.0"
+#define ACTRON_FW_VERSION "1.14.2"

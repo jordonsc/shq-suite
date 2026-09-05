@@ -23,6 +23,7 @@
 #include "mono.h"
 #include "http_api.h"
 #include "version.h"
+#include "wifi_proto.h"
 #include "wifi_prov.h"
 #include "ws_api.h"
 
@@ -134,6 +135,7 @@ static void pumpConsole() {
       Serial.println("#  forget <addr>                            remove motor from table");
       Serial.println("#  cfg <baud> <n|e|o>                       re-init UART (bring-up)");
       Serial.println("#  probe [ms]                               TX bcast GET_NODE_ADDR, dump raw RX");
+      Serial.println("#  proto [bgnax|bgn|bg]                     WiFi protocol A/B knob (persists; REBOOTS to apply)");
     } else if (!strcmp(cmd, "cfg") && n >= 3) {
       uint32_t baud = strtoul(toks[1], nullptr, 10);
       bus::reconfigure(baud, toks[2][0]);
@@ -147,6 +149,23 @@ static void pumpConsole() {
                     bus::currentParity(), (unsigned)k);
       for (size_t i = 0; i < k; i++) Serial.printf(" %02X", raw[i]);
       Serial.println();
+    } else if (!strcmp(cmd, "proto")) {
+      // fw 1.13.0 WiFi protocol A/B knob — same semantics as POST /wifiproto.
+      if (n < 2) {
+        Serial.printf("# wifi_proto=%s\n", wifi_proto::name(wifi_prov::wifiProto()));
+      } else {
+        wifi_proto::Proto proto;
+        if (!wifi_proto::parse(toks[1], &proto)) {
+          Serial.println("# proto must be bgnax|bgn|bg");
+        } else if (!wifi_prov::setWifiProto(proto)) {
+          Serial.println("# nvs write failed");
+        } else {
+          Serial.printf("# wifi_proto=%s — rebooting to apply\n", wifi_proto::name(proto));
+          Serial.flush();
+          delay(100);
+          wifi_prov::noteReboot("wifiproto");
+        }
+      }
     } else if (!strcmp(cmd, "s")) {
       printStatus();
     } else if (!strcmp(cmd, "d")) {

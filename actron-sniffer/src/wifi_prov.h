@@ -12,6 +12,8 @@
 
 #include <cstdint>
 
+#include "wifi_proto.h"
+
 namespace wifi_prov {
 
 enum class Status : uint8_t { CONNECTED, PORTAL };
@@ -48,5 +50,20 @@ uint32_t netProbeFailures();   // consecutive gateway probes unanswered (0 when 
 uint32_t netRecoveries();      // watchdog-driven re-associations since boot
 uint32_t netProbes();          // gateway probes sent since boot
 const char* netLastReason();   // reason of the newest watchdog action, "none" until one fires
+
+// WiFi protocol A/B knob (fw 1.13.0, ledger shq-suite-0046; the pure part is wifi_proto.h).
+// Persisted in NVS (key wifi_proto::NVS_KEY in this firmware's namespace), read once in begin()
+// and applied with esp_wifi_set_protocol() immediately before every WiFi.begin() — the boot
+// connect, reassociate() (manual / netwatch) and, on the somfy twin, the link-retry loop.
+// `bgnax` (the default) is written explicitly too (1.14.1). setWifiProto() persists + caches and
+// returns false only if the NVS write failed; it does NOT touch the live link — call
+// requestReconnectBestAp() afterwards so the new bitmap lands on a fresh association.
+wifi_proto::Proto wifiProto();
+bool setWifiProto(wifi_proto::Proto p);
+
+// One-shot: esp_phy_erase_cal_data_in_nvs(). The NEXT boot then performs a full RF calibration
+// instead of the partial one CONFIG_ESP_PHY_RF_CAL_PARTIAL does against the stored data. The
+// caller reboots (noteReboot("phycal")); nothing here does. Returns false if the NVS erase failed.
+bool erasePhyCalibration();
 
 }  // namespace wifi_prov

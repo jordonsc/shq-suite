@@ -17,7 +17,9 @@
 #include "fault.h"
 #include "mono.h"
 #include "sdn.h"
+#include "txstats.h"
 #include "version.h"
+#include "wifi_proto.h"
 #include "wifi_prov.h"
 #include "ws_api.h"
 
@@ -86,7 +88,7 @@ String statusLine() {
     devices::Device* d = t.at(i);
     if (d && d->online) online++;
   }
-  char buf[1024];
+  char buf[1280];
   snprintf(buf, sizeof(buf),
            "# app=%s mode=%s devices=%u online=%u "
            "tx=%u rx=%u polls=%u "
@@ -106,7 +108,7 @@ String statusLine() {
            "wifi_disc=%u wifi_reason=%u reset=%s note=%s "
            // Self-diagnostics summary (ledger shq-suite-0038). `sock` is spare lwIP sockets — 0
            // means the pool HTTP and WS share is exhausted. `loop_max`/`http_max` are the worst
-           // main-loop and HTTP-pump stalls since boot; anything near the 5 s pong deadline
+           // main-loop and HTTP-pump stalls since boot; a multi-second stall is still a fault, but
            // explains an eviction. `pongto`/`peerclose`/`txerr` split the disconnects by who
            // caused them. Full records at /diag. READ clk_back AS A RATE: a healthy controller
            // gathers a few hundred over four days, and thousands per second is a clock pinned
@@ -123,6 +125,13 @@ String statusLine() {
            // Device-level fault (fw 1.10.0). "ok" when clear; otherwise the worst active code
            // and its one-line detail. This is what HA's fault sensor mirrors.
            "fault=%s fault_detail=\"%s\" "
+           // MAC-layer transmit counters (fw 1.12.0, txstats.h — read-only baseline for the
+           // long-frame uplink-loss investigation). tx_retry/tx_to climbing against tx_ok is
+           // the air interface failing; tx_en=0 means the driver never enabled them.
+           "tx_ok=%u tx_retry=%u tx_tbretry=%u tx_to=%u tx_coll=%u tx_nomem=%u tx_fail=%u "
+           // Configured protocol set (fw 1.13.0 A/B knob): bgnax (default, driver untouched) |
+           // bgn | bg. Compare with phy= (negotiated) to confirm the AP honoured it.
+           "tx_en=%u phy=\"%s\" ch=%u proto=%s "
            "rssi=%d ip=%s fw=\"%s\"",
            APP_ID, modeStr(), (unsigned)t.count(), (unsigned)online,
            st.tx_frames, st.rx_frames, st.polls,
@@ -147,6 +156,13 @@ String statusLine() {
            (unsigned)wifi_prov::netProbeFailures(), (unsigned)wifi_prov::netProbes(),
            (unsigned)wifi_prov::netRecoveries(), wifi_prov::netLastReason(),
            fault::registry().worstSlug(), fault::registry().worstDetail(),
+           (unsigned)txstats::acc().total().tx_succ, (unsigned)txstats::acc().total().retry_edca,
+           (unsigned)txstats::acc().total().retry_tb, (unsigned)txstats::acc().total().timeout,
+           (unsigned)txstats::acc().total().collision,
+           (unsigned)txstats::acc().total().tx_no_mem,
+           (unsigned)txstats::acc().total().fail_count, (unsigned)txstats::enabledAcis(),
+           txstats::phyString(), (unsigned)txstats::channel(),
+           wifi_proto::name(wifi_prov::wifiProto()),
            WiFi.isConnected() ? WiFi.RSSI() : 0,
            WiFi.localIP().toString().c_str(), SOMFY_FW_VERSION " (" __DATE__ " " __TIME__ ")");
   return String(buf);
@@ -156,9 +172,10 @@ String statusLine() {
 // The same records HA receives over the socket, readable without a WS client — and reachable when
 // the WS layer is precisely the thing that has stopped working.
 static void handleDiag() {
-  // ~6 kB transient rather than a permanent static: this endpoint is read by a human occasionally,
-  // and the fault under investigation is memory pressure.
-  constexpr size_t CAP = 6144;
+  // Transient rather than a permanent static: this endpoint is read by a human occasionally,
+  // and the fault under investigation is memory pressure. 12 kB since 1.12.0 — each record line
+  // grew a MAC-retry tail and, for socket events, an lwIP pcb tail.
+  constexpr size_t CAP = 12288;
   char* buf = (char*)malloc(CAP);
   if (buf == nullptr) {
     g_server->send(503, "text/plain", "# diag: out of memory\n");
@@ -294,6 +311,9 @@ void handleHelp() {
   b += "POST /move?addr=AA:BB:CC&cmd=open|close|stop|pos|jogup|jogdown&value=<ha%|duration>\n";
   b += "POST /wifi?ssid=&password=        set creds, reboot\n";
   b += "POST /reconnect                  re-scan + reassociate to the strongest AP\n";
+  b += "GET  /wifiproto                  configured WiFi protocol set (bgnax|bgn|bg)\n";
+  b += "POST /wifiproto?set=bgnax|bgn|bg persist + REBOOT to apply (A/B knob; bgnax = untouched default)\n";
+  b += "POST /phycal?erase=1             erase PHY calibration in NVS, reboot (full RF cal next boot)\n";
   b += "POST /update?url=<bin>            HTTP-pull OTA\n";
   b += "POST /clear                      reset ring buffers + counters\n";
   b += "POST /reboot?reason=<text>        deliberate restart (reason lands in next boot note=)\n";
@@ -355,6 +375,30 @@ void handleStatsJson() {
   nw["last_reason"] = wifi_prov::netLastReason();
   doc["wifi_disc"] = wifi_prov::staDisconnectCount();
   doc["wifi_reason"] = wifi_prov::lastDisconnectReason();
+  // MAC-layer transmit counters, lifetime (fw 1.12.0). See txstats.h for the field meanings.
+  {
+    const txstats::Counters& x = txstats::acc().total();
+    JsonObject w = doc["wifi_tx"].to<JsonObject>();
+    w["ok"] = x.tx_succ;
+    w["enable"] = x.tx_enable;
+    w["complete"] = x.tx_complete;
+    w["retry_edca"] = x.retry_edca;
+    w["retry_tb"] = x.retry_tb;
+    w["tb_times"] = x.tb_times;
+    w["rx_ack"] = x.rx_ack;
+    w["rx_ba"] = x.rx_ba;
+    w["timeout"] = x.timeout;
+    w["collision"] = x.collision;
+    w["no_mem"] = x.tx_no_mem;
+    w["error_a0"] = x.tx_error_a0;
+    w["fail"] = x.fail_count;
+    w["fail_timeout"] = x.fail_timeout;
+    w["enabled_acis"] = txstats::enabledAcis();
+    w["samples"] = txstats::samples();
+    doc["phy"] = txstats::phyString();
+    doc["channel"] = txstats::channel();
+  }
+  doc["proto"] = wifi_proto::name(wifi_prov::wifiProto());  // fw 1.13.0 A/B knob
   doc["tx"] = st.tx_frames;
   doc["rx"] = st.rx_frames;
   doc["polls"] = st.polls;
@@ -545,6 +589,53 @@ void handleReconnect() {
   g_server->send(200, "text/plain", "# WiFi reconnect to strongest AP queued\n");
 }
 
+
+// ---- WiFi protocol A/B knob + PHY recalibration (fw 1.13.0, ledger shq-suite-0046) -----------
+// The knob is the instrument for the long-frame uplink-loss root cause: switch ONE churning unit
+// off 11ax (bgn) or off 11n (bg) without a reflash, keep its clean neighbour as the control, read
+// the churn + tx_* counters from HA. GET returns the configured slug on its own line; POST
+// persists it, replies, then REBOOTS (fw 1.14.0): esp_wifi_set_protocol() is honoured only on a
+// fresh WiFi init — the 1.13.0 re-associate left the canary negotiating HE20 with `bgn`
+// persisted, while a reboot came up HT20 (ledger shq-suite-0046). note= says why it restarted.
+void handleWifiProtoGet() {
+  g_server->send(200, "text/plain", String(wifi_proto::name(wifi_prov::wifiProto())) + "\n");
+}
+
+void handleWifiProtoSet() {
+  wifi_proto::Proto proto;
+  if (!g_server->hasArg("set") || !wifi_proto::parse(g_server->arg("set").c_str(), &proto)) {
+    g_server->send(400, "text/plain", "# need ?set=bgnax|bgn|bg\n");
+    return;
+  }
+  if (!wifi_prov::setWifiProto(proto)) {
+    g_server->send(500, "text/plain", "# nvs write failed\n");
+    return;
+  }
+  g_server->send(200, "text/plain", String(wifi_proto::name(proto)) + " (rebooting to apply)\n");
+  g_server->client().flush();
+  delay(100);  // let the response leave before the stack goes down
+  wifi_prov::noteReboot("wifiproto");
+}
+
+// One-shot, HTTP only (deliberately no HA button — this is a last-resort remedy, not a control):
+// erase the stored partial-calibration data so the next boot runs a FULL RF calibration
+// (CONFIG_ESP_PHY_RF_CAL_PARTIAL=y otherwise trims against the stored set, so a stale or bad
+// calibration persists across every ordinary reboot). Reply first, then noteReboot("phycal").
+void handlePhyCal() {
+  if (!g_server->hasArg("erase") || g_server->arg("erase") != "1") {
+    g_server->send(400, "text/plain", "# need ?erase=1 (erases PHY calibration data in NVS and reboots)\n");
+    return;
+  }
+  if (!wifi_prov::erasePhyCalibration()) {
+    g_server->send(500, "text/plain", "# esp_phy_erase_cal_data_in_nvs failed — not rebooting\n");
+    return;
+  }
+  g_server->send(200, "text/plain", "# PHY calibration erased; rebooting — next boot performs a full RF calibration\n");
+  g_server->client().flush();
+  delay(100);  // let the response leave before the stack goes down
+  wifi_prov::noteReboot("phycal");
+}
+
 void handleMove() {
   if (!g_server->hasArg("addr") || !g_server->hasArg("cmd")) {
     g_server->send(400, "text/plain", "# need ?addr=AA:BB:CC&cmd=open|close|stop|pos[&value=<ha%>]\n");
@@ -630,6 +721,8 @@ void handleReboot() {
   wifi_prov::noteReboot(reason.c_str());
 }
 
+static constexpr int OTA_CLIENT_TIMEOUT_MS = 30000;
+
 void handleUpdate() {
   if (!g_server->hasArg("url")) {
     g_server->send(400, "text/plain", "# need ?url=http://host:port/firmware.bin\n");
@@ -647,8 +740,13 @@ void handleUpdate() {
   // Don't let httpUpdate reboot us automatically — we verify the written image's app identity
   // first (OTA app-guard). httpUpdate.update() still switches the boot partition on success;
   // we either boot it (id matches) or revert the boot partition (foreign image, never booted).
-  httpUpdate.rebootOnUpdate(false);
-  t_httpUpdate_return r = httpUpdate.update(client, url);
+  // 30 s client timeout, not the library's 8 s default (fw 1.14.2, ledger shq-suite-0046): on a
+  // marginal uplink the 525 B GET itself can be lost, and lwIP's initial retransmit ladder is
+  // 3/6/12 s — Living Left's pulls died at 8 s with the request landing at 8.7 s.
+  HTTPUpdate updater(OTA_CLIENT_TIMEOUT_MS);
+  client.setTimeout(OTA_CLIENT_TIMEOUT_MS / 1000);
+  updater.rebootOnUpdate(false);
+  t_httpUpdate_return r = updater.update(client, url);
 
   if (r == HTTP_UPDATE_OK) {
     const esp_partition_t* next = esp_ota_get_boot_partition();
@@ -667,7 +765,7 @@ void handleUpdate() {
       bus::otaResume();
     }
   } else {
-    Serial.printf("# OTA failed (%d): %s\n", (int)r, httpUpdate.getLastErrorString().c_str());
+    Serial.printf("# OTA failed (%d): %s\n", (int)r, updater.getLastErrorString().c_str());
     bus::otaResume();
   }
 }
@@ -692,6 +790,9 @@ void begin(uint16_t port) {
   g_server->on("/forget", HTTP_POST, handleForget);
   g_server->on("/wifi", HTTP_POST, handleWifi);
   g_server->on("/reconnect", HTTP_POST, handleReconnect);
+  g_server->on("/wifiproto", HTTP_GET, handleWifiProtoGet);
+  g_server->on("/wifiproto", HTTP_POST, handleWifiProtoSet);
+  g_server->on("/phycal", HTTP_POST, handlePhyCal);
   g_server->on("/update", HTTP_POST, handleUpdate);
   g_server->on("/clear", HTTP_POST, handleClear);
   g_server->on("/reboot", HTTP_POST, handleReboot);

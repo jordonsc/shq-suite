@@ -13,8 +13,11 @@
 #include "fault.h"
 #include "mono.h"
 #include "sdn.h"
+#include "tcpsnap.h"
 #include "ws_guard.h"
+#include "ws_liveness.h"
 #include "version.h"
+#include "wifi_proto.h"
 #include "wifi_prov.h"
 
 namespace ws_api {
@@ -50,12 +53,29 @@ uint32_t g_hb_broadcasts = 0;
 // Diagnostics fan-out cursor (ledger shq-suite-0038). diag records are POLLED from loop() rather
 // than pushed from a callback: every record originates inside the WS library's own event dispatch,
 // and emitting a frame from there would re-enter the server mid-iteration.
-uint32_t g_last_diag_seq_sent = 0;
+// Per-client replay cursor (fw 1.14.0): the newest diag seq already sent to that slot. Set to
+// the start of the backlog on connect, so the backlog and the live stream are ONE mechanism — a
+// record per frame, at most one per DIAG_DRAIN_SPACING_MS per client, each held back while the
+// socket would block or the pcb is retransmitting. The old `diag_backlog` frame (12 records, ~2.6 kB,
+// two full-MSS segments) was the largest frame this firmware ever sent and the pcap showed it
+// lost on every attempt on the affected boards — a reconnect could not succeed on exactly the
+// units that needed one, which is why the churn was self-perpetuating (shq-suite-0046).
+uint32_t g_diag_cursor[WEBSOCKETS_SERVER_CLIENT_MAX] = {0};
 uint32_t g_last_health_ms = 0;
+uint8_t g_health_phase = 0;  // 0 = idle; 1..3 = which of the three health frames goes next
+uint32_t g_health_phase_ms = 0;
+uint32_t g_last_tcp_sample_ms = 0;
 
-// Records replayed to a client the moment it connects. A socket can never be told about its own
-// death, so this is the ONLY way HA learns why the previous session ended.
+// Records replayed to a client the moment it connects (see g_diag_cursor).
 constexpr uint32_t DIAG_BACKLOG_MAX = 12;
+// Minimum spacing between two diag frames to ONE client. The frame budget is per WS frame, but
+// lwIP merges writes: CONFIG_LWIP_TCP_OVERSIZE_MSS=y gives every unsent segment a full-MSS pbuf
+// that later writes FILL while it waits for cwnd (1-2 MSS on a fresh socket) or an ACK. Two
+// records per loop pass therefore left the device as 1436 B segments on every reconnect — the
+// very size class the pcap showed lost. 250 ms is far above the LAN RTT, so each record is
+// ACKed before the next is written and stays its own segment.
+constexpr uint32_t DIAG_DRAIN_SPACING_MS = 250;
+uint32_t g_diag_sent_ms[WEBSOCKETS_SERVER_CLIENT_MAX] = {0};  // mono::now() of the last diag frame per slot
 
 const char* movementName(sdn::MovementState m) {
   switch (m) {
@@ -291,6 +311,22 @@ void handleCommand(uint8_t client, JsonDocument& doc) {
     wifi_prov::requestReconnectBestAp();
     return;
   }
+  if (strcmp(command, "set_wifi_proto") == 0) {
+    // fw 1.13.0 WiFi protocol A/B knob (ledger shq-suite-0046). Persist, ack, then REBOOT
+    // (fw 1.14.0): esp_wifi_set_protocol() is honoured only on a fresh WiFi init — a live
+    // re-association left the canary negotiating HE20 with `bgn` persisted, while a reboot came
+    // up HT20. The reason lands in the next boot's note= so the restart is not read as a crash.
+    const char* p = obj["proto"];
+    wifi_proto::Proto proto;
+    if (p == nullptr || !wifi_proto::parse(p, &proto)) {
+      sendError(client, id, "proto must be bgnax|bgn|bg");
+      return;
+    }
+    if (!wifi_prov::setWifiProto(proto)) { sendError(client, id, "nvs write failed"); return; }
+    sendAck(client, id);
+    delay(100);
+    wifi_prov::noteReboot("wifiproto");
+  }
 
   if (handleMotorCommand(command, obj, &err)) {
     sendAck(client, id);
@@ -301,65 +337,100 @@ void handleCommand(uint8_t client, JsonDocument& doc) {
 
 // ---- diagnostics fan-out ------------------------------------------------
 
-void sendDiagRecord(const diag::Record& r) {
-  if (g_server == nullptr) return;
+// One record, one frame (<= ~554 B with the tcp_* keys), to one client, through the telemetry
+// gate: skipped while the socket would block or the pcb is retransmitting. Returns false when
+// held back so the caller's cursor stays put and the record is retried next pass.
+bool sendDiagRecordTo(uint8_t client, const diag::Record& r) {
   JsonDocument doc;
   doc["type"] = "diag";
   JsonObject obj = doc["event"].to<JsonObject>();
   diag::toJson(r, obj);
   String out;
   serializeJson(doc, out);
-  g_server->broadcastWritableTXT(out);
+  return (*g_server).sendTelemetryTXT(client, out);
 }
 
-// Deliberately does NOT advance g_last_diag_seq_sent: a second client would otherwise be starved
-// of everything this backlog covered. HA keys on `seq`, so a repeat is discarded there.
-void sendDiagBacklog(uint8_t client) {
-  if (g_server == nullptr) return;
+// Point a fresh client's cursor at the start of its backlog — the last DIAG_BACKLOG_MAX records
+// (or fewer) — for drainDiag() to deliver one frame at a time. A socket can never be told about
+// its own death, so this is the ONLY way HA learns why the previous session ended. HA keys on
+// `seq`, so a record a second client already received live is simply discarded there.
+void startDiagBacklog(uint8_t client) {
+  if (client >= WEBSOCKETS_SERVER_CLIENT_MAX) return;
   const uint32_t last = diag::lastSeq();
-  if (last == 0) return;
   uint32_t first = diag::firstSeq();
+  if (last == 0 || first == 0) { g_diag_cursor[client] = last; return; }
   if (last - first + 1 > DIAG_BACKLOG_MAX) first = last - DIAG_BACKLOG_MAX + 1;
+  g_diag_cursor[client] = first - 1;
+  g_diag_sent_ms[client] = 0;
+}
 
+// Advance every connected client's cursor towards the ring head, one frame per
+// DIAG_DRAIN_SPACING_MS. The cursor only moves on a successful queue, so a held-back frame is
+// retried, not lost.
+void drainDiag(uint32_t now) {
+  const uint32_t newest = diag::lastSeq();
+  const uint32_t oldest = diag::firstSeq();
+  for (uint8_t i = 0; i < WEBSOCKETS_SERVER_CLIENT_MAX; i++) {
+    if (!(*g_server).connected(i)) continue;
+    if (oldest > 0 && g_diag_cursor[i] + 1 < oldest) g_diag_cursor[i] = oldest - 1;  // the ring wrapped past us
+    if (g_diag_cursor[i] >= newest) continue;
+    if (g_diag_sent_ms[i] != 0 && (uint32_t)(now - g_diag_sent_ms[i]) < DIAG_DRAIN_SPACING_MS) continue;
+    const diag::Record* r = diag::bySeq(g_diag_cursor[i] + 1);
+    if (r != nullptr) {
+      if (!sendDiagRecordTo(i, *r)) continue;
+      g_diag_sent_ms[i] = (now == 0) ? 1u : now;  // 0 is the "never" sentinel
+    }
+    g_diag_cursor[i]++;
+  }
+}
+
+// The health push is THREE frames, a second apart, each under ws_liveness::FRAME_BUDGET_BYTES:
+//   health      device vitals + WS-layer counters + fault + fw
+//   health_ws   guard/liveness counters + lwIP's view of the HA socket
+//   health_net  netwatch + MAC transmit telemetry + PHY/protocol
+// The single ~1.3 kB `health` frame was the largest periodic thing this firmware sent, and the
+// one the pcap showed being lost on the affected boards (shq-suite-0046). HA merges the three
+// into one dict, so every sensor reads exactly as before.
+void sendHealthFrame(uint8_t phase) {
   JsonDocument doc;
-  doc["type"] = "diag_backlog";
-  JsonArray arr = doc["events"].to<JsonArray>();
-  for (uint32_t seq = first; seq <= last; seq++) {
-    const diag::Record* r = diag::bySeq(seq);
-    if (r != nullptr) diag::toJson(*r, arr.add<JsonObject>());
+  JsonObject obj = doc["data"].to<JsonObject>();
+  if (phase == 1) {
+    doc["type"] = "health";
+    diag::healthCoreToJson(obj);
+    // WS-layer counters live here, not in diag, so diag stays independent of the server it watches.
+    obj["clients"] = (*g_server).connectedClients();
+    obj["ws_conn"] = g_conn_events;
+    obj["ws_disc"] = g_disc_events;
+    obj["ws_err"] = g_err_events;
+    obj["hb_age_ms"] = (uint32_t)(mono::now() - g_last_heartbeat_ms);
+    obj["hb_tx"] = g_hb_broadcasts;
+    // Device-level fault (fw 1.10.0, ledger shq-suite-0041). "ok" when clear. This is the signal
+    // that was missing when a clock wedged for nine hours with every indicator green.
+    obj["fault"] = fault::registry().worstSlug();
+    obj["fault_detail"] = fault::registry().worstDetail();
+    obj["fault_mask"] = fault::registry().mask();
+    obj["fw"] = SOMFY_FW_VERSION " " __DATE__ " " __TIME__;
+  } else if (phase == 2) {
+    doc["type"] = "health_ws";
+    diag::healthWsToJson(obj);
+    // Write-guard + liveness counters (ws_guard.h). skipped/deferred separate "briefly busy,
+    // skipped one frame, recovered" from "socket died"; liveness_extended counts the holes the
+    // policy rode out instead of evicting; big_frames must stay 0.
+    obj["skipped_writes"] = (*g_server).skippedWrites();
+    obj["deferred_reaps"] = (*g_server).deferredReaps();
+    obj["liveness_evicts"] = (*g_server).livenessEvicts();
+    obj["liveness_extended"] = (*g_server).livenessExtensions();
+    obj["deferred_telemetry"] = (*g_server).deferredTelemetry();
+    obj["pings"] = (*g_server).pingsSent();
+    obj["ping_skips"] = (*g_server).pingSkips();
+    obj["big_frames"] = (*g_server).bigFrames();
+  } else {
+    doc["type"] = "health_net";
+    diag::healthNetToJson(obj);
   }
   String out;
   serializeJson(doc, out);
-  g_server->sendWritableTXT(client, out);
-}
-
-void sendHealth() {
-  if (g_server == nullptr) return;
-  JsonDocument doc;
-  doc["type"] = "health";
-  JsonObject obj = doc["data"].to<JsonObject>();
-  diag::healthToJson(obj);
-  // WS-layer counters live here, not in diag, so diag stays independent of the server it watches.
-  obj["clients"] = g_server->connectedClients();
-  obj["ws_conn"] = g_conn_events;
-  obj["ws_disc"] = g_disc_events;
-  obj["ws_err"] = g_err_events;
-  obj["hb_age_ms"] = (uint32_t)(mono::now() - g_last_heartbeat_ms);
-  // Writes the guard declined because the socket would have blocked. Paired with
-  // stall_reaps this separates "briefly busy, skipped one frame, recovered" from
-  // "socket died" — the gradation an AP that black-holes delivery would paint.
-  obj["skipped_writes"] = g_server->skippedWrites();
-  obj["deferred_reaps"] = g_server->deferredReaps();
-  obj["hb_tx"] = g_hb_broadcasts;
-  // Device-level fault (fw 1.10.0, ledger shq-suite-0041). "ok" when clear. This is the signal
-  // that was missing when Bed 2's clock wedged for nine hours with every indicator green.
-  obj["fault"] = fault::registry().worstSlug();
-  obj["fault_detail"] = fault::registry().worstDetail();
-  obj["fault_mask"] = fault::registry().mask();
-  obj["fw"] = SOMFY_FW_VERSION " " __DATE__ " " __TIME__;
-  String out;
-  serializeJson(doc, out);
-  g_server->broadcastWritableTXT(out);
+  (*g_server).broadcastTelemetryTXT(out);
 }
 
 void onEvent(uint8_t client, WStype_t type, uint8_t* payload, size_t length) {
@@ -370,8 +441,9 @@ void onEvent(uint8_t client, WStype_t type, uint8_t* payload, size_t length) {
       const IPAddress ip = g_server->remoteIP(client);
       diag::noteWsConnect(client, ip.toString().c_str(), g_server->connectedClients());
       sendStateTo(client);
-      // After the snapshot, so a client always has state before it has history.
-      sendDiagBacklog(client);
+      // After the snapshot, so a client always has state before it has history. The backlog is
+      // drained a record per frame from loop(), never blasted as one frame (see g_diag_cursor).
+      startDiagBacklog(client);
       break;
     }
     case WStype_DISCONNECTED:
@@ -412,30 +484,29 @@ void begin(uint16_t port) {
   g_server = new GuardedWebSocketsServer(port);
   g_server->begin();
   g_server->onEvent(onEvent);
-  // Protocol-level ping/pong with dead-client eviction. The app-level state heartbeat below is a
-  // data push, not a liveness probe — it can't detect a half-open socket. On a marginal WiFi link
-  // (e.g. a weak-signal motor) a dropped association leaves the client's TCP connection half-open
-  // with no FIN; without this the zombie lingers until lwIP's retransmit timeout (minutes), during
-  // which writes to it stall the WS service loop and new connections can't be served. Ping every
-  // 15 s, expect a pong within 5 s, disconnect after 2 consecutive misses (~30 s to reap).
-  // Parameters live in diag.h so the disconnect classifier reasons about exactly the deadlines
-  // that trigger an eviction here (ledger shq-suite-0038).
-  g_server->enableHeartbeat(diag::WS_PING_INTERVAL_MS, diag::WS_PONG_TIMEOUT_MS,
-                            diag::WS_PONG_MISSES);
+  // NO enableHeartbeat() (fw 1.14.0, ledger shq-suite-0046). The library's keepalive pinged the
+  // socket unguarded from inside loop() and evicted a client 10 s after the first missed pong —
+  // inside lwIP's retransmit ladder, so a 10 s uplink fade became a dead session (42 sessions
+  // recorded at pong_age = 25.0 s exactly). The half-open-zombie case it was added for in
+  // fw 1.1.5 is still covered: GuardedWebSocketsServer pings through the write-guard and judges
+  // liveness on the policy in ws_liveness.h (silence in BOTH directions for 45 s, extended while
+  // the pcb is retransmitting, hard cap 120 s; unwritable 30 s).
   g_last_heartbeat_ms = mono::now();
   g_last_health_ms = g_last_heartbeat_ms;
-  g_last_diag_seq_sent = diag::lastSeq();
 }
 
 void loop() {
   if (g_server == nullptr) return;
-  // Reap BEFORE loop(), not after (fw 1.8.0). enableHeartbeat's ping is sent from inside loop()
-  // and writes to the socket DIRECTLY, bypassing the write-guard — so a blocked slot still
-  // present when the library runs costs the full ~10 s core write. Dropping it first is what
-  // closes the residual 10,016 ms stall seen on this fleet's worst unit (shq-suite-0038).
-  g_server->reapStalled(mono::now(), WS_STALL_REAP_MS);
+  // Judge BEFORE loop() (fw 1.8.0's ordering, kept): a slot the policy drops must be gone before
+  // the library touches it. Since fw 1.14.0 no library write is unguarded — the keepalive ping
+  // below goes through the guard and the library's own heartbeat is off — so this ordering is
+  // hygiene rather than the 10 s core-write defence it used to be (ws_liveness.h).
+  g_server->judge(mono::now());
 
   g_server->loop();
+
+  // Our keepalive, after loop() so a pong that just arrived is already on the books.
+  g_server->sendPings(mono::now());
 
   if (g_dirty) {
     g_dirty = false;
@@ -458,27 +529,40 @@ void loop() {
     g_last_heartbeat_ms = t;
   }
 
-  // Drain new diagnostics to any listener. Bounded per iteration so a reconnect burst can't turn
-  // one loop pass into the very stall it reports.
+  // Drain diagnostics to every listener, a record per frame, paced per client so a reconnect
+  // burst is neither a loop stall nor a run of coalesced full-MSS segments.
   if (g_server->connectedClients() > 0) {
-    const uint32_t newest = diag::lastSeq();
-    if (g_last_diag_seq_sent < diag::firstSeq()) g_last_diag_seq_sent = diag::firstSeq() - 1;
-    uint8_t budget = 4;
-    while (g_last_diag_seq_sent < newest && budget-- > 0) {
-      const diag::Record* r = diag::bySeq(++g_last_diag_seq_sent);
-      if (r != nullptr) sendDiagRecord(*r);
-    }
-    if ((uint32_t)(t - g_last_health_ms) >= diag::HEALTH_INTERVAL_MS) {
+    drainDiag(t);
+    // Three health frames a second apart (sendHealthFrame), never in one pass.
+    if (g_health_phase == 0 && (uint32_t)(t - g_last_health_ms) >= diag::HEALTH_INTERVAL_MS) {
       g_last_health_ms = t;
-      sendHealth();
+      g_health_phase = 1;
+      g_health_phase_ms = t - 1000;  // the first frame goes out now
+    }
+    if (g_health_phase != 0 && (uint32_t)(t - g_health_phase_ms) >= 1000) {
+      sendHealthFrame(g_health_phase);
+      g_health_phase_ms = t;
+      g_health_phase = (g_health_phase >= 3) ? 0 : (uint8_t)(g_health_phase + 1);
     }
   } else {
-    // Nobody listening: keep the cursor at the head so a fresh client gets the backlog once,
-    // rather than the backlog and then a replay of the same records.
-    g_last_diag_seq_sent = diag::lastSeq();
+    g_health_phase = 0;
   }
 
   diag::tick((uint32_t)(t - g_last_heartbeat_ms));
+
+  // lwIP pcb sample for every connected client, once a second (fw 1.12.0, tcpsnap.h). This is
+  // what lets a ws_disconnect record say what TCP thought of the socket — by the time the
+  // library reports the disconnect the pcb is already gone. One list walk under the core lock.
+  if ((uint32_t)(t - g_last_tcp_sample_ms) >= 1000) {
+    g_last_tcp_sample_ms = t;
+    for (uint8_t i = 0; i < WEBSOCKETS_SERVER_CLIENT_MAX; i++) {
+      const int fd = g_server->fdOf(i);
+      if (fd < 0) continue;
+      tcpsnap::Snap snap;
+      tcpsnap::capture(fd, snap);
+      diag::noteTcp(i, snap);
+    }
+  }
 
   // Wedge watchdog (see the note by g_at_capacity_since_ms): if every WS slot has been occupied
   // continuously for WEDGE_REBOOT_MS, the server can no longer accept the HA coordinator — reboot

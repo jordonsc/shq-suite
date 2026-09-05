@@ -9,6 +9,8 @@
 #include <cstring>
 
 #include "mono.h"
+#include "txstats.h"
+#include "wifi_proto.h"
 #include "wifi_prov.h"
 
 namespace diag {
@@ -32,9 +34,13 @@ struct Slot {
   uint16_t rx_msgs = 0;
   uint16_t tx_msgs = 0;
   char ip[16] = {0};
+  tcpsnap::Snap tcp;       // last 1 Hz pcb sample (fw 1.12.0)
+  Reason evicted = Reason::None;  // set by the guard when IT dropped the slot (fw 1.14.0)
 };
 
 Slot slots_[MAX_SLOTS];
+
+uint16_t sat16(uint32_t v) { return v > 0xFFFF ? 0xFFFF : (uint16_t)v; }
 
 Record ring_[RING_CAPACITY];
 size_t ring_count_ = 0;    // records ever written, capped conceptually — see firstSeq()
@@ -109,6 +115,15 @@ Record& push(Event ev) {
   r.http_max_ms = http_win_;
   loop_win_ = 0;
   http_win_ = 0;
+  // MAC transmit deltas since the previous record, then reset that window (fw 1.12.0).
+  {
+    const txstats::Counters w = txstats::acc().sinceRecord();
+    r.tx_ok = sat16(w.tx_succ);
+    r.tx_retry = sat16(w.retries());
+    r.tx_to = sat16(w.timeout);
+    r.tx_fail = sat16(w.fail_count);
+    txstats::accMutable().markRecord();
+  }
   ring_count_++;
   return r;
 }
@@ -282,20 +297,19 @@ void noteWsDisconnect(uint8_t client_id, uint8_t clients) {
     tx = s.tx_msgs;
     strncpy(ip, s.ip, sizeof(ip) - 1);
 
-    if (s.last_error_ms != 0 && (uint32_t)(now - s.last_error_ms) <= 2000) {
+    if (s.evicted != Reason::None) {
+      // Observed, not inferred (fw 1.14.0): the guard told us it dropped this slot, and why.
+      // Its counter was bumped at the time (noteWsEvict / noteWsStallReap).
+      reason = s.evicted;
+    } else if (s.last_error_ms != 0 && (uint32_t)(now - s.last_error_ms) <= 2000) {
       reason = Reason::TransportError;
       transport_errors_++;
-    } else if (pong_age >= PONG_OVERDUE_MS) {
-      // Our own reaper. The client may be in perfect health — a main-loop stall long enough to
-      // miss the pong window produces exactly this, which is why loop_max_ms rides along.
-      reason = Reason::PongTimeout;
-      pong_timeouts_++;
     } else if (pong_age <= WS_PING_INTERVAL_MS ||
                (uint32_t)(now - s.last_rx_ms) <= PEER_ACTIVE_MS) {
-      // A pong inside the last ping cycle rules our reaper out entirely — it only evicts after
-      // consecutive misses — so whatever closed this socket, it was not us. The library gives no
-      // callback for a received close frame, which is why this is inferred rather than observed:
-      // HA's own `ha_clean`/`ha_closed` event is the confirming half of the story.
+      // We did not evict it and the peer was talking to us moments ago, so whatever closed this
+      // socket, it was the far end. The library gives no callback for a received close frame,
+      // which is why this is inferred rather than observed: HA's own `ha_clean`/`ha_closed`
+      // event is the confirming half of the story.
       reason = Reason::PeerClose;
       peer_closes_++;
     }
@@ -311,6 +325,12 @@ void noteWsDisconnect(uint8_t client_id, uint8_t clients) {
   r.rx_msgs = rx;
   r.tx_msgs = tx;
   memcpy(r.ip, ip, sizeof(r.ip));
+  // The socket is already closed by the time the library tells us, so this is the last 1 Hz
+  // sample, not a live read — up to a second stale, but it is the only picture there is.
+  if (client_id < MAX_SLOTS) {
+    r.tcp = slots_[client_id].tcp;
+    slots_[client_id].tcp = tcpsnap::Snap{};
+  }
 }
 
 void noteWsError(uint8_t client_id, uint8_t clients) {
@@ -320,12 +340,18 @@ void noteWsError(uint8_t client_id, uint8_t clients) {
   r.clients = clients;
 }
 
-void noteWsStallReap(uint8_t client_id, uint32_t unwritable_ms, uint8_t clients) {
+void noteWsStallReap(uint8_t client_id, uint32_t unwritable_ms, uint8_t clients,
+                     const tcpsnap::Snap* tcp) {
   stall_reaps_++;
   Record& r = push(Event::WsStallReap);
   r.client_id = client_id;
   r.clients = clients;
   r.value = unwritable_ms;
+  if (tcp != nullptr && tcp->valid) {
+    r.tcp = *tcp;
+  } else if (client_id < MAX_SLOTS) {
+    r.tcp = slots_[client_id].tcp;  // live capture failed: fall back to the last sample
+  }
   // Carry the socket's history so a reap can be told apart from a merely idle client after
   // the fact: a slot with live traffic that suddenly stopped accepting writes is a peer that
   // went away, whereas one that never had any was probably never healthy.
@@ -336,7 +362,48 @@ void noteWsStallReap(uint8_t client_id, uint32_t unwritable_ms, uint8_t clients)
     r.rx_msgs = s.rx_msgs;
     r.tx_msgs = s.tx_msgs;
     memcpy(r.ip, s.ip, sizeof(r.ip));
+    slots_[client_id].evicted = Reason::StallReap;
   }
+}
+
+void noteWsEvict(uint8_t client_id, const char* why, uint32_t silence_ms, uint8_t clients,
+                 const tcpsnap::Snap* tcp) {
+  pong_timeouts_++;
+  Record& r = push(Event::WsEvict);
+  r.client_id = client_id;
+  r.clients = clients;
+  r.reason = Reason::PongTimeout;
+  r.value = silence_ms;
+  if (tcp != nullptr && tcp->valid) {
+    r.tcp = *tcp;
+  } else if (client_id < MAX_SLOTS) {
+    r.tcp = slots_[client_id].tcp;
+  }
+  if (client_id < MAX_SLOTS) {
+    Slot& s = slots_[client_id];
+    const uint32_t now = mono::now();
+    r.lifetime_ms = s.active ? (uint32_t)(now - s.connected_ms) : 0;
+    r.pong_age_ms = s.active ? (uint32_t)(now - s.last_pong_ms) : 0;
+    r.rx_msgs = s.rx_msgs;
+    r.tx_msgs = s.tx_msgs;
+    memcpy(r.ip, s.ip, sizeof(r.ip));
+    s.evicted = Reason::PongTimeout;
+  }
+  Serial.printf("[diag] evict client %u (%s): %u ms silence\n", client_id, why ? why : "?",
+                (unsigned)silence_ms);
+}
+
+bool slotAges(uint8_t client_id, uint32_t now_ms, uint32_t* pong_age_ms, uint32_t* rx_age_ms) {
+  if (client_id >= MAX_SLOTS || !slots_[client_id].active) return false;
+  const Slot& s = slots_[client_id];
+  if (pong_age_ms != nullptr) *pong_age_ms = (uint32_t)(now_ms - s.last_pong_ms);
+  if (rx_age_ms != nullptr) *rx_age_ms = (uint32_t)(now_ms - s.last_rx_ms);
+  return true;
+}
+
+const tcpsnap::Snap* lastTcp(uint8_t client_id) {
+  if (client_id >= MAX_SLOTS || !slots_[client_id].active) return nullptr;
+  return &slots_[client_id].tcp;
 }
 
 void noteWsPong(uint8_t client_id) {
@@ -355,6 +422,11 @@ void noteWsTx() {
   for (uint8_t i = 0; i < MAX_SLOTS; i++) {
     if (slots_[i].active && slots_[i].tx_msgs != 0xFFFF) slots_[i].tx_msgs++;
   }
+}
+
+void noteTcp(uint8_t client_id, const tcpsnap::Snap& snap) {
+  if (client_id >= MAX_SLOTS) return;
+  slots_[client_id].tcp = snap;
 }
 
 void noteWifi(bool up, int rssi) {
@@ -401,6 +473,7 @@ const char* eventName(Event e) {
     case Event::WsStallReap: return "ws_stall_reap";
     case Event::ApChange: return "ap_change";
     case Event::NetRecover: return "net_recover";
+    case Event::WsEvict: return "ws_evict";
   }
   return "unknown";
 }
@@ -412,8 +485,24 @@ const char* reasonName(Reason r) {
     case Reason::PeerClose: return "peer_close";
     case Reason::TransportError: return "transport_error";
     case Reason::Unknown: return "unclassified";
+    case Reason::StallReap: return "stall_reap";
   }
   return "unknown";
+}
+
+// lwIP pcb snapshot as flat `tcp_*` keys, so the HA logbook and the recorder can read them
+// without nesting (fw 1.12.0). Only emitted when a pcb was actually found.
+static void tcpToJson(const tcpsnap::Snap& t, JsonObject obj) {
+  obj["tcp_state"] = tcpsnap::stateName(t.state);
+  obj["tcp_nrtx"] = t.nrtx;
+  obj["tcp_rto_ms"] = t.rto_ms;
+  obj["tcp_cwnd"] = t.cwnd;
+  obj["tcp_snd_buf"] = t.snd_buf;
+  obj["tcp_snd_wnd"] = t.snd_wnd;
+  obj["tcp_qlen"] = t.snd_queuelen;
+  obj["tcp_unacked"] = t.unacked;
+  obj["tcp_dupacks"] = t.dupacks;
+  obj["tcp_flags"] = t.flags;
 }
 
 void toJson(const Record& r, JsonObject obj) {
@@ -429,16 +518,24 @@ void toJson(const Record& r, JsonObject obj) {
   obj["rssi"] = r.rssi;
   obj["clients"] = r.clients;
   if (r.value != 0) obj["value"] = r.value;
+  // MAC transmit deltas since the previous record (fw 1.12.0). Always present so a zero is
+  // distinguishable from an old firmware that never reported them.
+  obj["tx_ok"] = r.tx_ok;
+  obj["tx_retry"] = r.tx_retry;
+  obj["tx_to"] = r.tx_to;
+  obj["tx_fail"] = r.tx_fail;
 
-  if (r.ev == Event::WsConnect || r.ev == Event::WsDisconnect || r.ev == Event::WsError) {
+  if (r.ev == Event::WsConnect || r.ev == Event::WsDisconnect || r.ev == Event::WsError ||
+      r.ev == Event::WsStallReap || r.ev == Event::WsEvict) {
     obj["client_id"] = r.client_id;
     if (r.ip[0] != '\0') obj["ip"] = r.ip;
   }
-  if (r.ev == Event::WsDisconnect) {
+  if (r.ev == Event::WsDisconnect || r.ev == Event::WsStallReap || r.ev == Event::WsEvict) {
     obj["lifetime_ms"] = r.lifetime_ms;
     obj["pong_age_ms"] = r.pong_age_ms;
     obj["rx_msgs"] = r.rx_msgs;
     obj["tx_msgs"] = r.tx_msgs;
+    if (r.tcp.valid) tcpToJson(r.tcp, obj);
   }
   if (r.ev == Event::LoopStall) {
     // Phase attribution, stashed in the shared numeric fields by noteLoop().
@@ -448,7 +545,7 @@ void toJson(const Record& r, JsonObject obj) {
   }
 }
 
-void healthToJson(JsonObject obj) {
+void healthCoreToJson(JsonObject obj) {
   obj["uptime_s"] = mono::now() / 1000;
   obj["heap"] = ESP.getFreeHeap();
   obj["min_heap"] = ESP.getMinFreeHeap();
@@ -456,19 +553,13 @@ void healthToJson(JsonObject obj) {
   obj["spare_sockets"] = spare_sockets_;
   obj["rssi"] = WiFi.isConnected() ? WiFi.RSSI() : 0;
   obj["wifi_disc"] = wifi_disc_;
-  obj["pong_timeouts"] = pong_timeouts_;
-  obj["stall_reaps"] = stall_reaps_;
   obj["bssid"] = bssid_;
   obj["wifi_roams"] = wifi_roams_;
-  obj["peer_closes"] = peer_closes_;
-  obj["transport_errors"] = transport_errors_;
   obj["loop_max_ms"] = loop_max_;
   obj["http_max_ms"] = http_max_;
   obj["ota_max_ms"] = ota_max_;
   obj["ws_max_ms"] = ws_max_;
   obj["loop_stalls"] = loop_stalls_;
-  obj["loop_iters"] = loop_iters_;
-  obj["loop_busy_ms"] = loop_busy_ms_;
   // Read clk_back as a RATE, not a total: a healthy controller accumulates a few hundred over
   // four days, and thousands per second means the clock is pinned RIGHT NOW (shq-suite-0041).
   obj["clk_back"] = mono::backwardReads();
@@ -476,12 +567,76 @@ void healthToJson(JsonObject obj) {
   obj["clk_rebase"] = mono::rebases();
   obj["clk_rebase_ms"] = mono::lastRebaseMs();
   obj["clk_jump"] = mono::forwardJumps();
+  obj["diag_seq"] = next_seq_ - 1;
+}
+
+void healthNetToJson(JsonObject obj) {
   // Network-stack watchdog (fw 1.11.0, shq-suite-0044): consecutive unanswered gateway probes,
   // lifetime re-associations it has performed, and why it last acted.
   obj["nw_fail"] = wifi_prov::netProbeFailures();
   obj["nw_recover"] = wifi_prov::netRecoveries();
   obj["nw_reason"] = wifi_prov::netLastReason();
-  obj["diag_seq"] = next_seq_ - 1;
+
+  // MAC-layer transmit telemetry (fw 1.12.0, txstats.h). Lifetime totals since boot, plus the
+  // deltas since the previous health push (`*_d`) so a 30 s window is readable without
+  // differencing the totals. `tx_en` is the driver's own enabled-AC bitmap: 0 means the enable
+  // never took and every counter here is a zero that says nothing.
+  {
+    const txstats::Counters& t = txstats::acc().total();
+    const txstats::Counters w = txstats::acc().sinceHealth();
+    txstats::accMutable().markHealth();
+    obj["tx_ok"] = t.tx_succ;
+    obj["tx_retry"] = t.retries();
+    obj["tx_retry_edca"] = t.retry_edca;
+    obj["tx_tbretry"] = t.retry_tb;
+    obj["tx_tb"] = t.tb_times;
+    obj["tx_ack"] = t.rx_ack;
+    obj["tx_ba"] = t.rx_ba;
+    obj["tx_to"] = t.timeout;
+    obj["tx_coll"] = t.collision;
+    obj["tx_nomem"] = t.tx_no_mem;
+    obj["tx_fail"] = t.fail_count;
+    obj["tx_fail_to"] = t.fail_timeout;
+    obj["tx_err"] = t.tx_error_a0;
+    obj["tx_ok_d"] = w.tx_succ;
+    obj["tx_retry_d"] = w.retries();
+    obj["tx_to_d"] = w.timeout;
+    obj["tx_fail_d"] = w.fail_count;
+    obj["tx_en"] = txstats::enabledAcis();
+    obj["tx_samples"] = txstats::samples();
+    obj["phy"] = txstats::phyString();
+    obj["channel"] = txstats::channel();
+    // Configured protocol set (fw 1.13.0 A/B knob): what the station was ALLOWED to negotiate,
+    // against `phy`, which is what it DID negotiate.
+    obj["proto"] = wifi_proto::name(wifi_prov::wifiProto());
+  }
+}
+
+void healthWsToJson(JsonObject obj) {
+  obj["pong_timeouts"] = pong_timeouts_;
+  obj["stall_reaps"] = stall_reaps_;
+  obj["peer_closes"] = peer_closes_;
+  obj["transport_errors"] = transport_errors_;
+  // lwIP's view of the first connected client's socket (the HA coordinator, in practice).
+  // tcp_miss is the sampler's own failure count: fw 1.12.x's dual-stack sockaddr miss (tcpsnap.h)
+  // showed only as an ABSENCE of keys, which nothing was watching for.
+  obj["tcp_miss"] = tcpsnap::misses();
+  for (uint8_t i = 0; i < MAX_SLOTS; i++) {
+    if (slots_[i].active && slots_[i].tcp.valid) {
+      obj["tcp_client"] = i;
+      tcpToJson(slots_[i].tcp, obj);
+      break;
+    }
+  }
+}
+
+// The whole picture in one object, for /diag.json ONLY. At ~1.3 kB it is twice the WS frame
+// budget (ws_liveness.h) and was the largest periodic frame the firmware sent — the one the
+// pcap showed being lost on the affected boards (shq-suite-0046). Over WS it goes as three.
+void healthToJson(JsonObject obj) {
+  healthCoreToJson(obj);
+  healthWsToJson(obj);
+  healthNetToJson(obj);
 }
 
 void noteNetRecover(const char* reason, uint32_t recoveries) {
@@ -505,7 +660,9 @@ size_t renderText(char* out, size_t cap) {
                 "# diag uptime=%lus heap=%u minheap=%u maxblk=%u spare_sock=%u rssi=%d "
                 "wifi_disc=%u pong_timeouts=%u peer_closes=%u transport_errors=%u "
                 "loop_max=%ums http_max=%ums ota_max=%ums ws_max=%ums stalls=%u reaps=%u "
-                "bssid=%s roams=%u seq=%u\n",
+                "bssid=%s roams=%u seq=%u "
+                "tx_ok=%u tx_retry=%u tx_tbretry=%u tx_to=%u tx_coll=%u tx_nomem=%u "
+                "tx_fail=%u tx_en=%u phy=\"%s\"\n",
                 (unsigned long)(mono::now() / 1000), (unsigned)ESP.getFreeHeap(),
                 (unsigned)ESP.getMinFreeHeap(), (unsigned)ESP.getMaxAllocHeap(),
                 (unsigned)spare_sockets_, WiFi.isConnected() ? WiFi.RSSI() : 0,
@@ -513,7 +670,15 @@ size_t renderText(char* out, size_t cap) {
                 (unsigned)transport_errors_, (unsigned)loop_max_, (unsigned)http_max_,
                 (unsigned)ota_max_, (unsigned)ws_max_, (unsigned)loop_stalls_,
                 (unsigned)stall_reaps_, bssid_, (unsigned)wifi_roams_,
-                (unsigned)(next_seq_ - 1)));
+                (unsigned)(next_seq_ - 1),
+                (unsigned)txstats::acc().total().tx_succ,
+                (unsigned)txstats::acc().total().retry_edca,
+                (unsigned)txstats::acc().total().retry_tb,
+                (unsigned)txstats::acc().total().timeout,
+                (unsigned)txstats::acc().total().collision,
+                (unsigned)txstats::acc().total().tx_no_mem,
+                (unsigned)txstats::acc().total().fail_count,
+                (unsigned)txstats::enabledAcis(), txstats::phyString()));
 
   for (uint32_t seq = firstSeq(); seq <= lastSeq() && seq != 0; seq++) {
     const Record* r = bySeq(seq);
@@ -521,14 +686,25 @@ size_t renderText(char* out, size_t cap) {
     if (n + 1 >= cap) break;
     appendClamped(out, cap, n, snprintf(out + n, cap - n,
                   "%u %lus %s%s%s id=%u ip=%s clients=%u val=%u life=%ums pong_age=%ums "
-                  "rx=%u tx=%u heap=%u blk=%u sock=%u loop_max=%ums http_max=%ums rssi=%d\n",
+                  "rx=%u tx=%u heap=%u blk=%u sock=%u loop_max=%ums http_max=%ums rssi=%d "
+                  "tx_ok=%u tx_retry=%u tx_to=%u tx_fail=%u",
                   (unsigned)r->seq, (unsigned long)(r->t_ms / 1000), eventName(r->ev),
                   r->reason != Reason::None ? ":" : "", reasonName(r->reason),
                   (unsigned)r->client_id, r->ip[0] ? r->ip : "-", (unsigned)r->clients,
                   (unsigned)r->value, (unsigned)r->lifetime_ms, (unsigned)r->pong_age_ms,
                   (unsigned)r->rx_msgs, (unsigned)r->tx_msgs, (unsigned)r->heap,
                   (unsigned)r->max_block, (unsigned)r->spare_sockets, (unsigned)r->loop_max_ms,
-                  (unsigned)r->http_max_ms, (int)r->rssi));
+                  (unsigned)r->http_max_ms, (int)r->rssi, (unsigned)r->tx_ok,
+                  (unsigned)r->tx_retry, (unsigned)r->tx_to, (unsigned)r->tx_fail));
+    if (r->tcp.valid && n + 1 < cap) {
+      appendClamped(out, cap, n, snprintf(out + n, cap - n,
+                    " tcp=%s nrtx=%u rto=%ums cwnd=%u sndbuf=%u unacked=%u qlen=%u dupacks=%u",
+                    tcpsnap::stateName(r->tcp.state), (unsigned)r->tcp.nrtx,
+                    (unsigned)r->tcp.rto_ms, (unsigned)r->tcp.cwnd, (unsigned)r->tcp.snd_buf,
+                    (unsigned)r->tcp.unacked, (unsigned)r->tcp.snd_queuelen,
+                    (unsigned)r->tcp.dupacks));
+    }
+    if (n + 1 < cap) appendClamped(out, cap, n, snprintf(out + n, cap - n, "\n"));
   }
   return n;
 }
