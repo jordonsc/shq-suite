@@ -23,6 +23,35 @@ DiagCallback = Callable[[dict[str, Any]], Awaitable[None]]
 HealthCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
 
+def _close_info(exc: Any, ws: Any) -> dict[str, Any]:
+    """Who closed, from the legacy-API exception's `rcvd`/`sent` (websockets >= 13).
+
+    `exc.code` is ambiguous: it is 1006 whenever no close frame was seen in EITHER direction,
+    which is what our own 20 s pong timeout produces, and it says nothing about who initiated a
+    clean close. `rcvd` is the close frame the peer sent, `sent` the one we sent; `rcvd_then_sent`
+    orders them (ledger shq-suite-0046, HA-side agent).
+    """
+    rcvd = getattr(exc, "rcvd", None)
+    sent = getattr(exc, "sent", None)
+    rcvd_code = getattr(rcvd, "code", None)
+    sent_code = getattr(sent, "code", None)
+    if rcvd is None and sent is None:
+        closed_by = "nobody"  # transport died: our pong timeout, or a RST
+    elif rcvd is not None and (sent is None or getattr(exc, "rcvd_then_sent", None)):
+        closed_by = "device"
+    else:
+        closed_by = "ha"
+    # The library's own definition of the legacy `.code` (deprecated since websockets 13, and a
+    # DeprecationWarning on every access in 15.x): the received close code, else 1006.
+    code = rcvd_code if rcvd_code is not None else 1006
+    return {
+        "close_code": code,
+        "close_rcvd": rcvd_code,
+        "close_sent": sent_code,
+        "closed_by": closed_by,
+    }
+
+
 class ActronMitmClient:
     """Minimal WS client. No reconnect logic — that's the coordinator's job."""
 
@@ -81,7 +110,13 @@ class ActronMitmClient:
         self._on_message = cb
 
     def set_disconnect_callback(self, cb: Callable[[str, Any, float], Awaitable[None]]):
-        """cb(kind, close_code, lifetime_s) — `kind` is one of clean/closed/error."""
+        """cb(kind, close_info, lifetime_s) — `kind` is one of clean/closed/error.
+
+        `close_info` is a dict: `close_code` (the legacy `.code`), `close_rcvd` / `close_sent`
+        (the code in the close frame the device sent / we sent, None if none), `closed_by`
+        ("device" / "ha" / "nobody" — the last meaning no close frame crossed either way, i.e.
+        our pong timeout or a reset), or, for `error`, the exception class under `close_code`.
+        """
         self._on_disconnect = cb
 
     async def run(self):
@@ -91,7 +126,7 @@ class ActronMitmClient:
         started = asyncio.get_running_loop().time()
         self._opened_at = started
         kind = "clean"
-        close_code: Any = None
+        close_info: dict[str, Any] = {}
         try:
             async for raw in self._ws:
                 try:
@@ -101,11 +136,12 @@ class ActronMitmClient:
                     continue
                 await self._handle_message(msg)
             # Iterator ended without raising = peer closed cleanly (code 1000/1001).
-            close_code = getattr(self._ws, "close_code", None)
+            close_info = {"close_code": getattr(self._ws, "close_code", None),
+                          "closed_by": "device"}
             _LOGGER.info(
                 "WebSocket closed cleanly after %.1fs (code=%s reason=%r)",
                 asyncio.get_running_loop().time() - started,
-                close_code,
+                close_info["close_code"],
                 getattr(self._ws, "close_reason", None),
             )
         except websockets.ConnectionClosed as exc:
@@ -118,24 +154,24 @@ class ActronMitmClient:
             # hits an already-silent socket ("no close frame received or sent", 1006) or on a
             # genuine close. Bump to WARNING again if you need it visible in /api/error_log.
             kind = "closed"
-            close_code = getattr(exc, "code", None) or getattr(self._ws, "close_code", None)
+            close_info = _close_info(exc, self._ws)
             _LOGGER.info(
-                "WebSocket closed after %.1fs: %s: %s",
+                "WebSocket closed after %.1fs: rcvd=%s sent=%s (closed by %s): %s",
                 asyncio.get_running_loop().time() - started,
-                type(exc).__name__,
+                close_info["close_rcvd"], close_info["close_sent"], close_info["closed_by"],
                 exc,
             )
         except Exception as exc:  # noqa: BLE001
             # Anything else that kills the reader is a transport failure, and it used to vanish
             # into the generic reconnect path with no record of what it was (shq-suite-0038).
             kind = "error"
-            close_code = type(exc).__name__
+            close_info = {"close_code": type(exc).__name__, "closed_by": "exception"}
             _LOGGER.warning("WebSocket reader failed after %.1fs: %s",
                             asyncio.get_running_loop().time() - started, exc)
         finally:
             if self._on_disconnect is not None:
                 lifetime = asyncio.get_running_loop().time() - started
-                await self._on_disconnect(kind, close_code, lifetime)
+                await self._on_disconnect(kind, close_info, lifetime)
 
     async def _handle_message(self, msg: dict[str, Any]):
         kind = msg.get("type")
@@ -153,7 +189,10 @@ class ActronMitmClient:
             if self._on_diag is not None:
                 for event in msg.get("events") or []:
                     await self._on_diag(event)
-        elif kind == "health":
+        elif kind in ("health", "health_ws", "health_net"):
+            # fw >= 1.14.0 splits the vitals into three frames so none exceeds its 600 B frame
+            # budget (ledger shq-suite-0046); the coordinator merges them. Older firmware sends
+            # the whole thing as `health`, which merges just the same.
             if self._on_health is not None:
                 await self._on_health(msg.get("data") or {})
         elif kind in ("ack", "error"):

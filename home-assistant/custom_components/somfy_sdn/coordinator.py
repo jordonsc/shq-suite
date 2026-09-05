@@ -23,7 +23,8 @@ from .const import (
     DIAG_SEEN_MAX,
     DOMAIN,
     EVENT_DIAG,
-    RECONNECT_DELAY_S,
+    RECONNECT_DELAY_MAX_S,
+    RECONNECT_DELAY_MIN_S,
     SOURCE_DEVICE,
     SOURCE_HA,
 )
@@ -96,6 +97,10 @@ class SomfySdnCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._shutdown = False
         self._last_msg_time: Optional[float] = None
         self._last_available: bool = False
+        # Reconnect backoff state (const.py): the next delay, and whether the current session
+        # has delivered anything — a session that has is a success, whatever ends it.
+        self._backoff_s: float = RECONNECT_DELAY_MIN_S
+        self._session_frames: int = 0
         self._connecting: bool = False
         # Jog step size (pulses) per motor addr — shared between the Number entity (sets it) and
         # the Jog up/down buttons (read it). Defaults applied by the Number entity.
@@ -155,9 +160,14 @@ class SomfySdnCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._fire_diag(SOURCE_HA, "ha_connect_failed", {
                     "error": f"{type(err).__name__}: {err}",
                 })
-                self._schedule_reconnect()
+                self._schedule_reconnect(self._bump_backoff())
                 return
             _LOGGER.info("Connected to somfy-sdn at %s:%s", self.host, self.port)
+            # A fresh socket gets the full AVAILABILITY_TIMEOUT_S to deliver its first frame.
+            # Without this the monitor judged a <1 s-old socket on the PREVIOUS session's last
+            # message and tore it down before the connect-time snapshot could arrive.
+            self._last_msg_time = time.time()
+            self._session_frames = 0
             self._fire_diag(SOURCE_HA, "ha_connected", {})
             self._run_task = asyncio.create_task(self.client.run())
         finally:
@@ -175,14 +185,22 @@ class SomfySdnCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 pass
         await self.client.close()
 
-    def _schedule_reconnect(self, delay: int = RECONNECT_DELAY_S):
+    def _bump_backoff(self) -> float:
+        """The delay for the next attempt after a failure, doubling towards the cap."""
+        delay = self._backoff_s
+        self._backoff_s = min(self._backoff_s * 2, RECONNECT_DELAY_MAX_S)
+        return delay
+
+    def _schedule_reconnect(self, delay: float | None = None):
+        if delay is None:
+            delay = self._backoff_s
         if self._shutdown or self._connecting:
             return
         if self._reconnect_task is not None and not self._reconnect_task.done():
             return
         self._reconnect_task = asyncio.create_task(self._reconnect_after(delay))
 
-    async def _reconnect_after(self, delay: int):
+    async def _reconnect_after(self, delay: float):
         try:
             await asyncio.sleep(delay)
         except asyncio.CancelledError:
@@ -202,6 +220,7 @@ class SomfySdnCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         specifically stalled.
         """
         self._last_msg_time = time.time()
+        self._session_frames += 1
 
     async def _on_state(self, data: dict[str, Any]):
         self._last_msg_time = time.time()
@@ -247,23 +266,34 @@ class SomfySdnCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._fire_diag(SOURCE_DEVICE, kind, event)
 
     async def _on_health(self, data: dict[str, Any]):
-        self.health = data
+        # Merge, don't replace: fw >= 1.14.0 delivers the vitals as three frames (`health`,
+        # `health_ws`, `health_net`) a second apart so none exceeds its 600 B frame budget; every
+        # sensor keeps reading the one dict it always did.
+        self.health = {**(self.health or {}), **data}
         # Sensors listen on their own signal rather than the coordinator's update, so a 30 s health
         # push doesn't drag every cover entity through a state write.
         async_dispatcher_send(self.hass, f"{DOMAIN}_health_{self.entry_id}")
 
-    async def _on_disconnect(self, kind: str, close_code: Any, lifetime_s: float):
+    async def _on_disconnect(self, kind: str, close_info: dict[str, Any], lifetime_s: float):
+        # A session that delivered anything was a success: the next attempt is immediate-ish.
+        # One that died before its first frame counts as a failed attempt and backs off.
+        if self._session_frames > 0:
+            self._backoff_s = RECONNECT_DELAY_MIN_S
+            delay = RECONNECT_DELAY_MIN_S
+        else:
+            delay = self._bump_backoff()
         _LOGGER.info(
-            "Disconnected from somfy-sdn after %.1fs (%s, code=%s) — will reconnect",
-            lifetime_s, kind, close_code,
+            "Disconnected from somfy-sdn after %.1fs (%s, code=%s, closed by %s) — reconnect in %ss",
+            lifetime_s, kind, close_info.get("close_code"), close_info.get("closed_by"), delay,
         )
         # Our end of the story, against the firmware's own verdict for the same socket.
         self._fire_diag(SOURCE_HA, f"ha_{kind}", {
-            "close_code": close_code,
+            **close_info,
             "lifetime_s": round(lifetime_s, 1),
+            "frames": self._session_frames,
         })
         if not self._shutdown:
-            self._schedule_reconnect()
+            self._schedule_reconnect(delay)
 
     @callback
     def _fire_diag(self, source: str, kind: str, payload: dict[str, Any]):

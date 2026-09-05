@@ -95,21 +95,22 @@ DIAG_SENSORS: tuple[SomfyDiagSensorDescription, ...] = (
         key="pong_timeouts", name="Pong timeouts",
         state_class=SensorStateClass.TOTAL_INCREASING,
         entity_category=EntityCategory.DIAGNOSTIC,
-        # Clients the FIRMWARE evicted for missing the ping/pong deadline. If this tracks the
-        # unavailable count, the device is dropping a healthy HA — check the loop-stall sensor
-        # next for why the pong was late.
+        # Clients the FIRMWARE evicted for silence: fw >= 1.14.0 means nothing inbound (pong,
+        # ping or text) for 45 s, extended to 120 s while lwIP is still retransmitting; older
+        # firmware meant a pong 25 s late. If this tracks the unavailable count, the device
+        # is dropping a live HA — read `_last_disconnect_reason`'s tcp_* attributes next.
         value_fn=lambda h: h.get("pong_timeouts"),
     ),
     SomfyDiagSensorDescription(
         key="deferred_reaps", name="Deferred reaps",
         state_class=SensorStateClass.TOTAL_INCREASING,
         entity_category=EntityCategory.DIAGNOSTIC,
-        # Reaps the firmware declined because the client was still settling into its
-        # connection. The 3 s stall grace was killing sockets ~6 s old that had never
-        # received a frame, which just made HA reconnect into the same trap; a minimum
-        # client age now protects them. Climbing here means that gate is doing real
-        # work. It stays under the 15 s ping interval, so a socket stuck from birth is
-        # still dropped before the library can block on it (ledger shq-suite-0038).
+        # Judgements the firmware declined because an unwritable client was still inside
+        # its 10 s minimum age (a coordinator mid-handshake looks dead at the socket
+        # layer). Climbing here means young sockets ARE going unwritable — the gate is
+        # doing real work. Since fw 1.14.0 the deadlines above it (30 s unwritable reap,
+        # 45 s silence) imply this one; it is kept as an explicit invariant
+        # (ledger shq-suite-0038 / 0046, firmware ws_liveness.h).
         value_fn=lambda h: h.get("deferred_reaps"),
     ),
     SomfyDiagSensorDescription(
@@ -196,7 +197,8 @@ DIAG_SENSORS: tuple[SomfyDiagSensorDescription, ...] = (
         native_unit_of_measurement=UnitOfTime.MILLISECONDS,
         state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
-        # Since boot. Anything approaching the 5 s pong deadline explains an eviction outright.
+        # Since boot. A multi-second stall is a fault in its own right; since fw 1.14.0 it can
+        # no longer cost a session on its own (the liveness deadline is 45 s).
         value_fn=lambda h: h.get("loop_max_ms"),
     ),
     SomfyDiagSensorDescription(
@@ -261,6 +263,89 @@ DIAG_SENSORS: tuple[SomfyDiagSensorDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda h: h.get("uptime_s"),
+    ),
+    # WiFi MAC-layer transmit counters (component 1.11.0, fw 1.12.0, txstats.{h,cpp}). Read-only
+    # instrumentation for the long-frame uplink-loss investigation: two controllers on one AP
+    # radio churn their WS session while ten identical neighbours do not, and a capture put the
+    # loss in the uplink as a function of frame length. These say whether the WiFi driver is
+    # retrying those frames to exhaustion — the one layer nothing had measured. Lifetime totals
+    # since boot; the ratio of retries/timeouts to successes is the number to plot, and a
+    # `tx_en` of 0 in the health payload means the driver never enabled them (all zeros then).
+    SomfyDiagSensorDescription(
+        key="tx_success", name="WiFi frames acknowledged",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:wifi-arrow-up",
+        value_fn=lambda h: h.get("tx_ok"),
+    ),
+    SomfyDiagSensorDescription(
+        key="tx_retries", name="WiFi TX retries",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:wifi-refresh",
+        # EDCA + trigger-based retransmissions. Retries per acknowledged frame is the figure that
+        # separates a device the AP cannot hear from one that is simply not transmitting much.
+        value_fn=lambda h: h.get("tx_retry"),
+    ),
+    SomfyDiagSensorDescription(
+        key="tx_tb_retries", name="WiFi TB retries",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:wifi-refresh",
+        # Retries inside 11ax trigger-based PPDUs specifically — non-zero only on an HE
+        # association, and the first place to look if the ax uplink path is the suspect.
+        value_fn=lambda h: h.get("tx_tbretry"),
+    ),
+    SomfyDiagSensorDescription(
+        key="tx_ack_timeouts", name="WiFi ACK timeouts",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:wifi-alert",
+        # The frame went out and no ACK/Block-ACK ever came back: the AP did not hear it, or its
+        # reply did not reach us. Climbing with the WS churn is the uplink dying on the air.
+        value_fn=lambda h: h.get("tx_to"),
+    ),
+    SomfyDiagSensorDescription(
+        key="tx_collisions", name="WiFi collisions",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:wifi-alert",
+        value_fn=lambda h: h.get("tx_coll"),
+    ),
+    SomfyDiagSensorDescription(
+        key="tx_no_mem", name="WiFi TX buffer starvation",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:memory",
+        # The driver could not allocate for a transmission. Non-zero points at the device, not
+        # the air — and it is the one counter here a queue of retried long frames would move.
+        value_fn=lambda h: h.get("tx_nomem"),
+    ),
+    SomfyDiagSensorDescription(
+        key="tx_failures", name="WiFi TX failures",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:wifi-off",
+        # Entries in the driver's failure-state matrix (RTS/CTS/data/ACK stages).
+        value_fn=lambda h: h.get("tx_fail"),
+    ),
+    SomfyDiagSensorDescription(
+        key="phy_mode", name="WiFi PHY mode",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:wifi-settings",
+        # "HE20 ch6 bw20 bgnax" — negotiated PHY mode, primary channel, bandwidth and the AP's
+        # advertised PHY set. Whether the churning controllers negotiated 11ax (HE) where the
+        # clean ones did not is the cheapest discriminator the capture could not see.
+        value_fn=lambda h: h.get("phy"),
+    ),
+    SomfyDiagSensorDescription(
+        key="wifi_protocol", name="WiFi protocol",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        icon="mdi:wifi-cog",
+        # The fw 1.13.0 A/B knob as the device reports it: what the station was ALLOWED to
+        # negotiate (`bgnax` default / `bgn` / `bg`), against `phy_mode` above, which is what it
+        # DID negotiate. Recorded so the churn history can be split by protocol setting.
+        value_fn=lambda h: h.get("proto"),
     ),
 )
 
