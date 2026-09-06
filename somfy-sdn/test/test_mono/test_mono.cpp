@@ -152,6 +152,14 @@ void test_wraparound_is_forward() {
   TEST_ASSERT_EQUAL_UINT32(0, f.forwardJumps());
 }
 
+// A duration measured across two reads must clamp at zero when a re-baseline lands between
+// them, not wrap to ~49.7 days (Bed 4, 2026-09-05: "loop stalled for 4294963989 ms").
+void test_elapsed_clamps_backward_step() {
+  TEST_ASSERT_EQUAL_UINT32(0, mono::elapsed(10000, 10000 - 3309));
+  TEST_ASSERT_EQUAL_UINT32(3309, mono::elapsed(10000 - 3309, 10000));
+  TEST_ASSERT_EQUAL_UINT32(0x140, mono::elapsed(0xFFFFFF00u, 0x40));  // 49.7-day wrap, forward
+}
+
 int main() {
   UNITY_BEGIN();
   RUN_TEST(test_normal_progression);
@@ -165,5 +173,6 @@ int main() {
   RUN_TEST(test_isolated_backward_reads_never_rebase);
   RUN_TEST(test_genuine_long_stall_is_accepted);
   RUN_TEST(test_wraparound_is_forward);
+  RUN_TEST(test_elapsed_clamps_backward_step);
   return UNITY_END();
 }

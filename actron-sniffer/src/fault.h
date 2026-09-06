@@ -27,9 +27,13 @@ enum class Code : uint8_t {
   ClockStalled = 0,  // mono::now() has not advanced across many loop iterations — device is dead
   BusOffline,        // motors are configured but none are answering the RS485 bus
   WsCapacity,        // every WS client slot occupied; the HA coordinator cannot get in
-  ClockRebase,       // the clock stepped and was adopted (handled, but the hardware misbehaved)
-  ClockWordStep,     // a high-word clock fault was detected and rejected (handled)
   HeapLow,           // free heap below the floor a reconnect needs
+  // NOT faults (removed fw 1.14.3, ledger shq-suite-0050): a clock re-baseline or a rejected
+  // high-word step. Both are the filter doing its job — handled, nothing for anyone to do — and
+  // a latched Problem for a handled event is noise. They stay fully logged: the `clock_glitch`
+  // diag record (a logbook line in HA), the clk_word / clk_rebase / clk_rebase_ms counters in
+  // /stats and the health push, and the HA "Clock re-baselines" / "Clock high-word faults"
+  // sensors. A fault here is for a condition that needs a response.
   Count
 };
 

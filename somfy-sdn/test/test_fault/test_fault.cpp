@@ -58,9 +58,9 @@ void test_raise_is_idempotent_but_counted() {
 // A later raise refreshes the detail, so the sensor shows the current magnitude, not the first.
 void test_detail_refreshes() {
   fault::Registry r;
-  r.raise(fault::Code::ClockRebase, "step -4294967 ms");
-  r.raise(fault::Code::ClockRebase, "step -25769804 ms");
-  TEST_ASSERT_EQUAL_STRING("step -25769804 ms", r.worstDetail());
+  r.raise(fault::Code::HeapLow, "58 kB");
+  r.raise(fault::Code::HeapLow, "41 kB");
+  TEST_ASSERT_EQUAL_STRING("41 kB", r.worstDetail());
 }
 
 // Detail longer than the buffer must truncate, not overrun.

@@ -114,9 +114,20 @@ class Filter {
 // Filtered `millis()`. Use this for every deadline, timestamp and age calculation.
 uint32_t now();
 
-// Telemetry (surfaced as clk_back/clk_word/clk_rebase/clk_jump in /stats, and as the
-// `clock_rebase` / `clock_word_step` faults). A non-zero word/rebase count is this module doing
-// its job — the clock misbehaved and the device kept running anyway.
+// Elapsed time between two now() reads taken in that order, clamped at zero. A re-baseline
+// (layer 2 above) between the two reads can make `to` smaller than `from`; the bare unsigned
+// difference then reads as ~49.7 days, which is how Bed 4 logged a 4,294,963,989 ms loop stall
+// (ledger shq-suite-0049). Use this for any duration measured across two reads in one pass —
+// NOT for deadline checks, where the unsigned `(now - last) >= interval` form is the right one.
+inline uint32_t elapsed(uint32_t from, uint32_t to) {
+  const int32_t d = (int32_t)(to - from);
+  return d < 0 ? 0u : (uint32_t)d;
+}
+
+// Telemetry (surfaced as clk_back/clk_word/clk_rebase/clk_jump in /stats, the health push and
+// the HA clock sensors, and as a `clock_glitch` diag record). A non-zero word/rebase count is
+// this module doing its job — the clock misbehaved and the device kept running anyway. Neither is
+// a fault (fw 1.14.3): handled means nothing to respond to.
 uint32_t backwardReads();
 uint32_t wordSteps();
 uint16_t lastWordUnits();

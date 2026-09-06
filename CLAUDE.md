@@ -220,6 +220,13 @@ Claude Code has direct access to the HA REST API via the `./ha` helper script (u
   derived `binary_sensor.<device>_problem` for automations. Before this, the only fault entity was
   per-motor — it reports the SDN motor's status word and knows nothing about the controller
   hosting it, which is why a nine-hour controller wedge showed every signal green.
+  **A fault code is for something that needs a response.** fw 1.10.0 also latched `clock_rebase`
+  / `clock_word_step` until reboot, and Bed 4 then sat with its Problem sensor on for a 3.3 s
+  step the filter had handled perfectly. Retired in 1.14.3 (ledger shq-suite-0050): handled clock
+  events stay logged (`clock_glitch` record, `clk_*` counters, HA clock sensors) but never latch.
+  And measure a duration across two `mono::now()` reads with `mono::elapsed()`, not a bare
+  subtraction — a re-baseline between the reads is how the loop meter logged a 4,294,963,989 ms
+  stall (shq-suite-0049).
 - **Rebooting a wedged device destroys the evidence — re-associate first, reboot last.**
   `POST /reboot` (HTTP, out-of-band) and a `reboot` WS command (what the HA button drives) exist
   on both firmwares, but nothing reboots on a clock fault alone. Bed 2's wedge was root-caused

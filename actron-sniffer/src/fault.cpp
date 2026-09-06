@@ -8,15 +8,13 @@ namespace {
 
 // Indexed by Code. Order must match the enum exactly.
 const char* const kSlugs[CODE_COUNT] = {
-    "clock_stalled", "bus_offline", "ws_capacity", "clock_rebase", "clock_word_step", "heap_low",
+    "clock_stalled", "bus_offline", "ws_capacity", "heap_low",
 };
 
 const char* const kDescriptions[CODE_COUNT] = {
     "monotonic clock has stopped advancing",
     "no configured motor is answering the bus",
     "all WebSocket client slots are occupied",
-    "clock stepped and was re-baselined onto",
-    "high-word clock fault detected and rejected",
     "free heap below the reconnect floor",
 };
 

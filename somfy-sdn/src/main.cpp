@@ -349,19 +349,9 @@ static void updateFaults(uint32_t now_ms) {
   if (++g_fault_poll < FAULT_POLL_LOOPS) return;
   g_fault_poll = 0;
 
-  // Latched, not live: both are historical facts about a clock that misbehaved and was handled.
-  // They stay up until a reboot or POST /clear, because "it happened while you weren't looking"
-  // is exactly the thing that went unreported for nine hours.
-  if (mono::rebases() > 0) {
-    snprintf(detail, sizeof(detail), "%lu x, last %ld ms", (unsigned long)mono::rebases(),
-             (long)mono::lastRebaseMs());
-    fault::raise(fault::Code::ClockRebase, detail);
-  }
-  if (mono::wordSteps() > 0) {
-    snprintf(detail, sizeof(detail), "%lu x, last %u high-word units",
-             (unsigned long)mono::wordSteps(), (unsigned)mono::lastWordUnits());
-    fault::raise(fault::Code::ClockWordStep, detail);
-  }
+  // A clock re-baseline or a rejected high-word step is deliberately NOT a fault (fw 1.14.3,
+  // ledger shq-suite-0050): the filter handled it and there is nothing to respond to. It is still
+  // logged — diag's `clock_glitch` record and the clk_* counters — just not latched as a Problem.
 
   // A controller with motors configured and none answering is not doing its job, whatever the
   // network thinks of it. Motors go offline on their own sweep timer, so this needs no debounce.
@@ -413,11 +403,14 @@ void loop() {
     const uint32_t t_ws = mono::now();
     ws_api::loop();
     const uint32_t t_end = mono::now();
-    ota_ms = t_http - t_ota;
-    http_ms = t_ws - t_http;
-    ws_ms = t_end - t_ws;
+    // mono::elapsed, not a bare subtraction: a re-baseline between two of these reads makes the
+    // later one smaller, and the unsigned difference then reads as a 49.7-day stall (Bed 4,
+    // 2026-09-05: "loop stalled for 4294963989 ms" — ledger shq-suite-0049).
+    ota_ms = mono::elapsed(t_ota, t_http);
+    http_ms = mono::elapsed(t_http, t_ws);
+    ws_ms = mono::elapsed(t_ws, t_end);
   }
   updateFaults(t_start);
-  diag::noteLoop((uint32_t)(mono::now() - t_start), ota_ms, http_ms, ws_ms);
+  diag::noteLoop(mono::elapsed(t_start, mono::now()), ota_ms, http_ms, ws_ms);
   // The SDN bus runs on its own FreeRTOS task (bus::begin) — see bus.cpp.
 }
