@@ -111,6 +111,25 @@ Claude Code has direct access to the HA REST API via the `./ha` helper script (u
 
 ## Key Gotchas
 
+- **HA core's `unifiprotect` websocket dies silently, and nothing in HA can tell you.**
+  `uiprotect/websocket.py` awaits `receive(self.receive_timeout)` with `receive_timeout=None` and
+  connects without an aiohttp `heartbeat`, so when the NVR stops sending, the loop blocks **for ever**:
+  no error, no `WebsocketState` change, no reconnect, nothing logged. The 15-minute REST bootstrap poll
+  keeps every camera reading healthy, but the detection binary_sensors key on the `last_*_event`
+  **objects**, which only arrive over the websocket — so the bootstrap can show motion two minutes ago
+  while the sensor reads `off` for days. It cost 3 d 19 h of dead camera automations on 2026-09-10, and
+  it is invisible from the HA side: across 70 s, **0 of 184** Protect entities advanced `last_reported`.
+  Diagnose at the socket (`lastrcv` on the hass↔NVR connection carrying the bytes — a zombie stays
+  ESTABLISHED for ever), cure with a config-entry reload. The `protect_watchdog` component now measures
+  this continuously — `binary_sensor.protect_event_stream_stale` is what camera automations should gate
+  on. Ledger **shq-suite-0054**; details in `home-assistant/CLAUDE.md`.
+- **Guard every HA state trigger against `unavailable`.** An integration outage parks a sensor at
+  `unavailable`, which is a perfectly valid `to:`/`from:` state — a `from: [on, off]` + `for: 5 minutes`
+  trigger therefore fires on the outage itself. That is how *Garage Lights Auto-Off* turned the garage and
+  workshop lights off at 03:42 during an NVR reboot, as though motion had ceased. Use
+  `not_to: [unavailable, unknown]` on the destination and `not_from: [unavailable, unknown]` on the
+  source. Ledger **shq-suite-0055**.
+
 - **Chrome CDP Host header**: Raw HTTP to Chrome's `/json` must include port in `Host` header (`Host: 127.0.0.1:9222`), else WebSocket URLs get port 80
 - **Chrome CDP reads**: Parse `Content-Length` and `read_exact`, never `read_to_end` (hangs waiting for EOF)
 - **Cross-compilation**: Uses Podman, not Docker (`CROSS_CONTAINER_ENGINE=podman`)

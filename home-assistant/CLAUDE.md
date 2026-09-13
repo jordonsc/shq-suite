@@ -27,6 +27,7 @@ Custom integrations for Home Assistant.
 | `somfy_sdn` | WebSocket | 8767 | Config Flow | Somfy SDN blind motors via the somfy-sdn ESP32 (one `cover` per motor) + firmware diagnostics (sensors + `somfy_sdn_diag` events) |
 | `cfa_fire_ban` | HTTP (RSS) | — | YAML | CFA fire ban & danger ratings |
 | `unifi_access_dps` | WebSocket (wss) | 12445 | YAML | Front-door DPS workaround — raw hub input via the UniFi Access developer websocket |
+| `protect_watchdog` | netlink sock_diag | — | YAML | Liveness of HA core's UniFi Protect event websocket, measured at the socket |
 
 ## shq_display (Nyx Kiosk Control)
 
@@ -228,6 +229,78 @@ cfa_fire_ban:
 **⚠️ Never remote-unlock a maglock door unattended** (`PUT /doors/{id}/unlock` or otherwise): with no mechanical latch the door can swing open on its own and stand open — the relay re-engaging 10s later holds nothing.
 
 **Key files**: `__init__.py` (YAML schema + setup + service), `coordinator.py` (websocket consumer + lock poll, `UnifiAccessDpsHub`), `binary_sensor.py`, `services.yaml`, `const.py`.
+
+## protect_watchdog (UniFi Protect websocket liveness)
+
+**Why it exists**: HA core's built-in `unifiprotect` integration (library `uiprotect`, **not ours** — no
+custom Protect component exists) cannot tell that its event websocket has died. `uiprotect/websocket.py`
+does `msg = await self._ws_connection.receive(self.receive_timeout)` with `receive_timeout` defaulting to
+`None`, and calls `ws_connect()` without an aiohttp `heartbeat`, so neither end is probed for liveness.
+When the NVR stops sending, that `await` blocks **for ever**: no error, no `WebsocketState` change, no
+reconnect, nothing logged.
+
+The failure is invisible from inside HA. The 15-minute REST bootstrap poll keeps `is_dark`,
+`storage_used`, `disk_write_rate` and the detection *switches* current, so every camera reads healthy —
+but the detection binary_sensors key on the `last_*_event` **objects**, which only ever arrive over the
+websocket. The NVR's own per-camera `lastMotion` *timestamp* in the bootstrap does not feed them (same
+mechanism as shq-suite-0003). So Protect can show motion two minutes ago while the sensor reads `off`
+indefinitely. On 2026-09-10 the stream stopped at 03:03:50 AEST and this went unnoticed for **3 days
+19 hours**, during which every camera automation in the estate was dead (ledger **shq-suite-0054**).
+
+**Why it measures the socket**: there is no HA-side signal to template against. Measured directly — across
+70 s, **0 of 184** Protect entities advanced `last_reported`, because HA only writes state when a value
+actually changes. The socket is the only honest evidence.
+
+**How it works** (`probe.py`): reads `/proc/net/tcp{,6}` for ESTABLISHED connections to the NVR, then asks
+netlink `sock_diag` (`NETLINK_INET_DIAG`, `INET_DIAG_INFO`) for each one's `struct tcp_info`, taking
+`tcpi_last_data_recv`. No privilege needed — a process may always diag its own sockets. Two gotchas the
+code handles, both load-bearing:
+
+- **The hass container runs `--network host`**, so `/proc/net/tcp` is the *whole host's* socket table
+  (302 rows), not ours. Filtering on "peer is the NVR" alone would be right only by luck, so the probe
+  intersects with the inodes behind its own `/proc/self/fd`. That works because the probe runs inside the
+  HA process.
+- **The integration holds TWO websockets open**: the private event stream (everything; ~2 kB/s even with
+  nothing moving) and the public devices stream (a ~342 B/min NVR heartbeat). Pick the one with the most
+  `bytes_received`. **Never key on the fd or the local port** — both are reassigned on reload, and the two
+  streams have been observed swapping fds between reloads.
+
+**Entities**:
+- `sensor.protect_event_stream_last_rx` — seconds since the event websocket last received a byte. Healthy
+  is **sub-5 s**; measured 0.4–4.6 s on a quiet estate. Attributes: `sockets`, `local_port`,
+  `bytes_received`, `seconds_since_healthy`, `stale_after`.
+- `binary_sensor.protect_event_stream_stale` (device class *problem*) — on once that silence passes
+  `stale_after`. **This is the entity to gate camera automations on**: when it is on, every Protect
+  detection sensor is frozen and will never change again on its own.
+
+**Config** (YAML, `deploy/config/ha/configuration.yaml`): `nvr_host` (required), `nvr_port` (443),
+`scan_interval` (60 s), `stale_after` (300 s — a 60x margin over the worst healthy sample, so it cannot
+fire on a quiet house).
+
+**Do not reintroduce a second clock.** `tcpi_last_data_recv` *is* the silence; it already counts from the
+last byte. v1.1.0 tracked "time since a reading below the threshold" on top of it, which reset on every
+sub-threshold reading and so could only trip after `2 x stale_after`. Caught by fault injection on the
+live socket — age climbed to 345 s with the flag still clear. Fixed in 1.2.0; the only thing the wall
+clock is used for now is the "no socket at all" case, which also debounces a restart or a reload.
+
+**How to fault-inject it** (silent, no effect on lights or audio): drop inbound NVR data to just that
+socket, so it stays ESTABLISHED but goes silent — exactly the real failure.
+
+```bash
+PORT=$(./ha get /api/states/sensor.protect_event_stream_last_rx \
+       | python3 -c "import json,sys;print(json.load(sys.stdin)['attributes']['local_port'])")
+sudo iptables -I INPUT 1 -s 192.168.1.3 -p tcp --sport 443 --dport $PORT -j DROP
+# ... wait past stale_after, watch the sensor climb ...
+sudo iptables -D INPUT   -s 192.168.1.3 -p tcp --sport 443 --dport $PORT -j DROP
+```
+
+**The cure**, and what the *Protect Event Stream Stale* automation does automatically (once per 30 min,
+push suppressed during `binary_sensor.quiet_hours`):
+`POST /api/config/config_entries/entry/01KG7DXXYMMZF053DKZ87YFS1B/reload`.
+
+**Key files**: `probe.py` (socket measurement + the two gotchas), `coordinator.py` (silence accounting),
+`sensor.py`, `binary_sensor.py`, `__init__.py` (YAML schema), `const.py`.
+
 
 ## HA Server Config
 

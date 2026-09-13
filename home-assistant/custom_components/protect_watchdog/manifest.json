@@ -1,0 +1,10 @@
+{
+  "domain": "protect_watchdog",
+  "name": "UniFi Protect Websocket Watchdog",
+  "documentation": "https://github.com/jordonsc/shq-suite",
+  "requirements": [],
+  "codeowners": [],
+  "version": "1.2.0",
+  "iot_class": "local_polling",
+  "config_flow": false
+}
