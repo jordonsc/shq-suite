@@ -490,3 +490,18 @@ EOF
 - YAML-configured integrations use dictionary keys as device IDs
 - All deps declared in `manifest.json` per component
 - HA deploys to `redacted.host` via `./setup ha`
+- **Always pass `config_entry` explicitly to `DataUpdateCoordinator`.** Omitting it makes HA infer the
+  entry from the `current_entry` ContextVar — ambient async context that is only correct because we
+  happen to construct coordinators inside `async_setup_entry`. HA deprecated that in 2026.8. The value
+  differs by component type, and a blanket answer is wrong:
+  - **config-flow components** (`actron_mitm_controller`, `somfy_sdn`, `centurion`) pass
+    `config_entry=entry`. This is the association that ties the coordinator's background WS task to the
+    entry's lifecycle, so it is cancelled on unload/reload — passing `None` here would *sever* something
+    they currently get right by accident.
+  - **YAML components** (`protect_watchdog`, `dosa`, `cfa_fire_ban`, `shq_display`) pass
+    `config_entry=None`. There is no entry, and `None` is what the ContextVar fallback already returns,
+    so this is pure explicitness with no behaviour change.
+
+  Currently `ReportBehavior.IGNORE` for custom integrations — nothing is logged and nothing fails — so
+  this is future-proofing, not a live bug. Still outstanding: `cfa_fire_ban`, `dosa`, `shq_display`
+  (the last is unloaded and lives in the Argus repo anyway). Ledger shq-suite-0058.

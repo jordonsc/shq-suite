@@ -73,6 +73,12 @@ class SomfySdnCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER,
             name=f"{DOMAIN} {entry.data[CONF_HOST]}",
             update_interval=None,  # push-only; no polling
+            # Pass the entry explicitly rather than letting HA infer it from the
+            # `current_entry` ContextVar: that fallback is only correct because we
+            # happen to construct the coordinator inside async_setup_entry, and HA
+            # deprecated it in 2026.8. The association is what ties our background
+            # WS task to the entry's lifecycle, so it must not be guessed.
+            config_entry=entry,
         )
         self.host: str = entry.data[CONF_HOST]
         self.port: int = entry.data.get(CONF_PORT, DEFAULT_PORT)
