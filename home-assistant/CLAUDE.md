@@ -232,8 +232,15 @@ cfa_fire_ban:
 
 ## protect_watchdog (UniFi Protect websocket liveness)
 
+> **Status since the 2026.9.2 upgrade (2026-09-14):** upstream fixed the root cause — uiprotect 16.x
+> passes `heartbeat=PRIVATE_WS_HEARTBEAT` (180 s) to `ws_connect`, so aiohttp now pings the NVR and tears
+> the connection down when no pong returns. This component is therefore **belt-and-braces, not the only
+> guard**. Keep it: it is the only thing that makes the failure *visible* (HA still has no entity for
+> websocket liveness), it covers a heartbeat that is itself wedged, and it costs one poll a minute.
+> Ledger shq-suite-0056.
+
 **Why it exists**: HA core's built-in `unifiprotect` integration (library `uiprotect`, **not ours** — no
-custom Protect component exists) cannot tell that its event websocket has died. `uiprotect/websocket.py`
+custom Protect component exists) could not tell that its event websocket had died. `uiprotect/websocket.py`
 does `msg = await self._ws_connection.receive(self.receive_timeout)` with `receive_timeout` defaulting to
 `None`, and calls `ws_connect()` without an aiohttp `heartbeat`, so neither end is probed for liveness.
 When the NVR stops sending, that `await` blocks **for ever**: no error, no `WebsocketState` change, no
@@ -260,9 +267,10 @@ code handles, both load-bearing:
   (302 rows), not ours. Filtering on "peer is the NVR" alone would be right only by luck, so the probe
   intersects with the inodes behind its own `/proc/self/fd`. That works because the probe runs inside the
   HA process.
-- **The integration holds TWO websockets open**: the private event stream (everything; ~2 kB/s even with
-  nothing moving) and the public devices stream (a ~342 B/min NVR heartbeat). Pick the one with the most
-  `bytes_received`. **Never key on the fd or the local port** — both are reassigned on reload, and the two
+- **The integration holds SEVERAL websockets open**: the private event stream (everything; ~2 kB/s even
+  with nothing moving) plus the public events/devices streams (~342 B/min NVR heartbeat each). uiprotect
+  10.x opened two, 16.x opens three — **never assume a count**. Pick the one with the most
+  `bytes_received`. **Never key on the fd or the local port** — both are reassigned on reload, and the
   streams have been observed swapping fds between reloads.
 
 **Entities**:

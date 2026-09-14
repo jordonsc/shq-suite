@@ -170,11 +170,13 @@ def probe(host: str, port: int) -> ProbeResult:
     if not socks:
         return ProbeResult(None, len(ports), None, None)
 
-    # The integration holds TWO websockets open: the private event stream, which
-    # carries everything, and the public devices stream, a ~342 B/min NVR
-    # heartbeat. Only the first one matters here, and it is the one with the
-    # bytes — within a minute of startup it outweighs the other by orders of
-    # magnitude. Do not key on the fd or the port: both are reassigned on every
-    # reload, and the two streams have swapped fds between reloads in practice.
+    # The integration holds SEVERAL websockets open: the private event stream,
+    # which carries everything, plus the public events/devices streams, which are
+    # only a ~342 B/min NVR heartbeat each. uiprotect 10.x opened two of these,
+    # 16.x opens three — so never assume a count. Only the private stream matters
+    # here, and it is the one with the bytes: within a minute of startup it
+    # outweighs the others by orders of magnitude. Do not key on the fd or the
+    # port either; both are reassigned on every reload, and the streams have been
+    # observed swapping fds between reloads.
     local_port, last_recv_ms, rx_bytes, _segs_in = max(socks, key=lambda s: s[2])
     return ProbeResult(last_recv_ms / 1000, len(socks), local_port, rx_bytes)

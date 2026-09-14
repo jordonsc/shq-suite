@@ -32,6 +32,11 @@ class ProtectWatchdogCoordinator(DataUpdateCoordinator[ProbeResult]):
             _LOGGER,
             name=DOMAIN,
             update_interval=timedelta(seconds=scan_interval),
+            # This is a YAML component with no config entry. Passing None
+            # explicitly is the semantically correct value and keeps us off the
+            # ContextVar path HA deprecated in 2026.8 (currently IGNOREd for
+            # custom integrations, but that will not last).
+            config_entry=None,
         )
         self.nvr_host = nvr_host
         self.nvr_port = nvr_port
