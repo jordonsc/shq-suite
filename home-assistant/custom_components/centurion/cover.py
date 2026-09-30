@@ -29,7 +29,6 @@ class CenturionGarageDoor(CoverEntity):
         self._ip = ip
         self._api_key = api_key
         self._state = STATE_CLOSED
-        self._position = 0
         self._available = True
         self._tracking = False
         self._attr_unique_id = f"centurion_garage_{ip.replace('.', '_')}"
@@ -59,11 +58,14 @@ class CenturionGarageDoor(CoverEntity):
 
     @property
     def supported_features(self):
+        # No SET_POSITION: the controller reports only open/closed/opening/
+        # closing (plus a stopped/error string) and cannot be driven to a
+        # position. Advertising it made every dashboard draw a position slider
+        # that did nothing (ledger shq-suite-0068).
         return (
             CoverEntityFeature.OPEN
             | CoverEntityFeature.CLOSE
             | CoverEntityFeature.STOP
-            | CoverEntityFeature.SET_POSITION
         )
 
     @property
@@ -82,12 +84,8 @@ class CenturionGarageDoor(CoverEntity):
     def is_closing(self):
         return self._state == STATE_CLOSING
 
-    @property
-    def current_cover_position(self):
-        return self._position
-
     def _apply_door_state(self, door_state):
-        """Map a raw controller door-status string onto _state/_position.
+        """Map a raw controller door-status string onto _state.
 
         Returns the previous _state so callers can detect a transition. The
         controller's strings are verbose (e.g. "closed by wifi", "opening by
@@ -97,24 +95,18 @@ class CenturionGarageDoor(CoverEntity):
         old_state = self._state
         if door_state.startswith("opening"):
             self._state = STATE_OPENING
-            self._position = 50
         elif door_state.startswith("closing"):
             self._state = STATE_CLOSING
-            self._position = 50
         elif door_state.startswith("close") or door_state.startswith("closed"):
             self._state = STATE_CLOSED
-            self._position = 0
         elif door_state.startswith("open"):
             self._state = STATE_OPEN
-            self._position = 100
         elif "stopped" in door_state or "error" in door_state:
             self._state = STATE_OPEN
-            self._position = 50
             _LOGGER.warning("Door in stopped/error state: %s", door_state)
         else:
             _LOGGER.warning("Unexpected door state: %s", door_state)
             self._state = STATE_OPEN
-            self._position = 50
         return old_state
 
     async def async_update(self):
@@ -239,7 +231,6 @@ class CenturionGarageDoor(CoverEntity):
     async def async_open_cover(self, **kwargs):
         door_state = await self._send_command_with_retry("open", ["opening", "open"])
         self._state = STATE_OPENING if "opening" in door_state else STATE_OPEN
-        self._position = 50 if "opening" in door_state else 100
         self.async_write_ha_state()
         if self._state == STATE_OPENING:
             self.hass.async_create_task(self._track_until_settled())
@@ -247,7 +238,6 @@ class CenturionGarageDoor(CoverEntity):
     async def async_close_cover(self, **kwargs):
         door_state = await self._send_command_with_retry("close", ["closing", "close"])
         self._state = STATE_CLOSING if "closing" in door_state else STATE_CLOSED
-        self._position = 50 if "closing" in door_state else 0
         self.async_write_ha_state()
         if self._state == STATE_CLOSING:
             self.hass.async_create_task(self._track_until_settled())
@@ -258,6 +248,3 @@ class CenturionGarageDoor(CoverEntity):
             _LOGGER.warning("Centurion stop command: HTTP %s, body: %s", response.status_code, response.text)
         except Exception as e:
             _LOGGER.error("Error sending stop command: %s", e)
-
-    async def async_set_cover_position(self, **kwargs):
-        self.async_write_ha_state()
