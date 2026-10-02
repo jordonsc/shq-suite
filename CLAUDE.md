@@ -246,6 +246,13 @@ Claude Code has direct access to the HA REST API via the `./ha` helper script (u
   And measure a duration across two `mono::now()` reads with `mono::elapsed()`, not a bare
   subtraction — a re-baseline between the reads is how the loop meter logged a 4,294,963,989 ms
   stall (shq-suite-0049).
+- **An AP radio restart (channel change, AP firmware, AP reboot) used to strand the actron bridge
+  off WiFi for good.** Before fw 1.14.4 nothing re-drove a dead STA link after boot, and the Arduino
+  core's auto-reconnect does not retry every disconnect reason; on 2026-10-02 a channel change on
+  Upper West left it off the network until a power cycle while every somfy twin rejoined in a minute
+  (ledger shq-suite-0070). 1.14.4 ports the somfy link-retry loop (no reboot tier — the A/C rule).
+  Any new firmware here must carry a link-retry loop, and a WiFi-only remedy (`POST /reconnect`,
+  WS `reconnect_wifi`, the HA Reconnect WiFi button) comes before any reboot.
 - **Rebooting a wedged device destroys the evidence — re-associate first, reboot last.**
   `POST /reboot` (HTTP, out-of-band) and a `reboot` WS command (what the HA button drives) exist
   on both firmwares, but nothing reboots on a clock fault alone. Bed 2's wedge was root-caused
