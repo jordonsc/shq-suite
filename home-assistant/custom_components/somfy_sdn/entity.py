@@ -2,7 +2,7 @@
 
 Two device types: a single *controller* device per ESP32 (bus-level controls + diagnostics) and
 one *motor* device per discovered cover (the shade + its calibration entities). The motor device
-identifiers/`via_device` are kept identical to those `cover.py` produces so every entity for a
+identifiers/`via_device_id` are kept identical to those `cover.py` produces so every entity for a
 motor lands on the same HA device.
 """
 
@@ -82,7 +82,7 @@ class SomfySdnMotorEntity(CoordinatorEntity[SomfySdnCoordinator]):
             name=label,
             manufacturer="Somfy",
             model="SDN motor",
-            via_device=(DOMAIN, self._cid),
+            via_device_id=self.coordinator.controller_device_id,
         )
 
     @property

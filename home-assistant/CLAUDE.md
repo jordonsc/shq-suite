@@ -210,7 +210,7 @@ cfa_fire_ban:
 - `unclassified`, not `unknown`, for an unattributable disconnect — HA renders the literal string `unknown` as the no-data state.
 **⚠️ Logbook timestamps are DELIVERY time, not device time.** A record replayed in the backlog was captured on the device seconds-to-minutes before HA saw it, so the logbook line for a disconnect can appear *after* the reconnect it preceded. The device's own clock is in the event's `t_ms` attribute (ms since its boot) — use that to order records, not the logbook column.
 
-**Key files**: `client.py` (+ diag/health/backlog dispatch, close-code capture), `coordinator.py` (`controller_key`, `_mac_norm`/`_format_mac`, diag bus events, health store), `config_flow.py` (`VERSION`), `__init__.py` (`async_migrate_entry`), `entity.py` (shared bases + controller `device_info`), `cover.py` (per-motor entity + entity services), `sensor.py` (bus + firmware diagnostics), `select.py` (WiFi protocol A/B knob), `logbook.py`, `services.yaml`, `const.py`.
+**Key files**: `client.py` (+ diag/health/backlog dispatch, close-code capture), `coordinator.py` (`controller_key`, `_mac_norm`/`_format_mac`, diag bus events, health store), `config_flow.py` (`VERSION`), `__init__.py` (`async_migrate_entry`; registers the controller device before the platforms load), `entity.py` (shared bases + controller `device_info`), `cover.py` (per-motor entity + entity services), `sensor.py` (bus + firmware diagnostics), `select.py` (WiFi protocol A/B knob), `logbook.py`, `services.yaml`, `const.py`.
 
 ## unifi_access_dps (Front Door DPS workaround)
 
@@ -507,3 +507,10 @@ EOF
   Currently `ReportBehavior.IGNORE` for custom integrations — nothing is logged and nothing fails — so
   this is future-proofing, not a live bug. Still outstanding: `cfa_fire_ban`, `dosa`, `shq_display`
   (the last is unloaded and lives in the Argus repo anyway). Ledger shq-suite-0058.
+- **Never use `DeviceInfo(via_device=...)` — pass `via_device_id` (a device registry id).** Deprecated
+  in 2026.9 and removed in 2027.8. It does *not* fail reliably: HA only warns while the call is
+  attributed to a custom integration, but it raises when the call is attributed to a core frame. That
+  happened for Bed 1 Left's motor, whose entities were added during a UI entity-registry update, so they
+  never registered at all (ledger shq-suite-0067). `somfy_sdn` 1.13.2 registers the controller device
+  in `async_setup_entry` and stores its id as `coordinator.controller_device_id` for the motor devices
+  to link to.

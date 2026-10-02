@@ -90,6 +90,8 @@ class SomfySdnCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # else host:port (manual entries). Fixed for the entry's life so identifiers survive a
         # DHCP change. Migrated from the old host:port scheme by async_migrate_entry.
         self.controller_key: str = _mac_norm(entry.unique_id) or f"{self.host}:{self.port}"
+        # Controller device registry id, set by async_setup_entry before the platforms load.
+        self.controller_device_id: str = ""
         self.client = SomfySdnClient(self.host, self.port)
         self.client.set_state_callback(self._on_state)
         self.client.set_diag_callback(self._on_diag)

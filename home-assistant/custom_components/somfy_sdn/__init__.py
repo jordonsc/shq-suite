@@ -86,6 +86,20 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up from a config entry."""
     coordinator = SomfySdnCoordinator(hass, entry)
+    # Register the controller device up front so motor devices can link to it by registry id:
+    # `DeviceInfo(via_device=...)` is deprecated (removed 2027.8) and already raises when the add
+    # is attributed to a core frame, which is how a motor's entities failed to register at all.
+    coordinator.controller_device_id = (
+        dr.async_get(hass)
+        .async_get_or_create(
+            config_entry_id=entry.entry_id,
+            identifiers={(DOMAIN, coordinator.controller_key)},
+            name=f"Somfy SDN ({coordinator.mac or coordinator.host})",
+            manufacturer="SHQ",
+            model="Somfy SDN controller",
+        )
+        .id
+    )
     await coordinator.async_start()
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
