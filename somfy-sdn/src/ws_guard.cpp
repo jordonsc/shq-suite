@@ -198,3 +198,18 @@ uint8_t GuardedWebSocketsServer::judge(uint32_t now_ms) {
   }
   return dropped;
 }
+
+uint8_t GuardedWebSocketsServer::dropAll() {
+  uint8_t dropped = 0;
+  for (uint8_t i = 0; i < WEBSOCKETS_SERVER_CLIENT_MAX; i++) {
+    WSclient_t* c = &_clients[i];
+    if (c->status != WSC_CONNECTED) continue;
+    if (c->tcp != nullptr && c->tcp->connected() && socketWritable(c)) {
+      disconnect(i);
+    } else if (c->tcp != nullptr) {
+      c->tcp->stop();
+    }
+    dropped++;
+  }
+  return dropped;
+}

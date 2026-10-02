@@ -86,6 +86,12 @@ class GuardedWebSocketsServer : public WebSocketsServer {
   // dropped. Call once per loop, BEFORE the library's loop() and before any broadcast.
   uint8_t judge(uint32_t now_ms);
 
+  // Drop EVERY connected client (fw 1.14.4, ledger shq-suite-0070): a writable socket gets a close
+  // frame, one that would block is stopped directly (no 10 s write). Returns the number dropped.
+  // The actron wedge watchdog's no-reboot remedy for "all slots occupied"; unused on somfy, which
+  // reboots instead — kept here so the twins stay byte-identical.
+  uint8_t dropAll();
+
   // Lifetime counters — surfaced in the health push so the policy is measurable.
   uint32_t skippedWrites() const { return skipped_; }
   uint32_t reapedClients() const { return reaped_; }          // unwritable reaps

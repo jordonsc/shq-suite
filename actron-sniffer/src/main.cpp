@@ -522,6 +522,24 @@ static void emitFromTemplate(uint8_t bytecount, const uint8_t* tmpl, size_t tmpl
   g_respond_tx++;
 }
 
+// Hardware reset cause of THIS boot (fw 1.14.4, twin of somfy http_api resetReasonStr) —
+// distinguishes a power cycle (poweron) from a deliberate restart (sw + a note=) and from a crash
+// (panic/wdt/brownout). The 2026-09-16 bridge reboot could not be explained for want of this.
+static const char* resetReasonStr() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON: return "poweron";
+    case ESP_RST_SW: return "sw";
+    case ESP_RST_PANIC: return "panic";
+    case ESP_RST_INT_WDT: return "int_wdt";
+    case ESP_RST_TASK_WDT: return "task_wdt";
+    case ESP_RST_WDT: return "wdt";
+    case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_DEEPSLEEP: return "deepsleep";
+    case ESP_RST_EXT: return "ext";
+    default: return "other";
+  }
+}
+
 static size_t statusLine(char *out, size_t cap) {
   return snprintf(out, cap,
     "# app=actron-mitm seq_max=%u baud=%u parity=8%c1 gap=%uus capture=%s "
@@ -549,6 +567,9 @@ static size_t statusLine(char *out, size_t cap) {
     // `pongto`/`peerclose`/`txerr` split the disconnects by who caused them. Full records at /diag.
     "sock=%u loop_max=%u http_max=%u stalls=%u "
     "pongto=%u peerclose=%u txerr=%u wifi_disc=%u reaps=%u skipped=%u deferred=%u "
+    // STA link telemetry (fw 1.14.4, twin of somfy): event-hook disconnects, last 802.11 reason,
+    // link-retry re-begins (ledger shq-suite-0070).
+    "sta_disc=%u wifi_reason=%u link_retry=%u reset=%s note=%s "
     // Station-side AP association (fw 1.8.0). The controller client list has been seen
     // disagreeing with the station; the station wins (wiki estate/shq-network.md).
     // Device-level fault (fw 1.10.0). "ok" when clear; otherwise the worst active code and its
@@ -587,6 +608,8 @@ static size_t statusLine(char *out, size_t cap) {
     (unsigned)diag::transportErrors(), (unsigned)diag::wifiDisconnects(),
     (unsigned)diag::stallReaps(), (unsigned)ws_api::skippedWrites(),
     (unsigned)ws_api::deferredReaps(),
+    (unsigned)wifi_prov::staDisconnectCount(), (unsigned)wifi_prov::lastDisconnectReason(),
+    (unsigned)wifi_prov::linkRetries(), resetReasonStr(), wifi_prov::bootNote(),
     diag::currentBssid(), (unsigned)diag::wifiRoams(),
     (unsigned)diag::lastSeq(),
     (unsigned)wifi_prov::netProbeFailures(), (unsigned)wifi_prov::netProbes(),
@@ -665,7 +688,7 @@ static String measureBaud() {
 
 // ---- HTTP handlers --------------------------------------------------------
 static void handleRoot() {
-  char st[1280];
+  char st[1536];
   statusLine(st, sizeof(st));
   String b = "Actron RS485 sniffer + MITM bridge\n";
   b += String(st) + "\n\n";
@@ -697,7 +720,7 @@ static void handleRoot() {
 }
 
 static void handleStats() {
-  char st[1280];
+  char st[1536];
   statusLine(st, sizeof(st));
   server.send(200, "text/plain", String(st) + "\n");
 }
@@ -775,7 +798,7 @@ static void handleLog() {
 
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/plain", "");
-  char st[1280];
+  char st[1536];
   statusLine(st, sizeof(st));
   server.sendContent(String(st) + "\n");
 
@@ -810,7 +833,7 @@ static void handleSet() {
     if (v > 0) g_gap_us = v;
   }
   startBuses();
-  char st[1280];
+  char st[1536];
   statusLine(st, sizeof(st));
   server.send(200, "text/plain", String(st) + "\n");
 }
@@ -833,10 +856,17 @@ static void handleReboot() {
   const String reason = server.hasArg("reason") ? server.arg("reason") : String("http");
   server.send(200, "text/plain", "# rebooting: " + reason + "\n");
   server.client().flush();
-  Serial.printf("# reboot requested (%s)\n", reason.c_str());
-  Serial.flush();
   delay(100);  // let the response leave before the stack goes down
-  ESP.restart();
+  wifi_prov::noteReboot(reason.c_str());  // reason lands in the next boot's note=
+}
+
+// Manual WiFi reconnect (fw 1.14.4, twin of somfy http_api handleReconnect). Drops the STA link and
+// re-scans all channels for the strongest AP — WiFi only, the RS485 relay is untouched, so unlike
+// /reboot this carries NO A/C cost. Ack first; wifi_prov services it from loop() after this
+// response has flushed.
+static void handleReconnect() {
+  wifi_prov::requestReconnectBestAp();
+  server.send(200, "text/plain", "# WiFi reconnect to strongest AP queued\n");
 }
 
 
@@ -861,10 +891,8 @@ static void handleWifiProtoSet() {
   }
   server.send(200, "text/plain", String(wifi_proto::name(proto)) + " (rebooting to apply)\n");
   server.client().flush();
-  Serial.println("# reboot requested (wifiproto)");
-  Serial.flush();
   delay(100);
-  ESP.restart();
+  wifi_prov::noteReboot("wifiproto");
 }
 
 static void handlePhyCal() {
@@ -878,10 +906,8 @@ static void handlePhyCal() {
   }
   server.send(200, "text/plain", "# PHY calibration erased; rebooting — next boot performs a full RF calibration\n");
   server.client().flush();
-  Serial.println("# reboot requested (phycal)");
-  Serial.flush();
   delay(100);
-  ESP.restart();
+  wifi_prov::noteReboot("phycal");
 }
 
 static void handleArm() {
@@ -1441,7 +1467,7 @@ static void handleUpdate() {
         strcmp(d.project_name, APP_ID) == 0) {
       Serial.printf("# OTA ok (app=%s ver=%s) — rebooting\n", d.project_name, d.version);
       delay(150);
-      ESP.restart();
+      wifi_prov::noteReboot("ota");
     } else {
       esp_ota_set_boot_partition(esp_ota_get_running_partition());
       Serial.printf("# OTA REJECTED: image app=\"%s\" != \"%s\" — reverted, not booting\n",
@@ -1464,7 +1490,7 @@ static void pumpConsole() {
     if (c == '\r') continue;
     if (c == '\n') {
       buf[len] = '\0';
-      char st[1280];
+      char st[1536];
       switch (buf[0]) {
         case 'm': Serial.print(measureBaud()); break;
         case 's': statusLine(st, sizeof(st)); Serial.println(st); break;
@@ -1480,9 +1506,7 @@ static void pumpConsole() {
             Serial.println("# nvs write failed");
           } else {
             Serial.printf("# wifi_proto=%s — rebooting to apply (zones off first!)\n", wifi_proto::name(proto));
-            Serial.flush();
-            delay(100);
-            ESP.restart();
+            wifi_prov::noteReboot("wifiproto");
           }
           break;
         }
@@ -1520,6 +1544,7 @@ static void startAppServer() {
   server.on("/set", HTTP_POST, handleSet);
   server.on("/clear", HTTP_POST, handleClear);
   server.on("/reboot", HTTP_POST, handleReboot);
+  server.on("/reconnect", HTTP_POST, handleReconnect);
   server.on("/update", HTTP_POST, handleUpdate);
   server.on("/wifireset", HTTP_POST, handleWifiReset);
   server.on("/wifiproto", HTTP_GET, handleWifiProtoGet);
@@ -1586,7 +1611,7 @@ void setup() {
   // after all the servers have allocated, socket headroom with them already bound).
   diag::begin();
 
-  char st[1280];
+  char st[1536];
   statusLine(st, sizeof(st));
   Serial.println(st);
 

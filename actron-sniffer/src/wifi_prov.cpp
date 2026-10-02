@@ -42,12 +42,29 @@ constexpr uint32_t NET_TICK_MS = 1000;
 constexpr uint32_t STA_CONNECT_TIMEOUT_MS = 15000;
 constexpr uint8_t STA_RETRIES = 2;
 
+// Active link-retry loop (fw 1.14.4, ported from somfy-sdn fw 1.5.0 — twins, keep in step; ledger
+// shq-suite-0070). Before this the bridge relied ENTIRELY on the Arduino core's implicit
+// auto-reconnect once the boot connect had succeeded, and the core does not retry every
+// disconnect reason (STA.cpp: reason 8 ASSOC_LEAVE never, anything outside
+// _is_staReconnectableReason never). On 2026-10-02 an AP radio restart (a channel change on
+// Upper West) left it OFF the network for good while every somfy twin rejoined within a minute.
+// After LINK_RETRY_AFTER_MS of continuous downtime (long enough for auto-reconnect to win the easy
+// cases), force a full disconnect + begin() every LINK_RETRY_INTERVAL_MS. begin() re-applies the
+// all-channel strongest-AP scan, so it also copes with the AP coming back on a new channel/BSSID.
+// DELIBERATE DIVERGENCE from the twin: NO wifi-dead reboot and NO portal-retry reboot. The bridge
+// sits on a physically cut RS485 bus and must never restart with the A/C running (shq-suite-0042),
+// so a link that will not come back is retried for ever instead — WiFi only, the relay is untouched.
+constexpr uint32_t LINK_RETRY_AFTER_MS = 20 * 1000;
+constexpr uint32_t LINK_RETRY_INTERVAL_MS = 30 * 1000;
+
 constexpr const char* NVS_NS = "actron";
 constexpr const char* NVS_SSID = "ssid";
 constexpr const char* NVS_PASS = "pass";
+constexpr const char* NVS_BOOTNOTE = "bootnote";  // fw 1.14.4, twin of somfy fw 1.5.0
 
 Status g_status = Status::PORTAL;
 char g_hostname[24] = "actron-mitm";
+char g_boot_note[24] = "none";  // previous boot's noteReboot() reason
 
 // Portal-mode servers (only created when no STA connection).
 WebServer* g_portal = nullptr;
@@ -55,6 +72,20 @@ DNSServer* g_dns = nullptr;
 
 // Set by requestReconnectBestAp() and serviced from loop() so a calling HTTP ack flushes first.
 bool g_reconnect_requested = false;
+
+// Link-retry state (fw 1.14.4). Creds are cached at boot so the retry needs no NVS read.
+String g_ssid;
+String g_pass;
+uint32_t g_wifi_down_since_ms = 0;   // mono::now() when the STA link was first seen down; 0 = up
+uint32_t g_last_link_retry_ms = 0;   // last forced re-begin attempt; 0 = none this outage
+uint32_t g_link_retries = 0;         // lifetime forced re-begins since boot
+
+// WiFi event telemetry (fw 1.14.4, twin of somfy fw 1.5.0). Written by the WiFi event task, read
+// from loop(); the handler itself stays minimal.
+volatile uint32_t g_wifi_disc_count = 0;   // lifetime STA disconnect events since boot
+volatile uint8_t g_wifi_last_reason = 0;   // last disconnect reason code (802.11 reason)
+volatile bool g_got_ip_event = false;      // GOT_IP seen — service mDNS re-announce from loop()
+uint32_t g_wifi_disc_logged = 0;           // last count logged from loop()
 
 // WiFi protocol A/B knob (fw 1.13.0, wifi_proto.h). Cached from NVS in begin(); applied by
 // applyProto() right before every WiFi.begin(). The Arduino core does not re-apply a protocol
@@ -154,6 +185,20 @@ void startGatewayProbe() {
   if (esp_ping_start(h) != ESP_OK) {
     esp_ping_delete_session(h);
     g_probe_result = 2;
+  }
+}
+
+void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      g_wifi_disc_count = g_wifi_disc_count + 1;
+      g_wifi_last_reason = info.wifi_sta_disconnected.reason;
+      break;
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      g_got_ip_event = true;
+      break;
+    default:
+      break;
   }
 }
 
@@ -432,17 +477,98 @@ void serviceNetwatch() {
   // Action::Reboot cannot be issued: the policy was built with allow_reboot=false.
 }
 
+// Log WiFi events + re-announce mDNS from the main loop (twin of somfy fw 1.5.0). The re-announce
+// on every (re)association is the fix for ledger shq-suite-0051: reassociate() and the link-retry
+// below both rebuild the esp_netif the responder was bound to, and ESPmDNS does not dependably
+// follow it — the `_actron-mitm._tcp` advert went silent until the next reboot. A fresh
+// end()+begin() re-announces on the new interface.
+void serviceWifiEvents() {
+  if (g_wifi_disc_logged != g_wifi_disc_count) {
+    g_wifi_disc_logged = g_wifi_disc_count;
+    Serial.printf("# WiFi: STA disconnect #%u (reason=%u)\n", (unsigned)g_wifi_disc_logged,
+                  (unsigned)g_wifi_last_reason);
+  }
+  if (g_got_ip_event) {
+    g_got_ip_event = false;
+    if (g_status == Status::CONNECTED) {
+      Serial.printf("# WiFi: got IP %s (rssi=%d) — re-announcing mDNS\n",
+                    WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
+      MDNS.end();
+      startMdns();
+    }
+  }
+}
+
+// Link-retry loop (constants up top for rationale). Non-blocking: begin() is fired and connection
+// progress is observed on later loop passes. No reboot backstop on this device, by design.
+void serviceLinkRetry() {
+  if (g_status != Status::CONNECTED) return;
+  const uint32_t now = mono::now();
+  if (WiFi.isConnected()) {
+    if (g_wifi_down_since_ms != 0) {
+      Serial.printf("# WiFi: link back after %us\n",
+                    (unsigned)(mono::elapsed(g_wifi_down_since_ms, now) / 1000));
+    }
+    g_wifi_down_since_ms = 0;
+    g_last_link_retry_ms = 0;
+    return;
+  }
+  if (g_wifi_down_since_ms == 0) {
+    g_wifi_down_since_ms = now;
+    Serial.println("# WiFi: STA link down — link-retry armed");
+    return;
+  }
+  const uint32_t down_for = mono::elapsed(g_wifi_down_since_ms, now);
+  if (down_for >= LINK_RETRY_AFTER_MS && g_ssid.length() > 0 &&
+      (g_last_link_retry_ms == 0 ||
+       mono::elapsed(g_last_link_retry_ms, now) >= LINK_RETRY_INTERVAL_MS)) {
+    g_last_link_retry_ms = now;
+    g_link_retries++;
+    Serial.printf("# WiFi: link down %us (disc=%u last_reason=%u) — forcing re-begin\n",
+                  (unsigned)(down_for / 1000), (unsigned)g_wifi_disc_count,
+                  (unsigned)g_wifi_last_reason);
+    WiFi.disconnect();
+    WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+    WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
+    applyProto();  // idempotent; keeps the A/B setting on this re-begin path too
+    WiFi.begin(g_ssid.c_str(), g_pass.c_str());
+  }
+}
+
 }  // namespace
 
 Status begin() {
   computeHostname();
+
+  // Recover the previous boot's reboot note (if any), then clear it so a subsequent power cycle
+  // reads "none" — the note describes THIS boot's cause only (twin of somfy fw 1.5.0).
+  {
+    Preferences p;
+    if (p.begin(NVS_NS, false)) {
+      String note = p.getString(NVS_BOOTNOTE, "");
+      if (note.length() > 0) {
+        strncpy(g_boot_note, note.c_str(), sizeof(g_boot_note) - 1);
+        g_boot_note[sizeof(g_boot_note) - 1] = '\0';
+        p.remove(NVS_BOOTNOTE);
+        Serial.printf("# boot note: %s\n", g_boot_note);
+      }
+      p.end();
+    }
+  }
+
   readProto();  // fw 1.13.0 WiFi protocol A/B knob; tryConnect applies it
+
+  // Register the event hook before the first connect so boot-time disconnects are counted too.
+  WiFi.onEvent(onWiFiEvent);
 
   String ssid, pass;
   if (readCreds(ssid, pass) && tryConnect(ssid, pass)) {
+    g_ssid = ssid;  // cached for the link-retry loop
+    g_pass = pass;
     g_status = Status::CONNECTED;
     Serial.printf("# WiFi up: http://%s/  (%s)\n", WiFi.localIP().toString().c_str(), g_hostname);
     startMdns();
+    g_got_ip_event = false;  // boot GOT_IP already handled by the startMdns() above
   } else {
     g_status = Status::PORTAL;
     startPortal();
@@ -452,6 +578,8 @@ Status begin() {
 
 void loop() {
   serviceReconnect();
+  serviceWifiEvents();
+  serviceLinkRetry();
   serviceNetwatch();
   if (g_status == Status::PORTAL) {
     if (g_dns) g_dns->processNextRequest();
@@ -461,10 +589,29 @@ void loop() {
 
 void requestReconnectBestAp() { g_reconnect_requested = true; }
 
+void noteReboot(const char* reason) {
+  Preferences p;
+  if (p.begin(NVS_NS, false)) {
+    p.putString(NVS_BOOTNOTE, reason);
+    p.end();
+  }
+  Serial.printf("# rebooting (%s)\n", reason);
+  Serial.flush();
+  delay(100);
+  ESP.restart();
+  while (true) {}  // unreachable — satisfies [[noreturn]]
+}
+
+const char* bootNote() { return g_boot_note; }
+
 void noteInbound() {
   g_inbound_ms = mono::now();
   g_inbound_seen = true;
 }
+uint32_t staDisconnectCount() { return g_wifi_disc_count; }
+uint8_t lastDisconnectReason() { return g_wifi_last_reason; }
+uint32_t linkRetries() { return g_link_retries; }
+
 uint32_t netProbeFailures() { return g_netwatch.consecutiveFailures(); }
 uint32_t netRecoveries() { return g_netwatch.recoveries(); }
 uint32_t netProbes() { return g_probes_sent; }

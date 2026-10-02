@@ -75,10 +75,14 @@ uint32_t last_heartbeat_ms_ = 0;
 // them — the library refuses all new handshakes (accept then drop, no HTTP response) and the
 // device looks dead to HA while the HTTP API and the RS485 bridge stay perfectly healthy. There
 // is only ever ONE legitimate HA coordinator, so sitting at the full cap for minutes is an
-// unambiguous wedge: self-heal by rebooting (WiFi creds live in NVS; the bridge task re-inits to
-// INJECT on boot, so the A/C keeps bridging). Backstop to the HA client's close-before-reconnect
-// fix (actron_mitm_controller 1.1.1). Cannot boot-loop: a fresh boot starts with 0 clients.
-constexpr uint32_t WEDGE_REBOOT_MS = 5 * 60 * 1000;  // continuously at cap this long => reboot
+// unambiguous wedge. Backstop to the HA client's close-before-reconnect fix
+// (actron_mitm_controller 1.1.1). Since fw 1.14.4 the remedy is to DROP EVERY CLIENT, not to
+// reboot (ledger shq-suite-0070): a reboot severs the physically cut RS485 bus for 8-30 s with the
+// A/C possibly running (shq-suite-0042), and clearing the slots is all the wedge needs — HA's
+// coordinator reconnects into a free slot within seconds. The somfy twin still reboots
+// (noteReboot "ws-wedge"); it has no such cost. If the slots refill straight away the drop simply
+// repeats every WEDGE_DROP_MS, which is harmless.
+constexpr uint32_t WEDGE_DROP_MS = 5 * 60 * 1000;  // continuously at cap this long => drop all
 uint32_t at_capacity_since_ms_ = 0;                  // millis() when we hit the cap; 0 = below cap
 
 // Lifetime WS event counters (ledger shq-suite-0019 instrumentation) — see ws_api.h.
@@ -581,10 +585,17 @@ void handleCommand(uint8_t client_id, JsonDocument& cmd) {
     // Prefer to reboot with the zones off. (The somfy twin has no such cost — it is an ordinary
     // bus participant and the motors simply stop being polled.)
     sendAck(client_id, cmd["id"]);
-    Serial.println("# reboot requested (ws-command)");
-    Serial.flush();
     delay(100);
-    ESP.restart();
+    wifi_prov::noteReboot("ws-command");  // reason lands in the next boot's note=
+  }
+
+  if (strcmp(command, "reconnect_wifi") == 0) {
+    // fw 1.14.4, twin of the somfy command. Ack first; wifi_prov drops + re-scans all channels for
+    // the strongest AP from loop() once this reply has flushed. WiFi only — the RS485 relay is
+    // untouched, so this carries NO A/C cost. The link bounce drops this WS connection; the HA
+    // coordinator reconnects and the next snapshot carries the new rssi/bssid.
+    sendAck(client_id, cmd["id"]);
+    wifi_prov::requestReconnectBestAp();
     return;
   }
 
@@ -602,11 +613,8 @@ void handleCommand(uint8_t client_id, JsonDocument& cmd) {
     }
     if (!wifi_prov::setWifiProto(proto)) { sendError(client_id, cmd["id"], "nvs write failed"); return; }
     sendAck(client_id, cmd["id"]);
-    Serial.println("# reboot requested (wifiproto)");
-    Serial.flush();
     delay(100);
-    ESP.restart();
-    return;
+    wifi_prov::noteReboot("wifiproto");
   }
 
   JsonObject obj = cmd.as<JsonObject>();
@@ -899,18 +907,18 @@ void loop() {
   }
 
   // Wedge watchdog (see the note by at_capacity_since_ms_): if every WS slot has been occupied
-  // continuously for WEDGE_REBOOT_MS, the server can no longer accept the HA coordinator — reboot
-  // to self-heal. Any drop below the cap resets the timer, so only a genuine stuck-full state trips.
+  // continuously for WEDGE_DROP_MS, the server can no longer accept the HA coordinator — drop
+  // every client to self-heal (no reboot on this device). Any drop below the cap resets the
+  // timer, so only a genuine stuck-full state trips.
   if (server.connectedClients() >= WEBSOCKETS_SERVER_CLIENT_MAX) {
     fault::raise(fault::Code::WsCapacity, "all client slots occupied");
     if (at_capacity_since_ms_ == 0) {
       at_capacity_since_ms_ = t;
-    } else if ((uint32_t)(t - at_capacity_since_ms_) >= WEDGE_REBOOT_MS) {
-      Serial.printf("[ws] WEDGE: %u clients at cap for >%us — rebooting to self-heal\n",
-                    (unsigned)server.connectedClients(), WEDGE_REBOOT_MS / 1000);
-      Serial.flush();
-      delay(50);
-      ESP.restart();
+    } else if ((uint32_t)(t - at_capacity_since_ms_) >= WEDGE_DROP_MS) {
+      Serial.printf("[ws] WEDGE: %u clients at cap for >%us — dropping all (no reboot)\n",
+                    (unsigned)server.connectedClients(), WEDGE_DROP_MS / 1000);
+      server.dropAll();
+      at_capacity_since_ms_ = 0;
     }
   } else {
     fault::clear(fault::Code::WsCapacity);

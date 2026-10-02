@@ -39,6 +39,23 @@ void factoryWipe();
 // Deferred to loop() so a calling HTTP ack flushes before the link drops.
 void requestReconnectBestAp();
 
+// Record a reboot reason in NVS and restart (fw 1.14.4, twin of somfy fw 1.5.0). The note is read
+// back (and cleared) on the next boot and surfaced as `note=` in /stats beside `reset=`, so a
+// deliberate restart (OTA, /reboot, wifiproto, phycal) is never mistaken for a crash, and an
+// unexplained one (note=none + reset=brownout/panic/wdt) says what actually happened. Every
+// restart path in this firmware should go through here. Never returns.
+[[noreturn]] void noteReboot(const char* reason);
+
+// The reboot note recorded by the PREVIOUS boot's noteReboot(), or "none". Valid after begin().
+const char* bootNote();
+
+// WiFi link telemetry (fw 1.14.4, twin of somfy fw 1.5.0): STA disconnect events since boot (from
+// the WiFi event hook, so it sees every drop — unlike diag's link-poll `wifi_disc`), the last 802.11
+// disconnect reason code, and the link-retry loop's forced re-begins since boot.
+uint32_t staDisconnectCount();
+uint8_t lastDisconnectReason();
+uint32_t linkRetries();
+
 // Network-stack watchdog (fw 1.11.0, ledger shq-suite-0044; policy in netwatch.h, twin of the
 // somfy-sdn one). Probes the gateway every minute and re-associates on a large backward clock
 // step, sustained unreachability with the link up, or sustained low heap. NO reboot tier on this
